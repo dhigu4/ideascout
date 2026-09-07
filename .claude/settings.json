@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/brad/AppData/Local/Temp/agentmail_check/extracted/agentmail/inboxes/messages/**)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && grep -n \"    def \\\\|    async def \" inboxes/messages/client.py | grep -v \"^.*#\" )",
+      "Read(//c/Users/brad/AppData/Local/Temp/agentmail_check/extracted/agentmail/**)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && echo \"=== message.py ===\" && find . -path \"*messages/types/message.py\" && cat ./messages/types/message.py 2>&1 | head -100)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && echo \"=== RawMessageResponse ===\" && cat ./messages/types/raw_message_response.py && echo \"=== ListMessagesResponse ===\" && cat ./messages/types/list_messages_response.py && echo \"=== message_from ===\" && cat ./messages/types/message_from.py)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && cat ./messages/types/message_item.py)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && cat ./messages/types/message_timestamp.py ./messages/types/message_size.py ./messages/types/message_to.py ./messages/types/message_headers.py 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && sed -n '1,60p' client.py)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && sed -n '60,110p' client.py)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && cat ./core/api_error.py)",
+      "Bash(cd \"C:\\\\Users\\\\brad\\\\AppData\\\\Local\\\\Temp\\\\agentmail_check\\\\extracted\\\\agentmail\" && grep -n \"ApiError\\\\|^from\\\\|^import\" __init__.py | head -20)",
+      "Bash(python -m pip index versions python-dotenv)",
+      "Bash(cd \"c:/Users/brad/Repos/IdeaScout\" && mkdir -p ideascout tests data && ls -la)",
+      "Bash(python -m venv .venv)",
+      "Bash(./.venv/Scripts/python.exe -m pip install --quiet --upgrade pip)",
+      "Bash(./.venv/Scripts/python.exe -m pip install --quiet -r requirements-dev.txt)",
+      "Bash(./.venv/Scripts/python.exe run.py status)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(./.venv/Scripts/python.exe run.py check-mail)",
+      "Bash(rm -f .env data/ideas.db data/app.log)",
+      "Bash(./.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile run.py ideascout/*.py tests/*.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\brad\\Repos\\IdeaScout"
+    ]
+  }
+}

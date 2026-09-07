@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Local database and logs
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Test cache
+.pytest_cache/
