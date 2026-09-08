@@ -22,7 +22,27 @@
       "Bash(./.venv/Scripts/python.exe run.py check-mail)",
       "Bash(rm -f .env data/ideas.db data/app.log)",
       "Bash(./.venv/Scripts/python.exe -m pytest -q)",
-      "Bash(./.venv/Scripts/python.exe -m py_compile run.py ideascout/*.py tests/*.py)"
+      "Bash(./.venv/Scripts/python.exe -m py_compile run.py ideascout/*.py tests/*.py)",
+      "Bash(./.venv/Scripts/python.exe -m pip list)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(./.venv/Scripts/python.exe -m pip install --quiet anthropic pydantic)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(rm -f data/ideas.db data/app.log .env)",
+      "Bash(./.venv/Scripts/python.exe run.py parse-mail)",
+      "Bash(./.venv/Scripts/python.exe run.py show-feedback)",
+      "Bash(./.venv/Scripts/python.exe -c \"import anthropic; print\\(anthropic.__file__\\)\")",
+      "Bash(cat)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile run.py ideascout/*.py)",
+      "Bash(./.venv/Scripts/python.exe run.py requeue-feedback)",
+      "Bash(./.venv/Scripts/python.exe run.py requeue-feedback msg-1 --all-errors)",
+      "Bash(./.venv/Scripts/python.exe run.py requeue-feedback m1)",
+      "Bash(./.venv/Scripts/python.exe -m pip show -f agentmail)",
+      "Bash(gh search *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_db.py -v)",
+      "Bash(grep -n \"Skipped \\(not a Brad sender\\): 1$\\\\|Feedback records: 9\" README.md)"
     ],
     "additionalDirectories": [
       "c:\\Users\\brad\\Repos\\IdeaScout"

@@ -47,6 +47,29 @@ def make_config(tmp_path) -> Config:
     )
 
 
+def patch_agentmail(monkeypatch, all_items, authenticated_ids=None, fetch_message=None):
+    """Simulate AgentMail's real listing behavior: include_unauthenticated=True
+    returns every item, the default (False) returns only the authenticated
+    subset. Defaults every item to authenticated unless told otherwise, so
+    existing tests that don't care about authentication don't need to.
+    """
+    if authenticated_ids is None:
+        authenticated_ids = {item.message_id for item in all_items}
+
+    def fake_list(client, inbox_id, include_unauthenticated=False):
+        if include_unauthenticated:
+            return all_items
+        return [item for item in all_items if item.message_id in authenticated_ids]
+
+    monkeypatch.setattr(agentmail_client, "build_client", lambda api_key: object())
+    monkeypatch.setattr(agentmail_client, "list_all_message_items", fake_list)
+    monkeypatch.setattr(
+        agentmail_client, "fetch_authenticated_message_ids", lambda client, inbox_id: authenticated_ids
+    )
+    if fetch_message is not None:
+        monkeypatch.setattr(agentmail_client, "fetch_message", fetch_message)
+
+
 def test_check_mail_stores_new_messages(tmp_path, monkeypatch):
     config = make_config(tmp_path)
 
@@ -56,14 +79,8 @@ def test_check_mail_stores_new_messages(tmp_path, monkeypatch):
         "msg_2": FakeMessage("msg_2"),
     }
 
-    monkeypatch.setattr(agentmail_client, "build_client", lambda api_key: object())
-    monkeypatch.setattr(
-        agentmail_client, "list_all_message_items", lambda client, inbox_id: fake_items
-    )
-    monkeypatch.setattr(
-        agentmail_client,
-        "fetch_message",
-        lambda client, inbox_id, message_id: fake_messages[message_id],
+    patch_agentmail(
+        monkeypatch, fake_items, fetch_message=lambda client, inbox_id, message_id: fake_messages[message_id]
     )
 
     exit_code = cli.cmd_check_mail(config)
@@ -83,14 +100,8 @@ def test_check_mail_is_idempotent_across_runs(tmp_path, monkeypatch):
     fake_items = [FakeItem("msg_1")]
     fake_messages = {"msg_1": FakeMessage("msg_1")}
 
-    monkeypatch.setattr(agentmail_client, "build_client", lambda api_key: object())
-    monkeypatch.setattr(
-        agentmail_client, "list_all_message_items", lambda client, inbox_id: fake_items
-    )
-    monkeypatch.setattr(
-        agentmail_client,
-        "fetch_message",
-        lambda client, inbox_id, message_id: fake_messages[message_id],
+    patch_agentmail(
+        monkeypatch, fake_items, fetch_message=lambda client, inbox_id, message_id: fake_messages[message_id]
     )
 
     first = cli.cmd_check_mail(config)
@@ -114,11 +125,7 @@ def test_check_mail_counts_per_message_failures_without_aborting(tmp_path, monke
             raise RuntimeError("simulated AgentMail failure")
         return FakeMessage(message_id)
 
-    monkeypatch.setattr(agentmail_client, "build_client", lambda api_key: object())
-    monkeypatch.setattr(
-        agentmail_client, "list_all_message_items", lambda client, inbox_id: fake_items
-    )
-    monkeypatch.setattr(agentmail_client, "fetch_message", fake_fetch)
+    patch_agentmail(monkeypatch, fake_items, fetch_message=fake_fetch)
 
     exit_code = cli.cmd_check_mail(config)
 
@@ -136,7 +143,7 @@ def test_check_mail_counts_per_message_failures_without_aborting(tmp_path, monke
 def test_check_mail_reports_failure_when_listing_fails(tmp_path, monkeypatch):
     config = make_config(tmp_path)
 
-    def fake_list(client, inbox_id):
+    def fake_list(client, inbox_id, include_unauthenticated=False):
         raise RuntimeError("cannot reach AgentMail")
 
     monkeypatch.setattr(agentmail_client, "build_client", lambda api_key: object())
@@ -151,4 +158,38 @@ def test_check_mail_reports_failure_when_listing_fails(tmp_path, monkeypatch):
     assert db.get_meta(conn, "last_error") is not None
     # The check never completed, so there is no successful check timestamp.
     assert db.get_meta(conn, "last_check_at") is None
+    conn.close()
+
+
+def test_check_mail_records_authentication_status(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+
+    fake_items = [FakeItem("msg_auth"), FakeItem("msg_unauth")]
+    fake_messages = {
+        "msg_auth": FakeMessage("msg_auth"),
+        "msg_unauth": FakeMessage("msg_unauth"),
+    }
+
+    # Both are captured (Stage 1 preserves everything), but only msg_auth
+    # is reported as authenticated by the (simulated) authenticated-only listing.
+    patch_agentmail(
+        monkeypatch,
+        fake_items,
+        authenticated_ids={"msg_auth"},
+        fetch_message=lambda client, inbox_id, message_id: fake_messages[message_id],
+    )
+
+    exit_code = cli.cmd_check_mail(config)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    assert db.count_total_messages(conn) == 2  # neither message was dropped
+    auth_row = conn.execute(
+        "SELECT sender_authenticated FROM messages_raw WHERE message_id = 'msg_auth'"
+    ).fetchone()
+    unauth_row = conn.execute(
+        "SELECT sender_authenticated FROM messages_raw WHERE message_id = 'msg_unauth'"
+    ).fetchone()
+    assert auth_row["sender_authenticated"] == "AUTHENTICATED"
+    assert unauth_row["sender_authenticated"] == "UNAUTHENTICATED"
     conn.close()
