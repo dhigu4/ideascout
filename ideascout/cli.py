@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from email.utils import parseaddr
 
 from . import agentmail_client, db, parser
+from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
 
@@ -37,9 +38,33 @@ def _is_allowed_brad_sender(raw_sender: str | None, allowed_senders: frozenset[s
     return _sender_email_address(raw_sender) in allowed_senders
 
 
+def cmd_init(config: Config) -> int:
+    """Create a brand-new production database. The ONLY command allowed to
+    do so -- every other command refuses outright if the database is
+    missing (see db.open_production_database). Refuses if a database
+    already exists at the target path.
+    """
+    try:
+        result = db.initialize_new_database(config.database_path)
+    except db.DatabaseAlreadyInitializedError as exc:
+        print(f"Refusing to initialize: {exc}")
+        return 1
+
+    state_dir = config.database_path.parent
+    backups_dir = state_dir / "backups"
+
+    print("Initialized a new production database.")
+    print(f"State directory: {state_dir} ({'created' if result['state_dir_created'] else 'already existed'})")
+    print(f"Backups directory: {backups_dir} ({'created' if result['backups_dir_created'] else 'already existed'})")
+    print(f"Database file: {config.database_path} (created, schema version {result['schema_version']})")
+    print("")
+    print(f"If you haven't already, put your real credentials in: {state_dir / '.env'}")
+    return 0
+
+
 def cmd_check_mail(config: Config) -> int:
     logger = get_logger()
-    conn = db.connect(config.database_path)
+    conn = db.open_production_database(config.database_path)
 
     try:
         client = agentmail_client.build_client(config.agentmail_api_key)
@@ -120,6 +145,7 @@ def cmd_check_mail(config: Config) -> int:
             errors += 1
 
     db.set_meta(conn, "last_check_at", utcnow_iso())
+    db.maybe_create_routine_backup(conn, config.database_path)
     conn.close()
 
     print("AgentMail check complete")
@@ -162,7 +188,7 @@ def cmd_parse_mail(config: Config) -> int:
     sender check meaningful.
     """
     logger = get_logger()
-    conn = db.connect(config.database_path)
+    conn = db.open_production_database(config.database_path)
 
     try:
         client = parser.build_client(config.anthropic_api_key)
@@ -299,6 +325,7 @@ def cmd_parse_mail(config: Config) -> int:
             needs_review += 1
 
     db.set_meta(conn, "last_parse_at", utcnow_iso())
+    db.maybe_create_routine_backup(conn, config.database_path)
     conn.close()
 
     print("Feedback parse complete")
@@ -315,7 +342,7 @@ def cmd_parse_mail(config: Config) -> int:
 
 
 def cmd_show_feedback(config: Config, limit: int = 10) -> int:
-    conn = db.connect(config.database_path)
+    conn = db.open_production_database(config.database_path)
     rows = db.get_latest_feedback(conn, limit=limit)
     conn.close()
 
@@ -333,19 +360,86 @@ def cmd_show_feedback(config: Config, limit: int = 10) -> int:
         # event_index > 0 means this email produced more than one event
         # (e.g. Brad replying to a digest with feedback on several ideas).
         event_suffix = f" (event {row['event_index'] + 1})" if row["event_index"] else ""
+        excluded_marker = " [EXCLUDED FROM LEARNING]" if row["excluded_from_learning"] else ""
 
         print(
             f"[{date}]{event_suffix} {label} | {row['event_type']} | "
-            f"{verdict} | confidence={confidence_text}"
+            f"{verdict} | confidence={confidence_text}{excluded_marker}"
         )
         print(f'    "{comment}"')
 
     return 0
 
 
+def _describe_feedback_row(row) -> str:
+    label = row["ticker"] or row["company"] or "(no ticker/company)"
+    verdict = row["verdict"] or "-"
+    comment = row["user_comment"] or "(no comment)"
+    return (
+        f"feedback_id={row['feedback_id']} | {label} | {row['event_type']} | "
+        f'verdict={verdict} | "{comment}"'
+    )
+
+
+def _set_feedback_exclusion(config: Config, ticker: str, excluded: bool) -> int:
+    """Shared logic for exclude-feedback / include-feedback: find every
+    feedback row whose ticker or company matches, show it, and flip its
+    excluded_from_learning flag. Never touches the raw email, never
+    touches any other feedback row, and never deletes anything -- only
+    this one boolean column on the matched row(s) changes.
+    """
+    conn = db.open_production_database(config.database_path)
+    matches = db.get_feedback_by_ticker_or_company(conn, ticker)
+
+    if not matches:
+        conn.close()
+        print(f"No feedback records found matching {ticker!r}. Nothing changed.")
+        return 1
+
+    action = "Excluding from learning" if excluded else "Re-including in learning"
+    print(f"{action} -- {len(matches)} matching feedback record(s) for {ticker!r}:")
+
+    changed = 0
+    for row in matches:
+        already_set = bool(row["excluded_from_learning"]) == excluded
+        note = "  (already set, no change)" if already_set else ""
+        print(f"  {_describe_feedback_row(row)}{note}")
+        db.set_feedback_excluded_from_learning(conn, row["feedback_id"], excluded)
+        if not already_set:
+            changed += 1
+
+    conn.close()
+
+    verb = "excluded from" if excluded else "included back into"
+    print(f"Done: {len(matches)} record(s) now {verb} learning ({changed} changed).")
+    return 0
+
+
+def cmd_exclude_feedback(config: Config, ticker: str) -> int:
+    """Mark every feedback record matching `ticker` (by ticker or company,
+    case-insensitive) as excluded_from_learning -- e.g. artificial
+    smoke-test records that must stay in the database for audit/history
+    but must never be used when a later stage learns Brad's preferences.
+    The raw email and the feedback row itself are never deleted or
+    otherwise modified.
+    """
+    return _set_feedback_exclusion(config, ticker, excluded=True)
+
+
+def cmd_include_feedback(config: Config, ticker: str) -> int:
+    """Reverse an accidental exclude-feedback: clears excluded_from_learning
+    for every feedback record matching `ticker`.
+    """
+    return _set_feedback_exclusion(config, ticker, excluded=False)
+
+
 def cmd_status(config: Config) -> int:
     try:
-        conn = db.connect(config.database_path)
+        conn = db.open_production_database(config.database_path)
+    except db.ProductionDatabaseMissingError as exc:
+        print("Database reachable: NO")
+        print(f"Error: {exc}")
+        return 3
     except Exception as exc:
         print("Database reachable: NO")
         print(f"Error: {exc}")
@@ -475,7 +569,7 @@ def _requeue_one_message(conn, message_id: str) -> tuple[bool, str]:
 
 def cmd_requeue_feedback(config: Config, message_id: str | None, all_errors: bool) -> int:
     logger = get_logger()
-    conn = db.connect(config.database_path)
+    conn = db.open_production_database(config.database_path)
 
     if all_errors:
         error_ids = db.get_message_ids_by_feedback_status(conn, "ERROR")
@@ -505,9 +599,102 @@ def cmd_requeue_feedback(config: Config, message_id: str | None, all_errors: boo
     return 0 if success else 1
 
 
+def _describe_feedback_event(event) -> str:
+    label = event["ticker"] or event["company"] or "(no ticker/company)"
+    verdict = event["verdict"] or "-"
+    confidence = event["confidence"]
+    confidence_text = f"{confidence:.2f}" if confidence is not None else "n/a"
+    comment = event["user_comment"] or "(no comment)"
+    return (
+        f"[{event['event_index']}] {label} | {event['event_type']} | "
+        f'verdict={verdict} | confidence={confidence_text}\n      "{comment}"'
+    )
+
+
+def cmd_show_review(config: Config) -> int:
+    """Show every message currently awaiting human review, with its
+    derived feedback event(s), so Brad can decide whether to approve them
+    (approve-review) or send them back for a fresh parse (requeue-feedback).
+    Purely a read: never changes any status or data.
+    """
+    conn = db.open_production_database(config.database_path)
+    messages = db.get_messages_by_feedback_status(conn, "NEEDS_REVIEW")
+
+    if not messages:
+        conn.close()
+        print("No messages currently need review.")
+        return 0
+
+    print(f"{len(messages)} message(s) need review -- NOT YET APPROVED for learning:")
+    print()
+    for message in messages:
+        events = db.get_feedback_events_for_message(conn, message["message_id"])
+        print(
+            f"message_id={message['message_id']} | subject={message['subject']!r} | "
+            f"received_at={message['received_at']}"
+        )
+        for event in events:
+            print(f"  {_describe_feedback_event(event)}")
+        print(
+            f"  -> NOT YET APPROVED. Approve with: python run.py approve-review "
+            f"{message['message_id']}"
+        )
+        print()
+
+    conn.close()
+    return 0
+
+
+def cmd_approve_review(config: Config, message_id: str) -> int:
+    """Approve a NEEDS_REVIEW message's feedback exactly as extracted.
+
+    Changes ONLY feedback_parse_status (NEEDS_REVIEW -> PARSED). Never
+    touches the raw email, and never touches the feedback row(s)
+    themselves -- approving doesn't correct or re-derive anything, it
+    just says "yes, this extraction is fine to use." Once PARSED, its
+    feedback becomes eligible for learning (see
+    db.get_feedback_eligible_for_learning); it never was while
+    NEEDS_REVIEW, no matter how confident it looked.
+
+    If the extracted feedback is actually wrong, use requeue-feedback
+    instead -- that deletes the superseded event(s) and forces a fresh
+    LLM parse, rather than approving what's already there.
+    """
+    conn = db.open_production_database(config.database_path)
+    row = db.get_message(conn, message_id)
+
+    if row is None:
+        conn.close()
+        print(f"No message found with message_id={message_id!r}.")
+        return 1
+
+    status = row["feedback_parse_status"]
+    if status != "NEEDS_REVIEW":
+        conn.close()
+        print(
+            f"message_id={message_id!r} is not eligible for approval "
+            f"(status={status}, not NEEDS_REVIEW) -- refusing."
+        )
+        return 1
+
+    events = db.get_feedback_events_for_message(conn, message_id)
+    db.set_feedback_parse_status(conn, message_id, "PARSED", error=None)
+    conn.close()
+
+    print(f"Approved message_id={message_id!r}: feedback_parse_status NEEDS_REVIEW -> PARSED.")
+    print(f"{len(events)} feedback event(s), unchanged, are now eligible for learning:")
+    for event in events:
+        print(f"  {_describe_feedback_event(event)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser(
+        "init",
+        help="Create a brand-new production database (refuses if one already exists)",
+    )
     subparsers.add_parser("check-mail", help="Fetch new messages from AgentMail into SQLite")
     subparsers.add_parser("parse-mail", help="Turn unparsed messages into structured feedback")
     show_feedback_parser = subparsers.add_parser(
@@ -529,6 +716,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Requeue every message currently in ERROR state (not NEEDS_REVIEW, not SKIPPED_NOT_BRAD)",
     )
+    exclude_parser = subparsers.add_parser(
+        "exclude-feedback",
+        help="Mark feedback record(s) for a ticker/company as excluded from learning",
+    )
+    exclude_parser.add_argument("ticker", help="Ticker or company name to match")
+    include_parser = subparsers.add_parser(
+        "include-feedback",
+        help="Reverse exclude-feedback for a ticker/company",
+    )
+    include_parser.add_argument("ticker", help="Ticker or company name to match")
+    subparsers.add_parser(
+        "show-review",
+        help="Show every message awaiting human review, with its derived feedback event(s)",
+    )
+    approve_parser = subparsers.add_parser(
+        "approve-review",
+        help="Approve a NEEDS_REVIEW message's feedback exactly as extracted",
+    )
+    approve_parser.add_argument("message_id", help="message_id to approve")
     return arg_parser
 
 
@@ -536,8 +742,20 @@ def main(argv: list[str] | None = None) -> int:
     arg_parser = build_parser()
     args = arg_parser.parse_args(argv)
 
+    legacy_env = config_module.find_legacy_repo_env()
+    if legacy_env is not None:
+        print(
+            f"Warning: found an old .env at {legacy_env}. IdeaScout now reads .env only "
+            f"from {config_module.ENV_PATH}. Move it there manually -- this app will never "
+            "do so automatically."
+        )
+
     try:
-        if args.command == "check-mail":
+        if args.command == "init":
+            cfg = load_config()
+            setup_logging(cfg.log_path)
+            return cmd_init(cfg)
+        elif args.command == "check-mail":
             config = load_config(require_agentmail=True)
             setup_logging(config.log_path)
             return cmd_check_mail(config)
@@ -563,6 +781,22 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_requeue_feedback(config, args.message_id, args.all_errors)
+        elif args.command == "exclude-feedback":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_exclude_feedback(config, args.ticker)
+        elif args.command == "include-feedback":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_include_feedback(config, args.ticker)
+        elif args.command == "show-review":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_show_review(config)
+        elif args.command == "approve-review":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_approve_review(config, args.message_id)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2

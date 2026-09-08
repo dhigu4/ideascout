@@ -22,7 +22,7 @@ DEFAULT_ALLOWED_SENDERS = frozenset({"brad@example.com"})
 
 
 def make_config(tmp_path, brad_allowed_senders=DEFAULT_ALLOWED_SENDERS) -> Config:
-    return Config(
+    config = Config(
         agentmail_api_key=None,
         agentmail_inbox_id=None,
         database_path=tmp_path / "ideas.db",
@@ -31,6 +31,11 @@ def make_config(tmp_path, brad_allowed_senders=DEFAULT_ALLOWED_SENDERS) -> Confi
         parser_model_name="claude-haiku-4-5",
         brad_allowed_senders=brad_allowed_senders,
     )
+    # Normal commands now refuse to silently create a missing production
+    # database (see db.open_production_database) -- tests may still create
+    # temporary databases normally, so do that explicitly here.
+    db.connect(config.database_path).close()
+    return config
 
 
 def insert_raw_message(

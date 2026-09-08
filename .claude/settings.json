@@ -42,7 +42,24 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(./.venv/Scripts/python.exe -m pytest tests/test_db.py -v)",
-      "Bash(grep -n \"Skipped \\(not a Brad sender\\): 1$\\\\|Feedback records: 9\" README.md)"
+      "Bash(grep -n \"Skipped \\(not a Brad sender\\): 1$\\\\|Feedback records: 9\" README.md)",
+      "Bash(./.venv/Scripts/python.exe run.py exclude-feedback XYZ)",
+      "Bash(./.venv/Scripts/python.exe run.py exclude-feedback TESTCO)",
+      "Bash(./.venv/Scripts/python.exe run.py include-feedback XYZ)",
+      "Bash(./.venv/Scripts/python.exe -m py_compile ideascout/config.py)",
+      "Bash(./.venv/Scripts/python.exe -c \"from ideascout import config; print\\(config.DEFAULT_STATE_DIR\\); print\\(config.DEFAULT_DATABASE_PATH\\); print\\(config.ENV_PATH\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m py_compile ideascout/db.py)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_config.py -v)",
+      "Bash(cd \"c:/Users/brad/Repos/IdeaScout\" && echo \"=== does real IdeaScoutLocal exist? \\(should not, since I never touched it\\) ===\" && ls -la \"/c/Users/brad/IdeaScoutLocal\" 2>&1)",
+      "Read(//c/Users/brad/**)",
+      "Bash(sed -i '99s/## 4\\\\. Running status/## 5. Running status/' README.md)",
+      "Bash(sed -i '123s/## 5\\\\. Where the database lives/## 6. Where the database lives/' README.md)",
+      "Bash(sed -i '132s/## 6\\\\. How to tell/## 7. How to tell/' README.md)",
+      "Bash(grep -n \"data/\\\\|data\\\\\\\\\\\\\\\\\\\\|copy \\\\.env\\\\.example \\\\.env\\\\|repo root\" README.md)",
+      "Bash(cd \"c:/Users/brad/Repos/IdeaScout\" && echo \"=== repo data/ideas.db still untouched? ===\" && stat data/ideas.db 2>&1 | grep Modify *)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_cli_show_review.py -v)",
+      "Bash(cd \"c:/Users/brad/Repos/IdeaScout\" && echo \"=== repo data/ideas.db untouched? ===\" && stat data/ideas.db 2>&1 | grep Modify *)",
+      "Read(//c/Users/brad/IdeaScoutLocal/**)"
     ],
     "additionalDirectories": [
       "c:\\Users\\brad\\Repos\\IdeaScout"

@@ -11,12 +11,17 @@ from ideascout.config import Config
 
 
 def make_config(tmp_path) -> Config:
-    return Config(
+    config = Config(
         agentmail_api_key=None,
         agentmail_inbox_id=None,
         database_path=tmp_path / "ideas.db",
         log_path=tmp_path / "app.log",
     )
+    # Normal commands now refuse to silently create a missing production
+    # database (see db.open_production_database) -- tests may still create
+    # temporary databases normally, so do that explicitly here.
+    db.connect(config.database_path).close()
+    return config
 
 
 def insert_raw_message(

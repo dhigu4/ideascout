@@ -3,6 +3,14 @@
 Nothing in this file talks to AgentMail or SQLite. It only answers the
 question "what are the current settings?" so that every other module has
 one place to get them from.
+
+IMPORTANT -- persistent state lives OUTSIDE this repository. All real data
+(the database, logs, and the real .env with real credentials) lives under
+DEFAULT_STATE_DIR (C:\\Users\\<you>\\IdeaScoutLocal on Windows), never under
+the repo. This is deliberate: a repo checkout, a test run, or a "clean up
+my test files" pass must never be able to reach production state just
+because it happened to share a path with the code. See CLAUDE.md for the
+full rule.
 """
 
 from __future__ import annotations
@@ -14,9 +22,17 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = PROJECT_ROOT / ".env"
-DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "ideas.db"
-DEFAULT_LOG_PATH = PROJECT_ROOT / "data" / "app.log"
+
+# Persistent production state -- database, .env, logs, backups -- lives
+# here, deliberately outside PROJECT_ROOT. Nothing in this file ever
+# derives a default path from PROJECT_ROOT anymore; that was the root
+# cause of an earlier incident where ad-hoc development/testing against
+# the repo-local default path destroyed real production data.
+DEFAULT_STATE_DIR = Path.home() / "IdeaScoutLocal"
+ENV_PATH = DEFAULT_STATE_DIR / ".env"
+DEFAULT_DATABASE_PATH = DEFAULT_STATE_DIR / "ideas.db"
+DEFAULT_LOG_PATH = DEFAULT_STATE_DIR / "app.log"
+DEFAULT_BACKUP_DIR_NAME = "backups"
 
 # Cheap, fast Claude model well suited to short structured-extraction tasks
 # like this one. Override with PARSER_MODEL_NAME in .env if desired.
@@ -47,11 +63,24 @@ def _parse_allowed_senders(raw: str | None) -> frozenset[str]:
     return frozenset(address.strip().lower() for address in raw.split(",") if address.strip())
 
 
+def find_legacy_repo_env() -> Path | None:
+    """Return the path of an old .env sitting in the repo root, if one
+    exists. Production .env now lives only at ENV_PATH (under
+    DEFAULT_STATE_DIR) -- this is used purely to print a one-time-per-run
+    warning telling a human to move it. It is never read for configuration
+    and never moved/copied/deleted automatically.
+    """
+    legacy_path = PROJECT_ROOT / ".env"
+    return legacy_path if legacy_path.exists() else None
+
+
 def load_config(require_agentmail: bool = False, require_llm: bool = False) -> Config:
     """Read settings from the .env file (if present) and the environment.
 
     Real environment variables always win over values in .env, which is the
-    standard behavior people expect from a .env file.
+    standard behavior people expect from a .env file. .env is read only
+    from ENV_PATH (under DEFAULT_STATE_DIR) -- an old repo-root .env is
+    never read here, see find_legacy_repo_env().
 
     Set require_agentmail=True for commands that must talk to AgentMail
     (check-mail). Set require_llm=True for commands that must talk to the

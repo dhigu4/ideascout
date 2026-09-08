@@ -13,6 +13,25 @@ recomputed later if the parser or prompt improves. Stage 2 only ever
 parses email from Brad's own approved addresses -- it never mistakes a
 newsletter or forwarded article for his opinion.
 
+## 0. Code vs. persistent state
+
+Code lives in this repo (`C:\Users\brad\Repos\IdeaScout`). Everything real
+-- the database, your credentials, logs, and backups -- lives entirely
+outside it, at `C:\Users\brad\IdeaScoutLocal`:
+
+```
+C:\Users\brad\IdeaScoutLocal\
+  ideas.db
+  .env
+  app.log
+  backups\
+```
+
+This separation is deliberate and load-bearing: it's what makes it
+impossible for a repo checkout, a test run, or routine cleanup to ever
+touch production data again. See `CLAUDE.md` for the full rule, and
+"Database initialization" below for how the database itself is protected.
+
 ## 1. Setup
 
 Requires Python 3.10+ on Windows.
@@ -27,23 +46,35 @@ pip install -r requirements.txt
 
 ## 2. AgentMail credentials
 
-Copy `.env.example` to `.env` and fill in the two required values:
-
-```
-copy .env.example .env
-```
-
-Then edit `.env`:
+Create `C:\Users\brad\IdeaScoutLocal\.env` (the folder is created for you
+automatically the first time you run any command, but you still need to
+create `.env` yourself, once, with your real credentials -- copy
+`.env.example` from this repo as a starting template):
 
 ```
 AGENTMAIL_API_KEY=your-real-api-key
 AGENTMAIL_INBOX_ID=your-inbox@yourdomain.agentmail.to
 ```
 
-`.env` is listed in `.gitignore` and will never be committed. Never put
-real credentials directly in code.
+This `.env` is Brad-managed: IdeaScout only ever reads it, never writes,
+moves, deletes, or prints it. `.env.example` (in the repo) is a template
+with placeholders only and is safe to commit.
 
-## 3. Running check-mail
+## 3. Initialize the database (one time)
+
+```
+python run.py init
+```
+
+Creates `IdeaScoutLocal\` (if needed), `IdeaScoutLocal\backups\`, and a
+brand-new `ideas.db` with the current schema. This is the **only** command
+allowed to create a new production database -- every other command
+refuses outright if `ideas.db` is missing, and `init` itself refuses if a
+database already exists at that path. You only need to run this once,
+ever, per machine (see "Database initialization" below for why this
+matters).
+
+## 4. Running check-mail
 
 ```
 python run.py check-mail
@@ -65,7 +96,7 @@ nothing is ever duplicated. Run this command as often as you like (e.g.
 from Windows Task Scheduler every few minutes) to keep the database
 current.
 
-## 4. Running status
+## 5. Running status
 
 ```
 python run.py status
@@ -89,16 +120,19 @@ Last error: none
 Data integrity warnings: 0
 ```
 
-## 5. Where the database lives
+## 6. Where the database lives
 
-`data/ideas.db`, inside the project folder, by default. The log file lives
-alongside it at `data/app.log`. Both are created automatically on first
-run. Neither is committed to git (see `.gitignore`).
+`C:\Users\brad\IdeaScoutLocal\ideas.db` by default -- outside the repo,
+created by `python run.py init` (see step 3). The log file lives alongside
+it at `IdeaScoutLocal\app.log`, and timestamped backups live in
+`IdeaScoutLocal\backups\` (see "Database backups" below). None of this is
+part of the repo or committed to git.
 
 You can point to a different location by setting `DATABASE_PATH` and/or
-`LOG_PATH` in `.env` (see the commented-out examples in `.env.example`).
+`LOG_PATH` in `.env` (see the commented-out examples in `.env.example`) --
+but there's normally no reason to.
 
-## 6. How to tell if the system is healthy
+## 7. How to tell if the system is healthy
 
 Run `python run.py status`. You're healthy if:
 
@@ -106,10 +140,14 @@ Run `python run.py status`. You're healthy if:
 - `Last error: none` (or an old error you already know about)
 - `Last successful inbox check` is recent (i.e., check-mail is actually
   being run regularly)
+- `Data integrity warnings: 0`
 
-If something looks wrong, open `data/app.log` -- every error is logged
-there with a full stack trace, in addition to the one-line summary shown
-on screen.
+If something looks wrong, open `IdeaScoutLocal\app.log` -- every error is
+logged there with a full stack trace, in addition to the one-line summary
+shown on screen. If `status` (or any other command) refuses to run and
+reports the database missing or a possible data loss, **stop** -- don't
+run `init`, don't delete anything, read the message (it lists any backups
+found in `IdeaScoutLocal\backups\`) and investigate first.
 
 ## What Stage 1 deliberately does NOT do
 
@@ -259,8 +297,8 @@ out of `Parsed messages`, and they mean different things:
 - **`Error messages`** -- a non-transient failure (e.g. invalid API
   credentials, a bad request). **Not retried automatically**, since
   retrying without a human fixing the underlying problem first would just
-  waste API calls. Check `data/app.log` for the reason, fix it, then use
-  `requeue-feedback` (below) to give it another try.
+  waste API calls. Check `IdeaScoutLocal\app.log` for the reason, fix it,
+  then use `requeue-feedback` (below) to give it another try.
 
 `Skipped (not a Brad sender)` and `Skipped (unauthenticated)` are not
 failures at all -- they mean the feedback parser was deliberately never
@@ -320,10 +358,40 @@ Prints the 10 most recent structured feedback events in plain text --
 date, ticker/company, event type, verdict, Brad's comment, and the
 parser's confidence -- so you never need to open the database directly to
 see what's been captured. When one email produced more than one event,
-each is labeled `(event 2)`, `(event 3)`, etc. Pass `--limit 25` to see
-more.
+each is labeled `(event 2)`, `(event 3)`, etc. A record excluded from
+learning (see below) is labeled `[EXCLUDED FROM LEARNING]`. Pass `--limit
+25` to see more.
 
-## 8. Raw email is always preserved
+## 8. Excluding a record from learning
+
+```
+python run.py exclude-feedback TICKER
+python run.py include-feedback TICKER
+```
+
+Some feedback records shouldn't count when a later stage learns Brad's
+preferences -- an artificial smoke-test record, for instance, or an
+accidental duplicate. `exclude-feedback` finds every feedback record
+whose `ticker` **or** `company` matches (case-insensitively -- not every
+record has a ticker filled in), shows exactly what it found, and sets
+`excluded_from_learning` on each one. `include-feedback` does the same
+thing in reverse, for undoing an accidental exclusion.
+
+```
+$ python run.py exclude-feedback XYZ
+Excluding from learning -- 1 matching feedback record(s) for 'XYZ':
+  feedback_id=7 | XYZ | FEEDBACK | verdict=LIKE | "smoke test"
+Done: 1 record(s) now excluded from learning (1 changed).
+```
+
+Neither command ever deletes anything -- not the raw email, not the
+feedback record itself -- so excluded records stay fully visible for
+audit/history in `show-feedback` and direct database inspection; they are
+just flagged as unfit for training. Excluding one event in a multi-event
+email only affects that one event's row, never the others, and never the
+message's `feedback_parse_status`.
+
+## 9. Raw email is always preserved
 
 Stage 2 never modifies `subject`, `body_raw`, `sender`, or any other raw
 field in `messages_raw` -- it only ever updates that message's
@@ -343,16 +411,19 @@ email.
 ```
 run.py                        entry point: python run.py <command>
 ideascout/
-  cli.py                      check-mail / parse-mail / show-feedback / status / requeue-feedback commands
+  cli.py                      init / check-mail / parse-mail / show-feedback / status / requeue-feedback / exclude-feedback / include-feedback commands
   agentmail_client.py         the only file that talks to the AgentMail SDK
   parser.py                   the only file that talks to the Anthropic (Claude) API
-  db.py                       SQLite schema, migrations, reads/writes
-  config.py                   loads .env
-  logger.py                   sets up data/app.log
-tests/                        pytest suite (see "Testing" below)
-data/                         ideas.db + app.log (created at runtime, gitignored)
-.env.example                  template for your .env (no real secrets)
+  db.py                       SQLite schema, migrations, backups, production-database safety, reads/writes
+  config.py                   resolves paths under IdeaScoutLocal, loads .env from there
+  logger.py                   sets up IdeaScoutLocal\app.log
+tests/                        pytest suite -- always uses temporary directories (see "Testing" below)
+.env.example                  template for IdeaScoutLocal\.env (no real secrets)
+CLAUDE.md                     the production-state and .env protection rules -- read this first
 ```
+
+Persistent state (`ideas.db`, `.env`, `app.log`, `backups\`) is **not**
+part of this repo -- see "Code vs. persistent state" above.
 
 ## Testing
 
@@ -397,10 +468,61 @@ database with the old `PARSED`/zero-feedback bug is repaired to
 `NO_FEEDBACK` on upgrade without touching a legitimately `PARSED`
 message; `NO_FEEDBACK` with zero feedback rows produces no integrity
 warning while one with feedback rows is flagged as inconsistent; and the
-raw email is never altered by any of this). They run entirely offline
+raw email is never altered by any of this), and exclude-feedback/
+include-feedback (matching by ticker or company, case-insensitively;
+excluding leaves every other feedback row and the raw email untouched;
+`include-feedback` correctly reverses an exclusion; the flag persists
+across reconnects; and neither command ever deletes a message or a
+feedback row). They also cover the production-state safety mechanisms
+themselves (`tests/test_config.py`, `tests/test_production_state.py`):
+production path defaults resolve outside this repo; an autouse fixture in
+`tests/conftest.py` redirects every test's "production" paths into a
+temporary sandbox, even ones that don't pass an explicit path;
+`init` creates a fresh database and refuses to overwrite an existing one;
+every normal command refuses to run against a missing database instead of
+silently creating one; a database that previously had data and now has
+less (or is missing outright) is detected and refused with a clear
+message listing any backups found; pre-migration and routine backups are
+created correctly (verified as real, restorable point-in-time snapshots,
+not just files that exist); routine backup retention keeps the most
+recent 14 while never touching pre-migration backups; and the production
+`.env` is never written to by any code path. They run entirely offline
 against temporary SQLite files with a fake parser -- no real AgentMail or
-Anthropic account or credentials are needed to run
-`pytest`.
+Anthropic account or credentials are needed to run `pytest`.
+
+## Database initialization, safety, and backups
+
+**Initialization (`python run.py init`)** is the only command allowed to
+create a new production database. It refuses outright if a database
+already exists at the target path, so it can never be used -- accidentally
+or otherwise -- to wipe one. Every other command instead refuses to run at
+all if the database is missing, rather than silently creating an empty
+replacement: this is precisely the behavior that would have caught the
+incident that motivated this design (see `CLAUDE.md`).
+
+**Fail-loud safety.** A small sidecar file
+(`IdeaScoutLocal\.ideascout_sentinel.json`) records the database's last
+known message count. If a normal command finds the database missing, or
+finds it now holds *fewer* messages than that record shows (message
+counts only ever grow under normal operation), it refuses to proceed and
+reports **possible data loss** -- along with the filenames of any backups
+found in `IdeaScoutLocal\backups\`. No backup is ever restored
+automatically; that decision is always left to a human.
+
+**Backups** are made with SQLite's own online backup API
+(`sqlite3.Connection.backup`), not a plain file copy -- safe to use even
+while the source connection is open, unlike copying the file directly,
+which could capture a half-written page mid-transaction. Two kinds are
+made automatically, both under `IdeaScoutLocal\backups\`:
+
+- **Pre-migration backups** (`ideas_<timestamp>_premigration.db`) -- made
+  immediately before any schema migration is applied to a database that
+  already has data. Never pruned.
+- **Routine backups** (`ideas_<timestamp>_routine.db`) -- made after
+  `check-mail`/`parse-mail`, rate-limited to at most one per calendar day.
+  The most recent 14 are kept; older ones are pruned automatically.
+
+The live database itself is never deleted by any of this.
 
 ## Database schema
 
@@ -454,6 +576,7 @@ event_index)` prevents any single event from being duplicated):
 | model_name      | which LLM model produced this row |
 | confidence      | the parser's own 0.0-1.0 confidence estimate for this event |
 | created_at      | when this feedback row was written |
+| excluded_from_learning | `0` (default) or `1` -- set via `exclude-feedback`/`include-feedback`; a later stage that learns Brad's preferences must skip any row where this is `1` |
 
 The schema is created and upgraded through a small migration list in
 `ideascout/db.py` (`MIGRATIONS`). To change the schema later, add a new

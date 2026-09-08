@@ -8,7 +8,9 @@ easy to see the entire data model at a glance and easy to change later.
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 # Each entry is one migration, applied in order, exactly once per database.
@@ -226,25 +228,265 @@ MIGRATIONS: list[str] = [
     WHERE feedback_parse_status = 'PARSED'
       AND message_id NOT IN (SELECT DISTINCT message_id FROM feedback);
     """,
+    # Migration 7: feedback housekeeping. Some feedback rows are known to
+    # be artificial (smoke-test records, accidental duplicates a human
+    # wants set aside, etc.) and should be kept for audit/history but
+    # never used when a later stage learns Brad's preferences from this
+    # table. excluded_from_learning defaults to 0 (false) for every
+    # existing and future row -- nothing is excluded unless a human
+    # explicitly marks it via `exclude-feedback`.
+    """
+    ALTER TABLE feedback ADD COLUMN excluded_from_learning INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 
+class ProductionDatabaseMissingError(RuntimeError):
+    """Raised by open_production_database when the database a normal
+    command needs is missing, empty, or holds fewer messages than it
+    provably used to. Deliberately not auto-recoverable: the whole point
+    is that nothing silently papers over this by creating a fresh replacement.
+    """
+
+
+class DatabaseAlreadyInitializedError(RuntimeError):
+    """Raised by initialize_new_database when a file already exists at the
+    target path -- `init` refuses to overwrite anything, ever.
+    """
+
+
+_SENTINEL_FILENAME = ".ideascout_sentinel.json"
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _sentinel_path(database_path: Path) -> Path:
+    return database_path.parent / _SENTINEL_FILENAME
+
+
+def _read_sentinel(database_path: Path) -> dict:
+    """The sentinel is a small sidecar JSON file recording the last known
+    message count for this database, used only to detect "this used to
+    have data and now it doesn't." A missing or corrupt sentinel is
+    treated as "no evidence either way" rather than an error -- it is a
+    safety net, not a thing that should itself be able to break normal
+    operation.
+    """
+    path = _sentinel_path(database_path)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_sentinel(database_path: Path, state: dict) -> None:
+    path = _sentinel_path(database_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _backups_dir(database_path: Path) -> Path:
+    return database_path.parent / "backups"
+
+
+def list_backup_files(database_path: Path) -> list[Path]:
+    """Every backup file for this database, newest first. Filenames are
+    timestamp-prefixed, so lexicographic sort is also chronological sort.
+    """
+    backups_dir = _backups_dir(database_path)
+    if not backups_dir.exists():
+        return []
+    return sorted(backups_dir.glob(f"{database_path.stem}_*.db"), reverse=True)
+
+
+def _create_backup(conn: sqlite3.Connection, database_path: Path, label: str) -> Path:
+    """Back up the database using SQLite's own online backup API
+    (Connection.backup) rather than a filesystem copy. A plain file copy
+    of an open database file can capture a half-written page if a
+    transaction happens to be mid-flight; the backup API is the
+    SQLite-documented way to safely copy a live database.
+    """
+    backups_dir = _backups_dir(database_path)
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backups_dir / f"{database_path.stem}_{timestamp}_{label}.db"
+    backup_conn = sqlite3.connect(str(backup_path))
+    try:
+        conn.backup(backup_conn)
+    finally:
+        backup_conn.close()
+    return backup_path
+
+
+def _prune_routine_backups(database_path: Path, keep: int = 14) -> None:
+    """Keep only the most recent `keep` routine backups. Pre-migration
+    backups use a different filename suffix and are never touched here --
+    they are kept indefinitely, since they're the ones that matter most
+    for recovering from a bad migration.
+    """
+    backups_dir = _backups_dir(database_path)
+    routine_backups = sorted(backups_dir.glob(f"{database_path.stem}_*_routine.db"))
+    excess = len(routine_backups) - keep
+    if excess > 0:
+        for old_backup in routine_backups[:excess]:
+            old_backup.unlink(missing_ok=True)
+
+
+def maybe_create_routine_backup(conn: sqlite3.Connection, database_path: Path) -> Path | None:
+    """Create a rolling operational backup, rate-limited to at most once
+    per calendar day (UTC). Called after check-mail/parse-mail -- the two
+    commands that do meaningful writes -- so routine backups accumulate
+    without needing a backup on every single run. Returns the new backup's
+    path, or None if today's backup already exists.
+    """
+    state = _read_sentinel(database_path)
+    today = date.today().isoformat()
+    if state.get("last_routine_backup_date") == today:
+        return None
+    backup_path = _create_backup(conn, database_path, "routine")
+    state["last_routine_backup_date"] = today
+    _write_sentinel(database_path, state)
+    _prune_routine_backups(database_path)
+    return backup_path
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
-    """Open (creating if needed) the database and bring its schema up to date."""
+    """Open (creating if needed) the database and bring its schema up to
+    date. This is the low-level primitive and WILL create a missing file
+    -- tests use this directly ("tests may create temporary databases
+    normally"), and `init` uses it internally after confirming no database
+    already exists. Every normal CLI command instead goes through
+    open_production_database, which never creates a missing file.
+    """
     database_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(database_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    _migrate(conn)
+    _migrate(conn, database_path)
     return conn
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
+def _migrate(conn: sqlite3.Connection, database_path: Path) -> None:
     current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if 0 < current_version < len(MIGRATIONS):
+        # An already-initialized database is about to have its schema
+        # changed -- back it up first. A brand-new database
+        # (current_version == 0, getting its very first migrations) has
+        # nothing to lose yet, so no backup is made for that case.
+        _create_backup(conn, database_path, "premigration")
     for index in range(current_version, len(MIGRATIONS)):
         conn.executescript(MIGRATIONS[index])
         conn.execute(f"PRAGMA user_version = {index + 1}")
         conn.commit()
+
+
+def initialize_new_database(database_path: Path) -> dict:
+    """Create a brand-new production database. Used ONLY by `python run.py
+    init`. Refuses if a file already exists at database_path -- regardless
+    of its size or contents -- which is what makes `init` impossible to
+    use to accidentally wipe an existing database. Returns a small summary
+    dict for the CLI to report back to the user.
+    """
+    if database_path.exists():
+        raise DatabaseAlreadyInitializedError(
+            f"A database already exists at {database_path}. Refusing to "
+            "initialize over it. If you genuinely want a fresh database, "
+            "move or rename the existing file yourself first."
+        )
+
+    state_dir_existed = database_path.parent.exists()
+    backups_dir_existed = _backups_dir(database_path).exists()
+    _backups_dir(database_path).mkdir(parents=True, exist_ok=True)
+
+    conn = connect(database_path)  # creates the file and runs every migration
+    total_messages = count_total_messages(conn)
+    _write_sentinel(database_path, {"message_count": total_messages, "checked_at": _utcnow_iso()})
+    conn.close()
+
+    return {
+        "state_dir_created": not state_dir_existed,
+        "backups_dir_created": not backups_dir_existed,
+        "schema_version": len(MIGRATIONS),
+    }
+
+
+def _data_loss_message(database_path: Path, previous_count: int, situation: str) -> str:
+    backups = list_backup_files(database_path)
+    backups_dir = _backups_dir(database_path)
+    if backups:
+        backup_lines = "\n".join(f"  - {p.name}" for p in backups[:20])
+        backup_section = (
+            f"Found {len(backups)} backup file(s) in {backups_dir}:\n{backup_lines}\n"
+            "(No backup has been restored automatically.)"
+        )
+    else:
+        backup_section = f"No backup files were found in {backups_dir}."
+
+    return (
+        "POSSIBLE DATA LOSS DETECTED.\n"
+        f"The production database at {database_path} previously contained "
+        f"{previous_count} message(s), but {situation}.\n"
+        "Refusing to continue automatically -- this command has not run.\n\n"
+        f"{backup_section}\n\n"
+        "Do NOT run 'init' -- that would create a new, empty database and "
+        "could make recovery harder. Investigate before proceeding."
+    )
+
+
+def open_production_database(database_path: Path) -> sqlite3.Connection:
+    """The connection path every normal command (check-mail, parse-mail,
+    status, show-feedback, requeue-feedback, exclude/include-feedback)
+    must use. Unlike connect(), this never creates a missing database --
+    it raises ProductionDatabaseMissingError instead:
+
+    - if there is no sentinel evidence this database ever held data, that
+      is treated as a genuinely new installation, and the message points
+      to `python run.py init`;
+    - if the sentinel says the database previously held N > 0 messages but
+      the file is now missing, or now holds fewer messages than that, this
+      is treated as possible data loss: refuse to continue, and list any
+      backup files found (never auto-restore one).
+
+    On success, updates the sentinel with the freshly observed count.
+    """
+    state = _read_sentinel(database_path)
+    previous_count = state.get("message_count")
+
+    if not database_path.exists():
+        if previous_count:
+            raise ProductionDatabaseMissingError(
+                _data_loss_message(
+                    database_path, previous_count, "the database file is now missing entirely"
+                )
+            )
+        raise ProductionDatabaseMissingError(
+            f"No production database found at {database_path}.\n"
+            "If this is a new installation, run:\n"
+            "    python run.py init\n"
+            "to create one."
+        )
+
+    conn = connect(database_path)
+    current_count = count_total_messages(conn)
+
+    if previous_count and current_count < previous_count:
+        conn.close()
+        raise ProductionDatabaseMissingError(
+            _data_loss_message(
+                database_path,
+                previous_count,
+                f"it currently contains only {current_count} message(s)",
+            )
+        )
+
+    _write_sentinel(
+        database_path, {**state, "message_count": current_count, "checked_at": _utcnow_iso()}
+    )
+    return conn
 
 
 def get_all_message_ids(conn: sqlite3.Connection) -> set[str]:
@@ -410,6 +652,45 @@ def get_message_ids_by_feedback_status(conn: sqlite3.Connection, status: str) ->
         (status,),
     ).fetchall()
     return [row["message_id"] for row in rows]
+
+
+def get_messages_by_feedback_status(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+    """Full raw-message rows currently in one specific feedback_parse_status,
+    oldest first. Used by `show-review` to display NEEDS_REVIEW messages
+    with enough context (subject, sender, received_at) for a human to
+    recognize which email each one is.
+    """
+    return conn.execute(
+        "SELECT * FROM messages_raw WHERE feedback_parse_status = ? ORDER BY id",
+        (status,),
+    ).fetchall()
+
+
+def get_feedback_eligible_for_learning(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Feedback rows a future taste-learning stage is allowed to use.
+
+    A row is eligible only if BOTH:
+      - it has not been manually excluded (excluded_from_learning = 0), and
+      - the message it came from has been fully approved
+        (feedback_parse_status = 'PARSED').
+
+    Critically, a feedback row belonging to a NEEDS_REVIEW message is
+    NEVER eligible, no matter how confident-looking its content is --
+    only `approve-review` (which flips the message to PARSED without
+    touching the feedback row itself) can make it eligible. This is the
+    one canonical query any future learning stage should use; do not
+    reimplement this filter elsewhere.
+    """
+    return conn.execute(
+        """
+        SELECT feedback.*
+        FROM feedback
+        JOIN messages_raw ON messages_raw.message_id = feedback.message_id
+        WHERE feedback.excluded_from_learning = 0
+          AND messages_raw.feedback_parse_status = 'PARSED'
+        ORDER BY feedback.feedback_id
+        """
+    ).fetchall()
 
 
 def record_parse_attempt(conn: sqlite3.Connection, message_id: str, attempted_at: str) -> None:
@@ -648,6 +929,7 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
             feedback.feedback_id, feedback.event_index, feedback.event_type,
             feedback.verdict, feedback.ticker, feedback.company, feedback.novelty,
             feedback.user_comment, feedback.confidence, feedback.created_at,
+            feedback.excluded_from_learning,
             messages_raw.received_at, messages_raw.sender, messages_raw.subject
         FROM feedback
         JOIN messages_raw ON messages_raw.message_id = feedback.message_id
@@ -656,6 +938,38 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
         """,
         (limit,),
     ).fetchall()
+
+
+def get_feedback_by_ticker_or_company(conn: sqlite3.Connection, value: str) -> list[sqlite3.Row]:
+    """Feedback events whose ticker or company matches `value`
+    case-insensitively. Used by exclude-feedback/include-feedback -- a
+    single argument is matched against both columns since not every
+    feedback event has a ticker filled in (e.g. some NEW_IDEA/MISSED_IDEA
+    events only have a company name).
+    """
+    return conn.execute(
+        """
+        SELECT * FROM feedback
+        WHERE LOWER(ticker) = LOWER(?) OR LOWER(company) = LOWER(?)
+        ORDER BY feedback_id
+        """,
+        (value, value),
+    ).fetchall()
+
+
+def set_feedback_excluded_from_learning(
+    conn: sqlite3.Connection, feedback_id: int, excluded: bool
+) -> None:
+    """Flip one feedback row's excluded_from_learning flag. Never deletes
+    or otherwise modifies the row -- the raw email and the feedback record
+    itself (event_type, verdict, user_comment, ...) are untouched; this
+    only ever changes whether a later learning stage should use it.
+    """
+    conn.execute(
+        "UPDATE feedback SET excluded_from_learning = ? WHERE feedback_id = ?",
+        (1 if excluded else 0, feedback_id),
+    )
+    conn.commit()
 
 
 def find_feedback_invariant_violations(conn: sqlite3.Connection) -> list[str]:
