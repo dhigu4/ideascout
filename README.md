@@ -486,9 +486,123 @@ message listing any backups found; pre-migration and routine backups are
 created correctly (verified as real, restorable point-in-time snapshots,
 not just files that exist); routine backup retention keeps the most
 recent 14 while never touching pre-migration backups; and the production
-`.env` is never written to by any code path. They run entirely offline
-against temporary SQLite files with a fake parser -- no real AgentMail or
-Anthropic account or credentials are needed to run `pytest`.
+`.env` is never written to by any code path. `tests/test_cli_build_taste.py`
+covers Stage 3 below the same way: the canonical eligibility query is what
+actually gets called (not a re-implementation); excluded and
+`NEEDS_REVIEW` feedback never enter training; `NEW_IDEA`/`MISSED_IDEA`
+without a verdict still count; the 15-record minimum and 5-rule cap are
+enforced; the exact training `feedback_id`s, version metadata, and
+`idea-taste.md` hash are all persisted and reproducible; holdout counting
+only starts after a version's checkpoint, never double-counts training
+data, and correctly excludes excluded/`NEEDS_REVIEW` records; regeneration
+is blocked below 20 holdout judgments and allowed at exactly 20; and
+`IDEA_SCREEN_RULES.md` is never touched by any of this. They run entirely
+offline against temporary SQLite files with a fake parser -- no real
+AgentMail or Anthropic account or credentials are needed to run `pytest`.
+
+---
+
+# Stage 3 -- Far View Idea Taste v1
+
+Stage 3 builds the first compact, regenerable model of Brad's
+idea-selection taste from his own accumulated feedback. It deliberately
+keeps three things separate:
+
+1. **SQLite `feedback`** -- permanent ground truth of exactly what Brad said.
+2. **`idea-taste.md`** -- inferred, regenerable description of his current
+   preferences, built by an LLM reasoning over (1).
+3. **`IDEA_SCREEN_RULES.md`** -- Brad's own explicit, permanent, manually
+   approved rules. IdeaScout never writes to this file, automatically or
+   otherwise -- Stage 3 only ever *proposes* candidates for Brad to review.
+
+## 1. Generating Taste v1
+
+```
+python run.py build-taste
+```
+
+Uses **only** `db.get_feedback_eligible_for_learning()` -- the same
+canonical query `approve-review`/`exclude-feedback` already rely on -- so
+a feedback record only ever trains the taste model if it's both not
+excluded and its message has been fully approved (`PARSED`). A
+`NEEDS_REVIEW` record is never used, no matter how confident-looking its
+content is. Requires at least 15 eligible records:
+
+```
+Eligible training records: 23
+Generated taste v1 from 23 eligible feedback record(s).
+  C:\Users\brad\IdeaScoutLocal\idea-taste.md
+  C:\Users\brad\IdeaScoutLocal\candidate-permanent-rules.md
+3 candidate permanent rule(s) proposed -- not applied automatically.
+Holdout for v1 starts now: the next 20 eligible judgments must accumulate before this can be regenerated.
+```
+
+Both files are written under `IdeaScoutLocal`, next to the database --
+never into this repo, and never committed. `ANTHROPIC_API_KEY` (same
+credential Stage 2 uses) is required; taste-building uses a separate,
+more capable model by default (`claude-opus-5` -- override with
+`TASTE_MODEL_NAME` if desired) since synthesizing nuanced, contradiction-
+preserving taste from a whole corpus of judgments is a fundamentally
+harder task than per-message extraction.
+
+`idea-taste.md` follows a fixed compact structure (Strong Positive
+Signals, Strong Negative Signals, Context-Dependent Signals, Mispricing
+Patterns, Upside/Asymmetry Preferences, Risk Tolerance, Situation/Company
+Preferences, Areas Still Uncertain) so it stays cheap to reuse inside
+future screening prompts. The model is instructed to reason only from
+Brad's own words and verdicts -- never from the underlying investment
+writeups (which it is never even given) -- to weight his natural-language
+explanation above the bare verdict, to preserve contradictions rather than
+average them away, to distinguish a repeated pattern from a one-off
+comment, and to use cautious language ("appears to prefer", "mixed
+evidence") when the evidence is thin.
+
+`candidate-permanent-rules.md` proposes at most 5 durable rules (fewer, or
+none, if the evidence doesn't support that many), each with its evidence,
+why it might generalize, and a HIGH/MEDIUM/LOW confidence rating. These
+are proposals only -- review them yourself and add anything you agree
+with to `IDEA_SCREEN_RULES.md` by hand.
+
+## 2. Checking taste status
+
+```
+python run.py taste-status
+```
+
+```
+Taste version: v1
+Training judgments: 23
+Holdout judgments collected: 4 / 20
+Taste frozen: YES
+```
+
+Reports "No taste model has been generated yet" if `build-taste` hasn't
+been run yet.
+
+## 3. The holdout freeze
+
+Building `idea-taste.md` starts a time-forward evaluation: the **next 20**
+feedback records that become eligible after that version's training
+checkpoint are its holdout set. `build-taste` refuses to regenerate until
+all 20 have accumulated (`taste-status` shows the running count) -- this
+is what keeps the taste model from being silently re-fit on the very data
+you'd want to use to judge whether it's actually working. A record that
+was already part of training (or existed but wasn't eligible yet, e.g.
+still `NEEDS_REVIEW`, at checkpoint time) never counts toward holdout, and
+excluded/`NEEDS_REVIEW` records never count even after the checkpoint.
+Once 20 have accumulated, `build-taste` will generate the next version
+(`v2`) from the full eligible set at that point, and start a fresh
+holdout window for it. Stage 3 does not yet *evaluate* the holdout
+against the taste model's predictions -- that, along with screening and
+ranking, is future work.
+
+## 4. Reproducibility
+
+Every taste version's exact training set is recorded in the database
+(`taste_versions` table): the precise list of `feedback_id`s used, the
+model that generated it, a SHA-256 hash of the resulting `idea-taste.md`,
+and the checkpoint that defines its holdout window. Nothing about a past
+version's training set can drift silently.
 
 ## Database initialization, safety, and backups
 
@@ -605,3 +719,21 @@ never again go unnoticed.
 
 Table `app_meta` is a simple key/value table used for `status` (e.g.
 `last_check_at`, `last_parse_at`, `last_error`).
+
+Table `taste_versions` (Stage 3, one row per generated taste version --
+the generated `.md` files themselves live under `IdeaScoutLocal`, never in
+this table or this repo; this table is the reproducible record of how
+they were produced):
+
+| column                      | meaning |
+|-----------------------------|---------|
+| version_number              | 1, 2, 3, ... -- the canonical ordering |
+| version_label               | `v1`, `v2`, ... |
+| generated_at / created_at   | when this version was generated |
+| model_name                  | which LLM model produced it |
+| training_count              | how many eligible feedback records trained it |
+| training_feedback_ids_json  | the exact `feedback_id`s used, as a JSON array -- the reproducible training set |
+| checkpoint_feedback_id      | `max(feedback_id)` among the training set; this version's holdout is every eligible record with a higher `feedback_id` |
+| idea_taste_path             | full path to the generated `idea-taste.md` |
+| idea_taste_sha256           | SHA-256 of that file's exact content at generation time |
+| candidate_rules_path        | full path to the generated `candidate-permanent-rules.md` |

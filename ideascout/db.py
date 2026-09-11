@@ -238,6 +238,32 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE feedback ADD COLUMN excluded_from_learning INTEGER NOT NULL DEFAULT 0;
     """,
+    # Migration 8 (Stage 3): Far View Taste versions. Each row is one
+    # generated idea-taste.md / candidate-permanent-rules.md pair, with
+    # exactly which feedback rows trained it (training_feedback_ids_json)
+    # and where its time-forward holdout window starts
+    # (checkpoint_feedback_id -- the max feedback_id among that training
+    # set). The generated .md files themselves live under IdeaScoutLocal,
+    # never in this repo and never in this table; this table is only the
+    # reproducible record of how they were produced.
+    """
+    CREATE TABLE taste_versions (
+        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_number              INTEGER NOT NULL UNIQUE,
+        version_label               TEXT NOT NULL,
+        generated_at                TEXT NOT NULL,
+        model_name                  TEXT NOT NULL,
+        training_count              INTEGER NOT NULL,
+        training_feedback_ids_json  TEXT NOT NULL,
+        checkpoint_feedback_id      INTEGER NOT NULL,
+        idea_taste_path             TEXT NOT NULL,
+        idea_taste_sha256           TEXT NOT NULL,
+        candidate_rules_path        TEXT NOT NULL,
+        created_at                  TEXT NOT NULL
+    );
+
+    CREATE INDEX idx_taste_versions_version_number ON taste_versions(version_number);
+    """,
 ]
 
 
@@ -1020,3 +1046,91 @@ def find_feedback_invariant_violations(conn: sqlite3.Connection) -> list[str]:
         )
 
     return violations
+
+
+# --- Stage 3: Far View Taste versions ---------------------------------------
+
+
+def get_eligible_feedback_after(conn: sqlite3.Connection, checkpoint_feedback_id: int) -> list[sqlite3.Row]:
+    """Eligible feedback rows (via the one canonical
+    get_feedback_eligible_for_learning query) with feedback_id strictly
+    greater than checkpoint_feedback_id -- i.e. judgments that showed up
+    after a taste version's training checkpoint. This is how the holdout
+    count is computed; it deliberately filters the canonical query's own
+    result rather than writing a second, separate eligibility query, so
+    the two can never drift apart.
+    """
+    eligible = get_feedback_eligible_for_learning(conn)
+    return [row for row in eligible if row["feedback_id"] > checkpoint_feedback_id]
+
+
+def get_latest_taste_version(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM taste_versions ORDER BY version_number DESC LIMIT 1"
+    ).fetchone()
+
+
+def update_taste_version_sha256(
+    conn: sqlite3.Connection, *, version_number: int, idea_taste_sha256: str
+) -> None:
+    """Update the stored hash for an existing taste_versions row after an
+    editorial correction to its idea-taste.md file on disk. Does not touch
+    version_number, training_feedback_ids_json, checkpoint_feedback_id, or
+    any other column -- this is purely "the file's contents changed, so the
+    recorded fingerprint of it must change too," not a new generation.
+    """
+    conn.execute(
+        "UPDATE taste_versions SET idea_taste_sha256 = :idea_taste_sha256 "
+        "WHERE version_number = :version_number",
+        {"idea_taste_sha256": idea_taste_sha256, "version_number": version_number},
+    )
+    conn.commit()
+
+
+def insert_taste_version(
+    conn: sqlite3.Connection,
+    *,
+    version_number: int,
+    version_label: str,
+    generated_at: str,
+    model_name: str,
+    training_count: int,
+    training_feedback_ids_json: str,
+    checkpoint_feedback_id: int,
+    idea_taste_path: str,
+    idea_taste_sha256: str,
+    candidate_rules_path: str,
+    created_at: str,
+) -> None:
+    """Record one generated taste version. version_number must be unique
+    and increasing (1, 2, 3, ...) -- the UNIQUE constraint on it is what
+    prevents two concurrent build-taste runs from ever producing two
+    conflicting "v2"s.
+    """
+    conn.execute(
+        """
+        INSERT INTO taste_versions (
+            version_number, version_label, generated_at, model_name,
+            training_count, training_feedback_ids_json, checkpoint_feedback_id,
+            idea_taste_path, idea_taste_sha256, candidate_rules_path, created_at
+        ) VALUES (
+            :version_number, :version_label, :generated_at, :model_name,
+            :training_count, :training_feedback_ids_json, :checkpoint_feedback_id,
+            :idea_taste_path, :idea_taste_sha256, :candidate_rules_path, :created_at
+        )
+        """,
+        {
+            "version_number": version_number,
+            "version_label": version_label,
+            "generated_at": generated_at,
+            "model_name": model_name,
+            "training_count": training_count,
+            "training_feedback_ids_json": training_feedback_ids_json,
+            "checkpoint_feedback_id": checkpoint_feedback_id,
+            "idea_taste_path": idea_taste_path,
+            "idea_taste_sha256": idea_taste_sha256,
+            "candidate_rules_path": candidate_rules_path,
+            "created_at": created_at,
+        },
+    )
+    conn.commit()

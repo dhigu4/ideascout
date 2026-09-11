@@ -8,11 +8,12 @@ what the tests exercise directly.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import parseaddr
 
-from . import agentmail_client, db, parser
+from . import agentmail_client, db, parser, taste
 from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
@@ -20,6 +21,23 @@ from .logger import get_logger, setup_logging
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _atomic_write(path, content: str) -> None:
+    """Write `content` to `path` via a temp-file-then-rename, so a reader
+    never sees a partially-written file and a failure mid-write never
+    leaves `path` itself corrupted -- whatever `path` contained before
+    (valid content, or nothing) is untouched until the rename succeeds.
+
+    newline="" is required: without it, Path.write_text's default text
+    mode silently translates "\\n" to "\\r\\n" on Windows, so the bytes
+    landing on disk would no longer match a SHA-256 computed from the
+    in-memory string -- exactly the kind of mismatch taste artifact
+    hash-verification exists to catch.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8", newline="")
+    tmp.replace(path)
 
 
 def _sender_email_address(raw_sender: str | None) -> str:
@@ -688,6 +706,261 @@ def cmd_approve_review(config: Config, message_id: str) -> int:
     return 0
 
 
+def cmd_build_taste(config: Config) -> int:
+    """Generate a new Far View Idea Taste version from Brad's accumulated
+    eligible feedback (see db.get_feedback_eligible_for_learning -- the
+    ONE canonical eligibility query; this command never recreates that
+    logic). Requires at least taste.MIN_TRAINING_RECORDS eligible records,
+    and refuses to regenerate while the previous version's time-forward
+    holdout has fewer than taste.HOLDOUT_SIZE judgments collected.
+
+    Every version's real, authoritative artifacts are immutable files
+    under IdeaScoutLocal\\taste-versions\\vN\\ -- written, renamed into
+    place, and hash-verified BEFORE the taste_versions row is committed.
+    That DB commit is the one and only thing that makes a version
+    "active"; nothing here ever decides the current version by looking at
+    files on disk. A failure at any point before that commit -- including
+    a process crash -- can leave orphaned vN files behind, but can never
+    alter whichever version was previously active (v1's own row/files, or
+    -- for a v1 built before this scheme existed -- the canonical files
+    directly, since that is what v1's row already points at).
+
+    idea-taste.md and candidate-permanent-rules.md directly under
+    IdeaScoutLocal are refreshed as convenience copies only, AFTER the new
+    version is already active -- if that refresh fails, the active
+    version and its authoritative artifacts are unaffected; this prints a
+    warning rather than failing or rolling anything back.
+
+    Never touches IDEA_SCREEN_RULES.md -- that file is Brad's own
+    permanent, manually curated rules and nothing here ever writes to it.
+    """
+    logger = get_logger()
+    conn = db.open_production_database(config.database_path)
+
+    eligible = db.get_feedback_eligible_for_learning(conn)
+    print(f"Eligible training records: {len(eligible)}")
+
+    if len(eligible) < taste.MIN_TRAINING_RECORDS:
+        conn.close()
+        print(
+            f"Need at least {taste.MIN_TRAINING_RECORDS} eligible feedback records to "
+            f"build a taste model; only {len(eligible)} available right now."
+        )
+        return 1
+
+    latest = db.get_latest_taste_version(conn)
+    if latest is not None:
+        holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
+        if len(holdout) < taste.HOLDOUT_SIZE:
+            conn.close()
+            print(
+                f"Taste {latest['version_label']} is frozen for time-forward evaluation: "
+                f"{len(holdout)}/{taste.HOLDOUT_SIZE} holdout judgments collected so far. "
+                "Refusing to regenerate until all of them have accumulated -- see "
+                "'python run.py taste-status'."
+            )
+            return 1
+
+    try:
+        client = taste.build_client(config.anthropic_api_key)
+    except Exception as exc:
+        message = f"Could not create LLM client: {exc}"
+        logger.exception(message)
+        conn.close()
+        print(f"build-taste FAILED: {message}")
+        return 1
+
+    records = taste.training_records_from_rows(eligible)
+
+    # Both generations happen entirely in memory before anything touches
+    # disk or the database -- a failure here (even after some internal
+    # retries inside taste.py) leaves no trace anywhere.
+    try:
+        body = taste.generate_idea_taste_body(client, config.taste_model_name, records, logger=logger)
+        rules = taste.generate_candidate_rules(client, config.taste_model_name, records, logger=logger)
+    except taste.TasteGenerationError as exc:
+        logger.exception(str(exc))
+        conn.close()
+        print(f"build-taste FAILED: {exc}")
+        return 1
+
+    version_number = (latest["version_number"] + 1) if latest is not None else 1
+    version_label = f"v{version_number}"
+    generated_date = date.today().isoformat()
+    generated_at = utcnow_iso()
+
+    idea_taste_content = taste.render_idea_taste_document(
+        version_label=version_label,
+        generated_date=generated_date,
+        training_count=len(eligible),
+        body=body,
+    )
+    idea_taste_sha256 = taste.compute_content_sha256(idea_taste_content)
+    candidate_rules_content = taste.render_candidate_rules_document(
+        version_label=version_label,
+        generated_date=generated_date,
+        training_count=len(eligible),
+        rules=rules,
+    )
+
+    training_ids = sorted(row["feedback_id"] for row in eligible)
+    checkpoint_feedback_id = training_ids[-1]
+
+    # Immutable, version-specific staging directory. Every future build
+    # writes its complete artifacts here FIRST, at a path unique to this
+    # version number -- never at the canonical idea-taste.md /
+    # candidate-permanent-rules.md paths directly. Nothing below is
+    # "active" until the taste_versions row is committed at the end: a
+    # crash or failure at any point up to and including that commit call
+    # leaves these as harmless orphan files and never touches whichever
+    # version was previously active (an older version's own immutable
+    # directory, or -- for a v1 built before this scheme existed -- the
+    # canonical files directly, since that is what v1's row points at).
+    version_dir = config.database_path.parent / "taste-versions" / version_label
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    idea_taste_version_path = version_dir / "idea-taste.md"
+    candidate_rules_version_path = version_dir / "candidate-permanent-rules.md"
+    idea_taste_version_tmp = idea_taste_version_path.with_suffix(idea_taste_version_path.suffix + ".tmp")
+    candidate_rules_version_tmp = candidate_rules_version_path.with_suffix(
+        candidate_rules_version_path.suffix + ".tmp"
+    )
+
+    try:
+        # 1-3: documents already exist as validated strings in memory;
+        # write each to a temp file inside this version's own directory
+        # and atomically rename it into its immutable, version-specific
+        # final filename.
+        _atomic_write(idea_taste_version_path, idea_taste_content)
+        _atomic_write(candidate_rules_version_path, candidate_rules_content)
+
+        # 4: verify hashes. The bytes now sitting at the immutable paths
+        # must be exactly what was generated in memory before any of this
+        # is allowed to become active -- this is what would catch, e.g., a
+        # filesystem-level write that silently truncated or corrupted the
+        # file despite the rename succeeding.
+        taste.verify_file_sha256(idea_taste_version_path, idea_taste_sha256, label="idea-taste.md")
+        if candidate_rules_version_path.read_text(encoding="utf-8") != candidate_rules_content:
+            raise taste.TasteIntegrityError(
+                f"candidate-permanent-rules.md content mismatch after write: {candidate_rules_version_path}"
+            )
+
+        # 5: only now, with complete and verified immutable artifacts
+        # already on disk, commit the taste_versions row. This single
+        # commit is the ENTIRE definition of "active" -- taste-status and
+        # all future screening logic read only this row, never file
+        # presence, to determine the current version.
+        db.insert_taste_version(
+            conn,
+            version_number=version_number,
+            version_label=version_label,
+            generated_at=generated_at,
+            model_name=config.taste_model_name,
+            training_count=len(eligible),
+            training_feedback_ids_json=json.dumps(training_ids),
+            checkpoint_feedback_id=checkpoint_feedback_id,
+            idea_taste_path=str(idea_taste_version_path),
+            idea_taste_sha256=idea_taste_sha256,
+            candidate_rules_path=str(candidate_rules_version_path),
+            created_at=generated_at,
+        )
+    except Exception as exc:
+        message = f"Failed to finalize taste {version_label}: {exc}"
+        logger.exception(message)
+        # Best-effort tidy-up of this not-yet-active version's staging
+        # files. Purely cosmetic: whether or not this succeeds, nothing
+        # here was ever active (that is decided solely by the
+        # taste_versions row, which was never committed), and whatever
+        # version was previously active -- rows and files alike -- was
+        # never touched by any of the code above.
+        for stray in (
+            idea_taste_version_tmp,
+            candidate_rules_version_tmp,
+            idea_taste_version_path,
+            candidate_rules_version_path,
+        ):
+            try:
+                stray.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            version_dir.rmdir()  # only succeeds if now empty
+        except OSError:
+            pass
+        conn.close()
+        print(f"build-taste FAILED: {message}")
+        return 1
+
+    # From here on {version_label} IS the active version -- the DB row is
+    # committed -- no matter what happens next. Refreshing the canonical
+    # convenience copies is a nicety for easy reading, not part of
+    # activation, so its failure is reported as a warning, never as a
+    # command failure or a reason to touch the row/artifacts above.
+    canonical_idea_taste_path = config.database_path.parent / "idea-taste.md"
+    canonical_candidate_rules_path = config.database_path.parent / "candidate-permanent-rules.md"
+    try:
+        _atomic_write(canonical_idea_taste_path, idea_taste_content)
+        _atomic_write(canonical_candidate_rules_path, candidate_rules_content)
+    except Exception as exc:
+        logger.exception(f"Failed to refresh canonical convenience copies for {version_label}: {exc}")
+        print(
+            f"WARNING: taste {version_label} is active and its authoritative artifacts are "
+            f"valid, but refreshing the convenience copies at {canonical_idea_taste_path} and "
+            f"{canonical_candidate_rules_path} failed: {exc}"
+        )
+
+    conn.close()
+
+    print(f"Generated taste {version_label} from {len(eligible)} eligible feedback record(s).")
+    print(f"  {idea_taste_version_path}")
+    print(f"  {candidate_rules_version_path}")
+    print(f"{len(rules)} candidate permanent rule(s) proposed -- not applied automatically.")
+    print(
+        f"Holdout for {version_label} starts now: the next {taste.HOLDOUT_SIZE} eligible "
+        "judgments must accumulate before this can be regenerated."
+    )
+    return 0
+
+
+def cmd_taste_status(config: Config) -> int:
+    conn = db.open_production_database(config.database_path)
+    latest = db.get_latest_taste_version(conn)
+
+    if latest is None:
+        conn.close()
+        print("No taste model has been generated yet.")
+        print(
+            f"Run 'python run.py build-taste' once at least {taste.MIN_TRAINING_RECORDS} "
+            "eligible feedback records exist."
+        )
+        return 0
+
+    holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
+    conn.close()
+
+    frozen = len(holdout) < taste.HOLDOUT_SIZE
+
+    print(f"Taste version: {latest['version_label']}")
+    print(f"Training judgments: {latest['training_count']}")
+    print(f"Holdout judgments collected: {len(holdout)} / {taste.HOLDOUT_SIZE}")
+    print(f"Taste frozen: {'YES' if frozen else 'NO'}")
+
+    # Fail loudly rather than silently trusting a file that may have been
+    # edited, truncated, or lost since this version was activated. This
+    # checks the authoritative artifact the DB row points at -- for a
+    # legacy v1 built before immutable per-version directories existed,
+    # that is the canonical idea-taste.md itself; for every version since,
+    # it is the immutable taste-versions/vN/idea-taste.md.
+    try:
+        taste.verify_taste_version_integrity(latest)
+    except taste.TasteIntegrityError as exc:
+        print(f"Artifact integrity: FAILED -- {exc}")
+        return 1
+
+    print("Artifact integrity: OK")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
@@ -735,6 +1008,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approve a NEEDS_REVIEW message's feedback exactly as extracted",
     )
     approve_parser.add_argument("message_id", help="message_id to approve")
+    subparsers.add_parser(
+        "build-taste",
+        help="Generate a new Far View Idea Taste version from eligible feedback",
+    )
+    subparsers.add_parser(
+        "taste-status",
+        help="Show the current taste version and its holdout progress",
+    )
     return arg_parser
 
 
@@ -797,6 +1078,14 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_approve_review(config, args.message_id)
+        elif args.command == "build-taste":
+            config = load_config(require_taste=True)
+            setup_logging(config.log_path)
+            return cmd_build_taste(config)
+        elif args.command == "taste-status":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_taste_status(config)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2

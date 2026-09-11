@@ -508,4 +508,39 @@ def test_no_feedback_status_with_feedback_rows_is_flagged_as_inconsistent(tmp_pa
     violations = db.find_feedback_invariant_violations(conn)
     assert len(violations) == 1
     assert "msg_1" in violations[0]
+
+
+def test_update_taste_version_sha256_changes_only_the_hash(tmp_path):
+    """update_taste_version_sha256 exists to let an editorial correction to
+    an existing idea-taste.md (fixing wording/encoding, not regenerating)
+    keep its stored fingerprint in sync -- it must never touch the
+    training set, checkpoint, version number, or any other column.
+    """
+    conn = db.connect(tmp_path / "ideas.db")
+    db.insert_taste_version(
+        conn,
+        version_number=1,
+        version_label="v1",
+        generated_at="2026-09-10T18:22:26+00:00",
+        model_name="claude-opus-5",
+        training_count=19,
+        training_feedback_ids_json="[1, 2, 3]",
+        checkpoint_feedback_id=21,
+        idea_taste_path=str(tmp_path / "idea-taste.md"),
+        idea_taste_sha256="oldhash",
+        candidate_rules_path=str(tmp_path / "candidate-permanent-rules.md"),
+        created_at="2026-09-10T18:22:26+00:00",
+    )
+
+    db.update_taste_version_sha256(conn, version_number=1, idea_taste_sha256="newhash")
+
+    row = db.get_latest_taste_version(conn)
+    assert row["idea_taste_sha256"] == "newhash"
+    # Everything else is untouched.
+    assert row["version_number"] == 1
+    assert row["version_label"] == "v1"
+    assert row["training_count"] == 19
+    assert row["training_feedback_ids_json"] == "[1, 2, 3]"
+    assert row["checkpoint_feedback_id"] == 21
+    assert row["generated_at"] == "2026-09-10T18:22:26+00:00"
     conn.close()
