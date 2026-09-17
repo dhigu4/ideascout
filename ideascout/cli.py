@@ -12,8 +12,9 @@ import json
 import sys
 from datetime import date, datetime, timezone
 from email.utils import parseaddr
+from pathlib import Path
 
-from . import agentmail_client, db, parser, taste
+from . import agentmail_client, db, idea_extraction, parser, shadow, source_isolation, structured_llm, taste
 from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
@@ -961,6 +962,275 @@ def cmd_taste_status(config: Config) -> int:
     return 0
 
 
+# --- Stage 4: blind shadow screening for the Taste v1 holdout ---------------
+#
+# SHADOW MODE ONLY. Nothing in this section ever regenerates or modifies
+# Taste v1, changes the holdout checkpoint, or writes to
+# IDEA_SCREEN_RULES.md. Nothing here ever shows Brad a prediction before
+# his own eligible feedback for that idea already exists in the database
+# (see cmd_show_shadow_results) -- shadow-status shows aggregate counts
+# only, never an individual idea's prediction.
+
+
+def cmd_shadow_score(config: Config) -> int:
+    """Blind shadow-screen every post-Taste-v1 holdout idea whose source
+    material can be reliably isolated from Brad's own commentary.
+
+    Three cost-tiered steps run per eligible holdout message, each
+    idempotent and skipped if already done:
+      Level 0 (free, local, no LLM): isolate source material from Brad's
+        commentary (source_isolation.isolate_source). If it can't be done
+        reliably, the message is recorded UNSCORABLE_SOURCE with a reason
+        and permanently skipped -- never guessed at, never retried.
+      Level 1 (cheap model): extract a compact, source-only idea record
+        (idea_extraction.extract_idea). Left PENDING (not a terminal
+        error) on failure, so a future run retries automatically.
+      Level 2 (capable model): screen that compact record against the
+        frozen Taste v1 artifact and canonical IDEA_SCREEN_RULES.md
+        (shadow.screen_idea), recording a new, immutable prediction --
+        unless an identical (idea, taste version, rules hash) prediction
+        already exists, in which case it is skipped, never overwritten.
+
+    Uses db.get_eligible_feedback_after -- the SAME canonical holdout
+    query taste-status uses -- so shadow-score can never disagree with
+    the holdout bookkeeping about which ideas are in scope. It never
+    touches taste_versions, never touches the holdout checkpoint, and
+    never reads candidate-permanent-rules.md.
+    """
+    logger = get_logger()
+    conn = db.open_production_database(config.database_path)
+
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet. Run 'python run.py build-taste' first.")
+        return 1
+
+    try:
+        taste.verify_taste_version_integrity(latest_taste)
+    except taste.TasteIntegrityError as exc:
+        conn.close()
+        print(f"shadow-score FAILED: taste {latest_taste['version_label']} artifact integrity check failed: {exc}")
+        return 1
+
+    if not config.screen_rules_path.exists():
+        conn.close()
+        print(
+            f"shadow-score FAILED: canonical screening rules file not found at "
+            f"{config.screen_rules_path}. Set SCREEN_RULES_PATH in .env if it lives elsewhere."
+        )
+        return 1
+
+    idea_taste_content = Path(latest_taste["idea_taste_path"]).read_text(encoding="utf-8")
+    screen_rules_content = config.screen_rules_path.read_text(encoding="utf-8")
+    screen_rules_sha256 = taste.compute_content_sha256(screen_rules_content)
+
+    holdout_rows = db.get_eligible_feedback_after(conn, latest_taste["checkpoint_feedback_id"])
+    # Dedupe by message_id: multiple feedback events on the same message
+    # (e.g. one email covering several ideas) share one source and one
+    # idea record -- see idea_records.message_id UNIQUE constraint. Order
+    # preserved (dict.fromkeys), oldest first, matching holdout order.
+    message_ids = list(dict.fromkeys(row["message_id"] for row in holdout_rows))
+    print(f"Holdout messages to consider: {len(message_ids)}")
+
+    isolated_now = 0
+    unscorable_now = 0
+    extracted_now = 0
+    predictions_now = 0
+    already_predicted = 0
+
+    idea_extraction_client = None  # built lazily -- only if actually needed
+    shadow_client = None
+
+    for message_id in message_ids:
+        idea_record = db.get_idea_record_by_message_id(conn, message_id)
+
+        if idea_record is None:
+            message = db.get_message(conn, message_id)
+            isolation = source_isolation.isolate_source(message["body_raw"] if message is not None else None)
+            isolated_at = utcnow_iso()
+            if not isolation.scorable:
+                db.insert_idea_record_unscorable(
+                    conn,
+                    message_id=message_id,
+                    unscorable_reason=isolation.unscorable_reason,
+                    source_isolated_at=isolated_at,
+                )
+                unscorable_now += 1
+                continue
+            source_hash = taste.compute_content_sha256(isolation.source_text)
+            db.insert_idea_record_isolated(
+                conn,
+                message_id=message_id,
+                source_type=isolation.source_type,
+                source_text=isolation.source_text,
+                source_hash=source_hash,
+                source_isolated_at=isolated_at,
+            )
+            isolated_now += 1
+            idea_record = db.get_idea_record_by_message_id(conn, message_id)
+
+        if idea_record["source_status"] != "ISOLATED":
+            continue  # UNSCORABLE_SOURCE from a previous run -- never retried automatically
+
+        if idea_record["extraction_status"] != "EXTRACTED":
+            if idea_extraction_client is None:
+                idea_extraction_client = idea_extraction.build_client(config.anthropic_api_key)
+            try:
+                extracted = idea_extraction.extract_idea(
+                    idea_extraction_client, config.parser_model_name, idea_record["source_text"], logger=logger
+                )
+            except structured_llm.StructuredGenerationError as exc:
+                logger.exception(str(exc))
+                print(f"  Idea extraction failed for message {message_id}: {exc} (will retry on a future run)")
+                continue
+            db.update_idea_record_extracted(
+                conn,
+                idea_id=idea_record["idea_id"],
+                company=extracted.company,
+                ticker=extracted.ticker,
+                source_title=extracted.source_title,
+                source_date=extracted.source_date,
+                business_summary=extracted.business_summary,
+                core_thesis=extracted.core_thesis,
+                why_mispriced=extracted.why_mispriced,
+                future_earnings_change=extracted.future_earnings_change,
+                upside_case=extracted.upside_case,
+                downside_or_key_risks=extracted.downside_or_key_risks,
+                catalysts=extracted.catalysts,
+                what_must_be_true=extracted.what_must_be_true,
+                evidence_of_market_misunderstanding=extracted.evidence_of_market_misunderstanding,
+                known_unknowns=extracted.known_unknowns,
+                extraction_model_name=config.parser_model_name,
+                extracted_at=utcnow_iso(),
+            )
+            extracted_now += 1
+            idea_record = db.get_idea_record_by_message_id(conn, message_id)
+
+        existing_prediction = db.get_shadow_prediction(
+            conn,
+            idea_id=idea_record["idea_id"],
+            taste_version=latest_taste["version_number"],
+            screen_rules_sha256=screen_rules_sha256,
+        )
+        if existing_prediction is not None:
+            already_predicted += 1
+            continue
+
+        if shadow_client is None:
+            shadow_client = shadow.build_client(config.anthropic_api_key)
+        try:
+            prediction = shadow.screen_idea(
+                shadow_client,
+                config.taste_model_name,
+                idea_taste_body=idea_taste_content,
+                screen_rules_body=screen_rules_content,
+                idea_record=idea_record,
+                logger=logger,
+            )
+        except structured_llm.StructuredGenerationError as exc:
+            logger.exception(str(exc))
+            print(f"  Shadow screening failed for message {message_id}: {exc} (will retry on a future run)")
+            continue
+
+        db.insert_shadow_prediction(
+            conn,
+            idea_id=idea_record["idea_id"],
+            created_at=utcnow_iso(),
+            taste_version=latest_taste["version_number"],
+            taste_sha256=latest_taste["idea_taste_sha256"],
+            screen_rules_path=str(config.screen_rules_path),
+            screen_rules_sha256=screen_rules_sha256,
+            source_hash=idea_record["source_hash"],
+            model_name=config.taste_model_name,
+            overall_prediction=prediction.overall_prediction,
+            mispricing=prediction.mispricing,
+            variant_perception=prediction.variant_perception,
+            upside=prediction.upside,
+            business_quality=prediction.business_quality,
+            downside=prediction.downside,
+            key_reasons_json=json.dumps(prediction.key_reasons),
+            key_concerns_json=json.dumps(prediction.key_concerns),
+            critical_questions_json=json.dumps(prediction.critical_questions),
+            confidence=prediction.confidence,
+        )
+        predictions_now += 1
+
+    conn.close()
+
+    print(f"Sources isolated this run: {isolated_now}")
+    print(f"Unscorable sources this run: {unscorable_now}")
+    print(f"Ideas extracted this run: {extracted_now}")
+    print(f"Shadow predictions created this run: {predictions_now}")
+    if already_predicted:
+        print(f"Already had a prediction for this taste/rules version: {already_predicted}")
+    return 0
+
+
+def cmd_shadow_status(config: Config) -> int:
+    """Aggregate counts ONLY. Must never reveal an individual idea's
+    prediction -- see cmd_show_shadow_results for the (gated) command
+    that does that.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet.")
+        return 0
+
+    holdout = db.get_eligible_feedback_after(conn, latest_taste["checkpoint_feedback_id"])
+    isolated = db.count_idea_records_by_source_status(conn, "ISOLATED")
+    unscorable = db.count_idea_records_by_source_status(conn, "UNSCORABLE_SOURCE")
+    predictions = db.count_shadow_predictions_for_taste_version(conn, latest_taste["version_number"])
+    conn.close()
+
+    print(f"Taste version: {latest_taste['version_label']}")
+    print(f"Holdout judgments collected: {len(holdout)} / {taste.HOLDOUT_SIZE}")
+    print(f"Sources isolated: {isolated}")
+    print(f"Unscorable sources: {unscorable}")
+    print(f"Shadow predictions generated: {predictions}")
+    return 0
+
+
+def cmd_show_shadow_results(config: Config) -> int:
+    """Reveal a shadow prediction next to Brad's actual verdict, but ONLY
+    for ideas where Brad's own eligible feedback already exists. This is
+    checked fresh per idea (db.get_eligible_feedback_for_message), never
+    assumed from holdout membership, so the no-leakage/no-influence
+    guarantee holds even as the system grows beyond the holdout-only case
+    this stage covers. Never updates taste or anything else -- read-only.
+    """
+    conn = db.open_production_database(config.database_path)
+
+    idea_ids = db.get_idea_ids_with_shadow_predictions(conn)
+    shown = 0
+    for idea_id in idea_ids:
+        idea_record = db.get_idea_record(conn, idea_id)
+        judged_feedback = db.get_eligible_feedback_for_message(conn, idea_record["message_id"])
+        if not judged_feedback:
+            continue  # Brad has not (yet) supplied an eligible judgment -- never reveal
+
+        prediction = db.get_latest_shadow_prediction_for_idea(conn, idea_id)
+        label = idea_record["company"] or idea_record["ticker"] or idea_record["message_id"]
+        ticker_suffix = f" ({idea_record['ticker']})" if idea_record["ticker"] and idea_record["ticker"] != label else ""
+
+        for feedback_row in judged_feedback:
+            print(f"=== {label}{ticker_suffix} ===")
+            print(f"Shadow prediction: {prediction['overall_prediction']} (confidence: {prediction['confidence']})")
+            print(f"Brad's actual verdict: {feedback_row['verdict'] or feedback_row['event_type']}")
+            print(f"Prediction rationale: {'; '.join(json.loads(prediction['key_reasons_json'])) or '(none given)'}")
+            print(f"Brad's actual reason: {feedback_row['user_comment'] or '(no comment)'}")
+            print()
+            shown += 1
+
+    if shown == 0:
+        print("No judged, scorable shadow predictions to show yet.")
+    conn.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
@@ -1015,6 +1285,18 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "taste-status",
         help="Show the current taste version and its holdout progress",
+    )
+    subparsers.add_parser(
+        "shadow-score",
+        help="Blind-screen post-Taste-v1 holdout ideas against frozen Taste v1 + IDEA_SCREEN_RULES.md",
+    )
+    subparsers.add_parser(
+        "shadow-status",
+        help="Show aggregate shadow-screening counts (never an individual prediction)",
+    )
+    subparsers.add_parser(
+        "show-shadow-results",
+        help="Show shadow predictions next to Brad's actual verdict, for already-judged ideas only",
     )
     return arg_parser
 
@@ -1086,6 +1368,18 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_taste_status(config)
+        elif args.command == "shadow-score":
+            config = load_config(require_shadow=True)
+            setup_logging(config.log_path)
+            return cmd_shadow_score(config)
+        elif args.command == "shadow-status":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_shadow_status(config)
+        elif args.command == "show-shadow-results":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_show_shadow_results(config)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2

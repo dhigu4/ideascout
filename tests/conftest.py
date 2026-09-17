@@ -45,4 +45,11 @@ def _never_touch_production_state(request, tmp_path, monkeypatch):
     monkeypatch.setattr(ideascout_config, "ENV_PATH", sandbox / ".env")
     monkeypatch.setattr(ideascout_config, "DEFAULT_DATABASE_PATH", sandbox / "ideas.db")
     monkeypatch.setattr(ideascout_config, "DEFAULT_LOG_PATH", sandbox / "app.log")
+    # Stage 4: IDEA_SCREEN_RULES.md's real default lives in a SEPARATE real
+    # repo (InvestmentBrain), not under IdeaScoutLocal -- but it is still
+    # real state on Brad's machine that a test must never be able to
+    # resolve to, even by accident, so it gets the same sandboxing treatment.
+    monkeypatch.setattr(
+        ideascout_config, "DEFAULT_SCREEN_RULES_PATH", sandbox / "InvestmentBrain_TEST_SANDBOX" / "IDEA_SCREEN_RULES.md"
+    )
     yield

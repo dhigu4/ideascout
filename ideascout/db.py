@@ -264,6 +264,100 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX idx_taste_versions_version_number ON taste_versions(version_number);
     """,
+    # Migration 9 (Stage 4): blind shadow screening for the Taste v1
+    # holdout.
+    #
+    # idea_records is the permanent, inexpensive compact-idea library:
+    # one row per message_id, built in two local/cheap steps that never
+    # see Brad's feedback.
+    #   Level 0 (source_status/unscorable_reason/source_type/source_text/
+    #     source_hash/source_isolated_at) -- free, deterministic,
+    #     no-LLM separation of source material from Brad's own commentary
+    #     (see source_isolation.py). source_status is 'ISOLATED' or
+    #     'UNSCORABLE_SOURCE'; when unscorable, only the reason is filled
+    #     in and every Level-1 column stays NULL.
+    #   Level 1 (extraction_status and everything from company through
+    #     known_unknowns) -- one cheap LLM call over ISOLATED source_text
+    #     only (see idea_extraction.py). extraction_status starts
+    #     'PENDING' and becomes 'EXTRACTED' once that call succeeds; it is
+    #     deliberately left 'PENDING' (not a terminal 'ERROR') on failure
+    #     so the next shadow-score run retries automatically -- "runs once
+    #     per source" means once it has actually succeeded, not that a
+    #     failure is permanent.
+    #
+    # shadow_predictions is a strictly append-only, immutable log: a
+    # prediction is never updated or overwritten, only ever superseded by
+    # a NEW row if taste or the screening rules later change (hence the
+    # UNIQUE constraint keying on the exact combination that produced it,
+    # not just idea_id). Every column needed to reproduce exactly what was
+    # screened against is recorded on the row itself, not just referenced
+    # by version number, so a prediction remains meaningful even if a
+    # later taste version's row is itself later edited/corrected.
+    """
+    CREATE TABLE idea_records (
+        idea_id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id                           TEXT NOT NULL UNIQUE REFERENCES messages_raw(message_id),
+
+        source_status                        TEXT NOT NULL,
+        unscorable_reason                    TEXT,
+        source_type                          TEXT,
+        source_text                          TEXT,
+        source_hash                          TEXT,
+        source_isolated_at                   TEXT NOT NULL,
+
+        extraction_status                    TEXT NOT NULL DEFAULT 'PENDING',
+        company                              TEXT,
+        ticker                                TEXT,
+        source_title                         TEXT,
+        source_date                          TEXT,
+        business_summary                     TEXT,
+        core_thesis                          TEXT,
+        why_mispriced                        TEXT,
+        future_earnings_change               TEXT,
+        upside_case                          TEXT,
+        downside_or_key_risks                TEXT,
+        catalysts                            TEXT,
+        what_must_be_true                    TEXT,
+        evidence_of_market_misunderstanding  TEXT,
+        known_unknowns                       TEXT,
+        extraction_model_name                TEXT,
+        extracted_at                         TEXT
+    );
+
+    CREATE INDEX idx_idea_records_source_status ON idea_records(source_status);
+    CREATE INDEX idx_idea_records_extraction_status ON idea_records(extraction_status);
+
+    CREATE TABLE shadow_predictions (
+        prediction_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        idea_id                  INTEGER NOT NULL REFERENCES idea_records(idea_id),
+        created_at               TEXT NOT NULL,
+
+        taste_version            INTEGER NOT NULL,
+        taste_sha256             TEXT NOT NULL,
+
+        screen_rules_path        TEXT NOT NULL,
+        screen_rules_sha256      TEXT NOT NULL,
+
+        source_hash              TEXT NOT NULL,
+        model_name               TEXT NOT NULL,
+
+        overall_prediction       TEXT NOT NULL,
+        mispricing                TEXT NOT NULL,
+        variant_perception       TEXT NOT NULL,
+        upside                   TEXT NOT NULL,
+        business_quality         TEXT NOT NULL,
+        downside                 TEXT NOT NULL,
+
+        key_reasons_json         TEXT NOT NULL,
+        key_concerns_json        TEXT NOT NULL,
+        critical_questions_json  TEXT NOT NULL,
+        confidence               TEXT NOT NULL,
+
+        UNIQUE(idea_id, taste_version, screen_rules_sha256)
+    );
+
+    CREATE INDEX idx_shadow_predictions_idea_id ON shadow_predictions(idea_id);
+    """,
 ]
 
 
@@ -1134,3 +1228,269 @@ def insert_taste_version(
         },
     )
     conn.commit()
+
+
+# --- Stage 4: blind shadow screening for the Taste v1 holdout ---------------
+
+
+def get_idea_record_by_message_id(conn: sqlite3.Connection, message_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM idea_records WHERE message_id = ?", (message_id,)
+    ).fetchone()
+
+
+def get_idea_record(conn: sqlite3.Connection, idea_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM idea_records WHERE idea_id = ?", (idea_id,)
+    ).fetchone()
+
+
+def insert_idea_record_unscorable(
+    conn: sqlite3.Connection, *, message_id: str, unscorable_reason: str, source_isolated_at: str
+) -> int:
+    """Record that Level-0 isolation could not reliably separate source
+    material from Brad's own commentary for this message. Every Level-1
+    (extraction) column stays NULL -- there is nothing safe to extract
+    from, and this row is permanently skipped by shadow-score.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO idea_records (message_id, source_status, unscorable_reason, source_isolated_at)
+        VALUES (:message_id, 'UNSCORABLE_SOURCE', :unscorable_reason, :source_isolated_at)
+        """,
+        {
+            "message_id": message_id,
+            "unscorable_reason": unscorable_reason,
+            "source_isolated_at": source_isolated_at,
+        },
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_idea_record_isolated(
+    conn: sqlite3.Connection,
+    *,
+    message_id: str,
+    source_type: str,
+    source_text: str,
+    source_hash: str,
+    source_isolated_at: str,
+) -> int:
+    """Record a successfully isolated source. extraction_status starts
+    'PENDING' (its column default) -- Level 1 (idea_extraction.py) fills
+    in the compact fields and flips it to 'EXTRACTED' afterward.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO idea_records (
+            message_id, source_status, source_type, source_text, source_hash, source_isolated_at
+        ) VALUES (
+            :message_id, 'ISOLATED', :source_type, :source_text, :source_hash, :source_isolated_at
+        )
+        """,
+        {
+            "message_id": message_id,
+            "source_type": source_type,
+            "source_text": source_text,
+            "source_hash": source_hash,
+            "source_isolated_at": source_isolated_at,
+        },
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def update_idea_record_extracted(
+    conn: sqlite3.Connection,
+    *,
+    idea_id: int,
+    company: str | None,
+    ticker: str | None,
+    source_title: str | None,
+    source_date: str | None,
+    business_summary: str,
+    core_thesis: str,
+    why_mispriced: str,
+    future_earnings_change: str,
+    upside_case: str,
+    downside_or_key_risks: str,
+    catalysts: str,
+    what_must_be_true: str,
+    evidence_of_market_misunderstanding: str,
+    known_unknowns: str,
+    extraction_model_name: str,
+    extracted_at: str,
+) -> None:
+    """Fill in Level-1 (compact idea extraction) fields for a row already
+    ISOLATED at Level 0, and flip extraction_status to 'EXTRACTED'. Never
+    called for a row whose source_status is 'UNSCORABLE_SOURCE'.
+    """
+    conn.execute(
+        """
+        UPDATE idea_records
+        SET extraction_status = 'EXTRACTED',
+            company = :company,
+            ticker = :ticker,
+            source_title = :source_title,
+            source_date = :source_date,
+            business_summary = :business_summary,
+            core_thesis = :core_thesis,
+            why_mispriced = :why_mispriced,
+            future_earnings_change = :future_earnings_change,
+            upside_case = :upside_case,
+            downside_or_key_risks = :downside_or_key_risks,
+            catalysts = :catalysts,
+            what_must_be_true = :what_must_be_true,
+            evidence_of_market_misunderstanding = :evidence_of_market_misunderstanding,
+            known_unknowns = :known_unknowns,
+            extraction_model_name = :extraction_model_name,
+            extracted_at = :extracted_at
+        WHERE idea_id = :idea_id
+        """,
+        {
+            "idea_id": idea_id,
+            "company": company,
+            "ticker": ticker,
+            "source_title": source_title,
+            "source_date": source_date,
+            "business_summary": business_summary,
+            "core_thesis": core_thesis,
+            "why_mispriced": why_mispriced,
+            "future_earnings_change": future_earnings_change,
+            "upside_case": upside_case,
+            "downside_or_key_risks": downside_or_key_risks,
+            "catalysts": catalysts,
+            "what_must_be_true": what_must_be_true,
+            "evidence_of_market_misunderstanding": evidence_of_market_misunderstanding,
+            "known_unknowns": known_unknowns,
+            "extraction_model_name": extraction_model_name,
+            "extracted_at": extracted_at,
+        },
+    )
+    conn.commit()
+
+
+def count_idea_records_by_source_status(conn: sqlite3.Connection, source_status: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM idea_records WHERE source_status = ?", (source_status,)
+    ).fetchone()[0]
+
+
+def get_shadow_prediction(
+    conn: sqlite3.Connection, *, idea_id: int, taste_version: int, screen_rules_sha256: str
+) -> sqlite3.Row | None:
+    """Existence check used by shadow-score to decide whether a given
+    idea already has a prediction for this EXACT (taste version, rules
+    hash) combination -- if so, it is skipped, never re-screened or
+    overwritten. A different taste version or a changed rules file is a
+    different combination, so it is free to get its own new prediction
+    alongside the old one.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM shadow_predictions
+        WHERE idea_id = ? AND taste_version = ? AND screen_rules_sha256 = ?
+        """,
+        (idea_id, taste_version, screen_rules_sha256),
+    ).fetchone()
+
+
+def insert_shadow_prediction(
+    conn: sqlite3.Connection,
+    *,
+    idea_id: int,
+    created_at: str,
+    taste_version: int,
+    taste_sha256: str,
+    screen_rules_path: str,
+    screen_rules_sha256: str,
+    source_hash: str,
+    model_name: str,
+    overall_prediction: str,
+    mispricing: str,
+    variant_perception: str,
+    upside: str,
+    business_quality: str,
+    downside: str,
+    key_reasons_json: str,
+    key_concerns_json: str,
+    critical_questions_json: str,
+    confidence: str,
+) -> int:
+    """Insert one immutable shadow prediction. Never updated afterward --
+    there is deliberately no update_shadow_prediction function. The
+    UNIQUE(idea_id, taste_version, screen_rules_sha256) constraint is the
+    hard backstop against ever creating two predictions for the exact
+    same (idea, taste, rules) combination, on top of the existence check
+    callers are expected to do first via get_shadow_prediction.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO shadow_predictions (
+            idea_id, created_at, taste_version, taste_sha256,
+            screen_rules_path, screen_rules_sha256, source_hash, model_name,
+            overall_prediction, mispricing, variant_perception, upside,
+            business_quality, downside,
+            key_reasons_json, key_concerns_json, critical_questions_json, confidence
+        ) VALUES (
+            :idea_id, :created_at, :taste_version, :taste_sha256,
+            :screen_rules_path, :screen_rules_sha256, :source_hash, :model_name,
+            :overall_prediction, :mispricing, :variant_perception, :upside,
+            :business_quality, :downside,
+            :key_reasons_json, :key_concerns_json, :critical_questions_json, :confidence
+        )
+        """,
+        {
+            "idea_id": idea_id,
+            "created_at": created_at,
+            "taste_version": taste_version,
+            "taste_sha256": taste_sha256,
+            "screen_rules_path": screen_rules_path,
+            "screen_rules_sha256": screen_rules_sha256,
+            "source_hash": source_hash,
+            "model_name": model_name,
+            "overall_prediction": overall_prediction,
+            "mispricing": mispricing,
+            "variant_perception": variant_perception,
+            "upside": upside,
+            "business_quality": business_quality,
+            "downside": downside,
+            "key_reasons_json": key_reasons_json,
+            "key_concerns_json": key_concerns_json,
+            "critical_questions_json": critical_questions_json,
+            "confidence": confidence,
+        },
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def count_shadow_predictions_for_taste_version(conn: sqlite3.Connection, taste_version: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM shadow_predictions WHERE taste_version = ?", (taste_version,)
+    ).fetchone()[0]
+
+
+def get_idea_ids_with_shadow_predictions(conn: sqlite3.Connection) -> list[int]:
+    rows = conn.execute("SELECT DISTINCT idea_id FROM shadow_predictions ORDER BY idea_id").fetchall()
+    return [row["idea_id"] for row in rows]
+
+
+def get_latest_shadow_prediction_for_idea(conn: sqlite3.Connection, idea_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM shadow_predictions WHERE idea_id = ? ORDER BY prediction_id DESC LIMIT 1",
+        (idea_id,),
+    ).fetchone()
+
+
+def get_eligible_feedback_for_message(conn: sqlite3.Connection, message_id: str) -> list[sqlite3.Row]:
+    """Brad's eligible feedback row(s) (via the one canonical
+    get_feedback_eligible_for_learning query) for one specific message --
+    this is the reveal-gate show-shadow-results uses to decide whether
+    Brad has actually supplied his own judgment yet. Deliberately filters
+    the canonical query's own result rather than writing a second,
+    separate eligibility query, exactly like get_eligible_feedback_after.
+    """
+    eligible = get_feedback_eligible_for_learning(conn)
+    return [row for row in eligible if row["message_id"] == message_id]

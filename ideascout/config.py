@@ -46,6 +46,14 @@ DEFAULT_PARSER_MODEL_NAME = "claude-haiku-4-5"
 # Override with TASTE_MODEL_NAME in .env if desired.
 DEFAULT_TASTE_MODEL_NAME = "claude-opus-5"
 
+# Stage 4 (blind shadow screening): Far View's own permanent, manually
+# curated screening rules live in a SEPARATE repo (InvestmentBrain), never
+# in IdeaScout and never in IdeaScoutLocal. This is Brad's real path on
+# his own machine; override with SCREEN_RULES_PATH in .env if it ever
+# lives somewhere else. shadow-score reads this file but IdeaScout never
+# writes to it.
+DEFAULT_SCREEN_RULES_PATH = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
@@ -61,6 +69,7 @@ class Config:
     parser_model_name: str = DEFAULT_PARSER_MODEL_NAME
     brad_allowed_senders: frozenset[str] = frozenset()
     taste_model_name: str = DEFAULT_TASTE_MODEL_NAME
+    screen_rules_path: Path = DEFAULT_SCREEN_RULES_PATH
 
 
 def _parse_allowed_senders(raw: str | None) -> frozenset[str]:
@@ -84,7 +93,10 @@ def find_legacy_repo_env() -> Path | None:
 
 
 def load_config(
-    require_agentmail: bool = False, require_llm: bool = False, require_taste: bool = False
+    require_agentmail: bool = False,
+    require_llm: bool = False,
+    require_taste: bool = False,
+    require_shadow: bool = False,
 ) -> Config:
     """Read settings from the .env file (if present) and the environment.
 
@@ -99,9 +111,15 @@ def load_config(
     commands that must talk to the taste-building LLM (build-taste) --
     this shares ANTHROPIC_API_KEY with require_llm but does NOT need
     BRAD_ALLOWED_SENDERS, since taste-building never looks at raw email,
-    only already-eligible feedback rows. Commands that only touch the
-    local database (status, show-feedback, taste-status) should leave all
-    three False so they keep working even before credentials are configured.
+    only already-eligible feedback rows. Set require_shadow=True for
+    shadow-score (Stage 4): shares ANTHROPIC_API_KEY the same way -- shadow
+    screening never looks at raw email either, only already-isolated
+    source text -- and does NOT check screen_rules_path exists here;
+    cmd_shadow_score checks that itself so the failure message is specific
+    to shadow-screening rather than a generic config error. Commands that
+    only touch the local database (status, show-feedback, taste-status,
+    shadow-status, show-shadow-results) should leave all four False so
+    they keep working even before credentials are configured.
     """
     load_dotenv(dotenv_path=ENV_PATH, override=False)
 
@@ -114,6 +132,7 @@ def load_config(
 
     database_path = Path(os.getenv("DATABASE_PATH") or DEFAULT_DATABASE_PATH)
     log_path = Path(os.getenv("LOG_PATH") or DEFAULT_LOG_PATH)
+    screen_rules_path = Path(os.getenv("SCREEN_RULES_PATH") or DEFAULT_SCREEN_RULES_PATH)
 
     missing = []
     if require_agentmail:
@@ -127,6 +146,9 @@ def load_config(
         if not brad_allowed_senders:
             missing.append("BRAD_ALLOWED_SENDERS")
     if require_taste:
+        if not anthropic_api_key:
+            missing.append("ANTHROPIC_API_KEY")
+    if require_shadow:
         if not anthropic_api_key:
             missing.append("ANTHROPIC_API_KEY")
     if missing:
@@ -145,4 +167,5 @@ def load_config(
         parser_model_name=parser_model_name,
         brad_allowed_senders=brad_allowed_senders,
         taste_model_name=taste_model_name,
+        screen_rules_path=screen_rules_path,
     )

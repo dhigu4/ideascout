@@ -41,16 +41,31 @@ def test_default_database_log_and_env_paths_live_under_state_dir_not_repo():
         assert config.PROJECT_ROOT not in path.parents
 
 
+@pytest.mark.real_config_defaults
+def test_default_screen_rules_path_matches_the_agreed_location():
+    """Stage 4's canonical IDEA_SCREEN_RULES.md lives in a separate real
+    repo (InvestmentBrain), never under IdeaScoutLocal and never in this
+    repo -- this is Brad's real path, so this test (like the
+    DEFAULT_STATE_DIR ones above) is exempt from the autouse sandboxing
+    fixture specifically to check the real, unpatched value.
+    """
+    assert config.DEFAULT_SCREEN_RULES_PATH == Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
+    assert config.PROJECT_ROOT not in config.DEFAULT_SCREEN_RULES_PATH.parents
+
+
 def test_autouse_fixture_redirects_ordinary_tests_away_from_real_state_dir(tmp_path):
     """No special marker here -- this is what every ordinary test gets.
     Proves the safety net is actually active by default, not just present
     in the source.
     """
     real_state_dir = Path.home() / "IdeaScoutLocal"
+    real_screen_rules_path = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
     assert config.DEFAULT_STATE_DIR != real_state_dir
     assert config.DEFAULT_STATE_DIR.is_relative_to(tmp_path)
     assert config.DEFAULT_DATABASE_PATH.is_relative_to(tmp_path)
     assert config.ENV_PATH.is_relative_to(tmp_path)
+    assert config.DEFAULT_SCREEN_RULES_PATH != real_screen_rules_path
+    assert config.DEFAULT_SCREEN_RULES_PATH.is_relative_to(tmp_path)
 
 
 def test_load_config_cannot_resolve_to_the_real_production_database(monkeypatch):
@@ -67,6 +82,21 @@ def test_load_config_cannot_resolve_to_the_real_production_database(monkeypatch)
     assert resolved.database_path != real_state_dir / "ideas.db"
     assert config.PROJECT_ROOT not in resolved.database_path.parents
     assert real_state_dir not in resolved.database_path.parents
+
+
+def test_load_config_cannot_resolve_screen_rules_path_to_the_real_investment_brain_repo(monkeypatch):
+    """Same guarantee as the database one above, for Stage 4's
+    screen_rules_path: with no SCREEN_RULES_PATH override in the
+    environment, load_config() must fall back to the (patched-by-conftest)
+    sandbox default -- never to Brad's real InvestmentBrain repo.
+    """
+    monkeypatch.delenv("SCREEN_RULES_PATH", raising=False)
+
+    resolved = config.load_config()
+
+    real_screen_rules_path = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
+    assert resolved.screen_rules_path != real_screen_rules_path
+    assert config.PROJECT_ROOT not in resolved.screen_rules_path.parents
 
 
 def test_find_legacy_repo_env_never_reads_or_modifies_the_file(tmp_path, monkeypatch):
