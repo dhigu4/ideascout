@@ -2025,3 +2025,59 @@ def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, tas
         """,
         {"taste_version": taste_version},
     ).fetchall()
+
+
+def get_recent_source_screenings(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Every source_screenings row (any source, any taste version, PASS
+    included), newest first, joined to its collected_sources row for
+    display -- one row per VERSION, so a document with multiple stored
+    versions (e.g. an old duplicate retained from before the Stage 5.4
+    idempotency fix) appears once per version. This is the --all-versions
+    forensic view; get_recent_source_screenings_deduplicated is the
+    default. Purely a read-only audit log -- unlike
+    get_unshown_screened_sources_for_taste_version, this never filters by
+    digest_shown_sources or a specific taste_version, and never excludes
+    PASS: `show-source-screenings` is meant to show Brad exactly what was
+    decided, not a curated alert candidate pool.
+    """
+    return conn.execute(
+        """
+        SELECT cs.*, ss.*
+        FROM source_screenings ss
+        JOIN collected_sources cs ON cs.source_id = ss.source_id
+        ORDER BY ss.created_at DESC, ss.screening_id DESC
+        LIMIT :limit
+        """,
+        {"limit": limit},
+    ).fetchall()
+
+
+def get_recent_source_screenings_deduplicated(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Like get_recent_source_screenings, but one row per LOGICAL document
+    (source_name, external_id) -- not per stored version. For a document
+    with more than one version (a genuine content change, or a historical
+    duplicate retained from before the Stage 5.4 idempotency fix), this
+    picks that document's single newest screening across ALL of its
+    versions (by created_at, then screening_id as a tiebreak), so a
+    retained old duplicate version never causes the same document to be
+    shown twice. --limit is applied to this already-deduplicated result,
+    not before deduplication.
+    """
+    return conn.execute(
+        """
+        SELECT cs.*, ss.*
+        FROM source_screenings ss
+        JOIN collected_sources cs ON cs.source_id = ss.source_id
+        WHERE ss.screening_id = (
+            SELECT ss2.screening_id
+            FROM source_screenings ss2
+            JOIN collected_sources cs2 ON cs2.source_id = ss2.source_id
+            WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+            ORDER BY ss2.created_at DESC, ss2.screening_id DESC
+            LIMIT 1
+        )
+        ORDER BY ss.created_at DESC, ss.screening_id DESC
+        LIMIT :limit
+        """,
+        {"limit": limit},
+    ).fetchall()

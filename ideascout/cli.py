@@ -1677,6 +1677,85 @@ def cmd_preview_digest(config: Config) -> int:
     return 0
 
 
+def _source_screening_label(row) -> str:
+    """Ticker and/or company, pipe-joined; if NEITHER is known, falls
+    back to source_title, then external_id -- always something, never
+    blank.
+    """
+    parts = [part for part in (row["ticker"], row["company"]) if part]
+    if not parts:
+        parts = [row["source_title"] or row["external_id"]]
+    return " | ".join(parts)
+
+
+def cmd_show_source_screenings(config: Config, *, limit: int, all_versions: bool = False) -> int:
+    """READ-ONLY audit view of recent website-source screening decisions,
+    newest first -- lets Brad inspect them without raw SQLite queries.
+
+    By default, one row per LOGICAL document (source_name, external_id):
+    a document with more than one stored version -- a genuine content
+    change, or a historical duplicate retained from before the Stage 5.4
+    idempotency fix -- is shown once, using its single newest screening
+    across all versions, so a retained old duplicate never makes the same
+    document appear twice. --all-versions is the forensic escape hatch
+    that shows every stored version/screening instead, exactly as before.
+    --limit always applies to the final (deduplicated, unless
+    --all-versions) result.
+
+    Strictly read-only: only ever SELECTs from source_screenings/
+    collected_sources. Never writes to digest_shown_sources or marks
+    anything as seen (unlike preview-digest), never triggers extraction
+    or screening, and never calls an LLM (unlike collect-source) -- this
+    only ever displays decisions that were already made and stored.
+    """
+    conn = db.open_production_database(config.database_path)
+    if all_versions:
+        rows = db.get_recent_source_screenings(conn, limit)
+    else:
+        rows = db.get_recent_source_screenings_deduplicated(conn, limit)
+    conn.close()
+
+    if not rows:
+        print("No source screenings recorded yet.")
+        return 0
+
+    for row in rows:
+        key_reasons = json.loads(row["key_reasons_json"])[:2]
+        key_concerns = json.loads(row["key_concerns_json"])[:2]
+        critical_questions = json.loads(row["critical_questions_json"])[:2]
+
+        print(f"{_source_screening_label(row)} | {row['overall_prediction']}")
+        print(
+            f"Mispricing: {row['mispricing']} | Variant: {row['variant_perception']} | "
+            f"Upside: {row['upside']}"
+        )
+        print(
+            f"Business quality: {row['business_quality']} | Downside: {row['downside']} | "
+            f"Confidence: {row['confidence']}"
+        )
+        print()
+
+        print("Why:")
+        for reason in key_reasons:
+            print(f"- {reason}")
+        print()
+
+        print("Concerns:")
+        for concern in key_concerns:
+            print(f"- {concern}")
+        print()
+
+        print("Questions:")
+        for question in critical_questions:
+            print(f"- {question}")
+        print()
+
+        print(f"URL: {row['canonical_url']}")
+        print()
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
@@ -1774,6 +1853,18 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
+    )
+    show_source_screenings_parser = subparsers.add_parser(
+        "show-source-screenings",
+        help="READ-ONLY: show recent website-source screening decisions, newest first",
+    )
+    show_source_screenings_parser.add_argument(
+        "--limit", type=int, default=10, help="Maximum number of screenings to show (default: 10)"
+    )
+    show_source_screenings_parser.add_argument(
+        "--all-versions",
+        action="store_true",
+        help="Forensic: show every stored version/screening instead of one row per logical document",
     )
     return arg_parser
 
@@ -1881,6 +1972,10 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_preview_digest(config)
+        elif args.command == "show-source-screenings":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_show_source_screenings(config, limit=args.limit, all_versions=args.all_versions)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2
