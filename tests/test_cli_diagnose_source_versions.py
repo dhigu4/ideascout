@@ -119,6 +119,37 @@ def test_diagnose_reports_differs_when_versions_are_substantively_different(tmp_
     assert "DIFFERS" in output
 
 
+def test_diagnose_reports_char_counts_completeness_and_text_excerpts(tmp_path, monkeypatch, capsys):
+    """Stage 5.7 extension: Brad's read-only diagnostic for one stored
+    Yellowbrick source must also show raw HTML/canonical char counts,
+    collection_status, and the first/last ~1000 chars of canonical text --
+    everything section 7 of the full-capture fix asked for, without
+    running a real browser or touching production state.
+    """
+    config = make_config(tmp_path)
+    patch_browser(monkeypatch, make_page())
+    patch_extraction_and_screening(monkeypatch)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    capsys.readouterr()
+
+    conn = db.connect(config.database_path)
+    row = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    conn.close()
+    raw_html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
+    from ideascout.sources import yellowbrick
+    canonical_text = yellowbrick.build_canonical_source_text(raw_html)
+
+    exit_code = cli.cmd_diagnose_source_versions(config, "yellowbrick", "139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+
+    assert "collection_status: COLLECTED" in output
+    assert f"raw HTML chars:    {len(raw_html)}" in output
+    assert f"canonical chars:   {len(canonical_text)}" in output
+    assert repr(canonical_text[:1000]) in output
+    assert repr(canonical_text[-1000:]) in output
+
+
 def test_diagnose_makes_no_writes_of_any_kind(tmp_path, monkeypatch):
     """Purely read-only: no DB changes, no file changes."""
     config = make_config(tmp_path)

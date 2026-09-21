@@ -1681,6 +1681,7 @@ def insert_collected_source(
     created_at: str,
     previous_version_source_id: int | None = None,
     raw_capture_hash: str | None = None,
+    collection_status: str = "COLLECTED",
 ) -> int:
     """Insert one collected source VERSION. extraction_status starts
     'PENDING' (its column default); company/ticker/source_title/
@@ -1700,17 +1701,26 @@ def insert_collected_source(
     provenance detail (hash of the exact raw bytes captured this time);
     it is optional (defaults to None) precisely so it can never become
     part of any uniqueness/versioning decision.
+
+    collection_status (Stage 5.7): 'COLLECTED' (default) or
+    'INCOMPLETE_CONTENT' -- set by a caller when the source adapter
+    signaled base.SourceItem.content_complete=False. Incomplete rows are
+    excluded from get_pending_extraction_sources so a thin capture is
+    never silently extracted/screened, and are retried automatically on
+    the next collection run (see cli.py's cmd_collect_source).
     """
     cursor = conn.execute(
         """
         INSERT INTO collected_sources (
             source_name, external_id, canonical_url, discovered_at, discovery_title, source_date,
             source_title, author, ticker, company, source_type,
-            content_hash, raw_capture_hash, raw_html_path, metadata_json, previous_version_source_id, created_at
+            content_hash, raw_capture_hash, raw_html_path, metadata_json, previous_version_source_id, created_at,
+            collection_status
         ) VALUES (
             :source_name, :external_id, :canonical_url, :discovered_at, :discovery_title, :source_date,
             :source_title, :author, :ticker, :company, :source_type,
-            :content_hash, :raw_capture_hash, :raw_html_path, :metadata_json, :previous_version_source_id, :created_at
+            :content_hash, :raw_capture_hash, :raw_html_path, :metadata_json, :previous_version_source_id, :created_at,
+            :collection_status
         )
         """,
         {
@@ -1731,6 +1741,7 @@ def insert_collected_source(
             "metadata_json": metadata_json,
             "previous_version_source_id": previous_version_source_id,
             "created_at": created_at,
+            "collection_status": collection_status,
         },
     )
     conn.commit()
@@ -1812,8 +1823,14 @@ def update_collected_source_extracted(
 
 
 def get_pending_extraction_sources(conn: sqlite3.Connection, source_name: str) -> list[sqlite3.Row]:
+    """PENDING rows ready for extraction. Excludes collection_status =
+    'INCOMPLETE_CONTENT' (Stage 5.7) so a thin/incomplete capture is
+    never swept into extraction/screening -- it stays PENDING and is
+    retried on the next collection run instead.
+    """
     return conn.execute(
-        "SELECT * FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' ORDER BY source_id",
+        "SELECT * FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' "
+        "AND collection_status = 'COLLECTED' ORDER BY source_id",
         (source_name,),
     ).fetchall()
 

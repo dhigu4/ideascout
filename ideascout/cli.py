@@ -1252,6 +1252,13 @@ SOURCE_ADAPTERS = {
     yellowbrick.SOURCE_NAME: yellowbrick,
 }
 
+# collect-source --external-id (Stage 5.8): a generous discovery cap used
+# ONLY when targeting one specific document by id, so the single already-
+# loaded feed page is scanned in full rather than truncated at the normal
+# --limit default -- never used for the ordinary feed-sweep path, and never
+# a second page load or any pagination/scrolling.
+EXTERNAL_ID_DISCOVERY_LIMIT = 500
+
 
 class TasteOrRulesUnavailableError(RuntimeError):
     """Raised by _load_frozen_taste_and_rules when there's no active taste
@@ -1335,12 +1342,26 @@ def cmd_source_login(config: Config, source_name: str) -> int:
     return 0
 
 
-def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit: int) -> int:
+def cmd_collect_source(
+    config: Config, source_name: str, *, dry_run: bool, limit: int, external_id: str | None = None
+) -> int:
     """Discover, and (unless --dry-run) fetch/save/extract/screen, recent
     items from one website source.
 
     --dry-run: authenticate, discover at most `limit` items, print what
     would be collected, and stop -- NO database changes, NO LLM calls.
+
+    external_id (Stage 5.8, mutually exclusive with limit at the CLI
+    level): narrows the SAME pipeline below to exactly one logical
+    document, instead of sweeping the recent feed. Discovery still runs
+    exactly once against the already-loaded feed page (via
+    EXTERNAL_ID_DISCOVERY_LIMIT, never a second page load or pagination),
+    then discovered_items is filtered down to (at most) the one matching
+    item BEFORE the dry-run branch and before any fetch/DB/LLM activity,
+    so "not found" fails clearly with no writes and no LLM calls. Every
+    later phase (fetch, version detection, extraction, screening) is the
+    same code, unmodified, only ever seeing that one item -- there is
+    deliberately no separate ad-hoc single-document code path.
 
     Otherwise, three phases, each idempotent and skipped where already
     done (so re-running this is always safe and never repeats work):
@@ -1365,14 +1386,24 @@ def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit
         return 2
 
     logger = get_logger()
+    discover_limit = EXTERNAL_ID_DISCOVERY_LIMIT if external_id is not None else limit
 
     with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=True) as context:
         page = context.new_page()
         try:
-            discovered_items = adapter.discover(page, limit=limit)
+            discovered_items = adapter.discover(page, limit=discover_limit)
         except source_base.AuthRequiredError:
             print(f"AUTH_REQUIRED: run 'python run.py source-login {source_name}' first.")
             return 1
+
+        if external_id is not None:
+            discovered_items = [item for item in discovered_items if item.external_id == external_id]
+            if not discovered_items:
+                print(
+                    f"NOT_FOUND: no item with external_id={external_id!r} was discovered for source "
+                    f"{source_name!r}. No database changes made. No LLM calls made."
+                )
+                return 1
 
         if dry_run:
             print(f"[DRY RUN] Discovered: {len(discovered_items)}")
@@ -1382,12 +1413,18 @@ def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit
             return 0
 
         conn = db.open_production_database(config.database_path)
-        stats = {"already_known": 0, "new_saved": 0, "changed": 0, "auth_required": 0, "errors": 0}
+        stats = {"already_known": 0, "new_saved": 0, "changed": 0, "auth_required": 0, "errors": 0, "incomplete": 0}
 
         for item in discovered_items:
             existing = db.get_latest_collected_source(conn, source_name, item.external_id)
-            looks_unchanged = existing is not None and (
-                item.title is None or existing["discovery_title"] == item.title
+            # A prior INCOMPLETE_CONTENT capture (Stage 5.7) must never be
+            # treated as "already known" purely because its discovery
+            # title looks unchanged -- otherwise a thin summary-only
+            # capture would never be retried.
+            looks_unchanged = (
+                existing is not None
+                and existing["collection_status"] == "COLLECTED"
+                and (item.title is None or existing["discovery_title"] == item.title)
             )
             if looks_unchanged:
                 stats["already_known"] += 1
@@ -1410,6 +1447,7 @@ def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit
             raw_path = raw_storage.save_raw_html(
                 source_name, fetched.external_id, fetched.content_hash, fetched.raw_html, config.raw_storage_dir
             )
+            collection_status = "COLLECTED" if fetched.content_complete else "INCOMPLETE_CONTENT"
             db.insert_collected_source(
                 conn,
                 source_name=source_name,
@@ -1429,8 +1467,16 @@ def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit
                 metadata_json=json.dumps(fetched.metadata),
                 previous_version_source_id=existing["source_id"] if existing is not None else None,
                 created_at=utcnow_iso(),
+                collection_status=collection_status,
             )
             stats["changed" if existing is not None else "new_saved"] += 1
+            if not fetched.content_complete:
+                stats["incomplete"] += 1
+                print(
+                    f"INCOMPLETE_CONTENT: {fetched.external_id} was saved for provenance but the page still "
+                    f"signals more substantive content exists (e.g. an un-expanded 'Show full summary' control). "
+                    f"Skipping extraction/screening for this version -- it will be retried on the next collection run."
+                )
             time.sleep(adapter.POLITE_DELAY_SECONDS)
 
     # Level 1: sweep every PENDING source for this adapter, not just ones
@@ -1541,6 +1587,7 @@ def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit
     print("Changed sources:", stats["changed"])
     print("Authentication required:", stats["auth_required"])
     print("Errors:", stats["errors"])
+    print("Incomplete content (saved, not extracted/screened):", stats["incomplete"])
     print(f"Ideas extracted this run: {extracted_now}")
     if screening_note:
         print(f"Screening skipped this run: {screening_note}")
@@ -1586,6 +1633,51 @@ def cmd_source_status(config: Config, source_name: str) -> int:
     return 0
 
 
+def cmd_diagnose_source_live(config: Config, source_name: str, external_id: str) -> int:
+    """READ-ONLY (Stage 5.9): launches the existing authenticated browser
+    profile for `source_name`, discovers just enough of the feed to locate
+    exactly one pitch by external_id, and reports direct DOM/network
+    evidence about its "Show full summary" control -- see
+    yellowbrick.diagnose_live for exactly what is gathered and why.
+
+    Deliberately makes NO database connection at all (there is no
+    db.open_production_database call anywhere in this function), NO raw
+    artifact writes, and NO LLM calls -- this exists purely to gather
+    ground truth before attempting another capture-logic fix, never to
+    collect, extract, or screen anything.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    if not hasattr(adapter, "diagnose_live"):
+        print(f"Source {source_name!r} does not support the live diagnostic yet.")
+        return 2
+
+    with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=True) as context:
+        page = context.new_page()
+        try:
+            discovered_items = adapter.discover(page, limit=EXTERNAL_ID_DISCOVERY_LIMIT)
+        except source_base.AuthRequiredError:
+            print(f"AUTH_REQUIRED: run 'python run.py source-login {source_name}' first.")
+            return 1
+
+        matches = [item for item in discovered_items if item.external_id == external_id]
+        if not matches:
+            print(f"NOT_FOUND: no item with external_id={external_id!r} was discovered for source {source_name!r}.")
+            return 1
+
+        try:
+            result = adapter.diagnose_live(page, context, matches[0])
+        except source_base.AuthRequiredError:
+            print(f"AUTH_REQUIRED: run 'python run.py source-login {source_name}' first.")
+            return 1
+
+    print(adapter.format_live_diagnostic_report(result))
+    return 0
+
+
 def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: str) -> int:
     """READ-ONLY diagnostic: for one external_id, list every stored
     version's hashes/paths and report whether their substantive pitch
@@ -1616,12 +1708,20 @@ def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: 
         print(f"    raw_capture_hash:  {row['raw_capture_hash'] or '(not recorded -- captured before this column existed)'}")
         print(f"    raw_html_path:     {row['raw_html_path']}")
         print(f"    created_at:        {row['created_at']}")
+        print(f"    collection_status: {row['collection_status']}")
         try:
             html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
         except OSError as exc:
             print(f"    (could not read raw artifact to compare substantive text: {exc})")
             continue
-        canonical_texts.append(adapter.build_canonical_source_text(html))
+        canonical_text = adapter.build_canonical_source_text(html)
+        canonical_texts.append(canonical_text)
+        print(f"    raw HTML chars:    {len(html)}")
+        print(f"    canonical chars:   {len(canonical_text)}")
+        print(f"    canonical text (first ~1000 chars):")
+        print(f"      {canonical_text[:1000]!r}")
+        print(f"    canonical text (last ~1000 chars):")
+        print(f"      {canonical_text[-1000:]!r}")
 
     if len(canonical_texts) < len(rows):
         print("Could not read every raw artifact -- substantive-text comparison is incomplete.")
@@ -1836,8 +1936,15 @@ def build_parser() -> argparse.ArgumentParser:
     collect_source_parser.add_argument(
         "--dry-run", action="store_true", help="Discover and print only -- no database changes, no LLM calls"
     )
-    collect_source_parser.add_argument(
+    collect_source_target_group = collect_source_parser.add_mutually_exclusive_group()
+    collect_source_target_group.add_argument(
         "--limit", type=int, default=10, help="Maximum number of recent items to discover (default: 10)"
+    )
+    collect_source_target_group.add_argument(
+        "--external-id",
+        default=None,
+        help="Collect exactly one document by its external_id (e.g. 143618) through the normal "
+        "discover/fetch/extract/screen pipeline, instead of sweeping the recent feed",
     )
     source_status_parser = subparsers.add_parser(
         "source-status",
@@ -1850,6 +1957,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagnose_versions_parser.add_argument("source_name", help="e.g. yellowbrick")
     diagnose_versions_parser.add_argument("external_id", help="e.g. 143411")
+    diagnose_live_parser = subparsers.add_parser(
+        "diagnose-source-live",
+        help="READ-ONLY: launch the real authenticated browser and inspect one pitch's live DOM/network behavior",
+    )
+    diagnose_live_parser.add_argument("source_name", help="e.g. yellowbrick")
+    diagnose_live_parser.add_argument("--external-id", required=True, help="e.g. 143618")
     subparsers.add_parser(
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
@@ -1959,7 +2072,9 @@ def main(argv: list[str] | None = None) -> int:
             # ANTHROPIC_API_KEY -- only a real (non-dry-run) run does.
             config = load_config(require_source=not args.dry_run)
             setup_logging(config.log_path)
-            return cmd_collect_source(config, args.source_name, dry_run=args.dry_run, limit=args.limit)
+            return cmd_collect_source(
+                config, args.source_name, dry_run=args.dry_run, limit=args.limit, external_id=args.external_id
+            )
         elif args.command == "source-status":
             config = load_config()
             setup_logging(config.log_path)
@@ -1968,6 +2083,12 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_diagnose_source_versions(config, args.source_name, args.external_id)
+        elif args.command == "diagnose-source-live":
+            # Read-only browser introspection, no LLM calls -- does not
+            # require ANTHROPIC_API_KEY.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_diagnose_source_live(config, args.source_name, args.external_id)
         elif args.command == "preview-digest":
             config = load_config()
             setup_logging(config.log_path)

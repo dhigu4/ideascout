@@ -56,6 +56,16 @@ class SourceItem:
         expected to differ between two fetches of an unchanged pitch
         (volatile scripts, session/hydration state, timestamps, etc.) and
         must never by itself trigger a new version.
+
+    content_complete (Stage 5.7 fix, completeness logic replaced in Stage
+    5.11): True unless the adapter has a reliable, adapter-specific
+    page-state signal that more substantive content exists but could not
+    be obtained (e.g. Yellowbrick's full-summary switch still reporting
+    aria-checked="false"/data-state="unchecked" after an expand attempt)
+    -- see yellowbrick.py's _content_is_complete. When False, raw
+    provenance is still saved, but callers must NOT run compact
+    extraction or screening against it: a thin, incomplete capture must
+    never be silently treated as the whole pitch.
     """
 
     source_name: str
@@ -72,4 +82,5 @@ class SourceItem:
     raw_html: str
     content_hash: str
     raw_capture_hash: str
+    content_complete: bool = True
     metadata: dict = field(default_factory=dict)

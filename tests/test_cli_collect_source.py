@@ -93,18 +93,49 @@ PITCH_DEF_HTML = """
 
 LOGIN_HTML = '<html><body><input type="password"></body></html>'
 
+# --- Stage 5.7/5.11: collapsed/expanded pitch fixtures for the full-capture
+# fix. The label span + role="switch" button matches the real production
+# DOM (Stage 5.10/5.11 live-diagnostic evidence) -- clicking the SWITCH
+# flips aria-checked/data-state; the label text deliberately stays present
+# in BOTH versions, since real evidence showed it never disappears.
+
+PITCH_ABC_HTML_COLLAPSED = """
+<html><head><title>XYZ Corp: Hidden Value Play</title></head><body>
+<time datetime="2026-09-01">Sep 1</time>
+<p>XYZ Corp trades at 5x normalized earnings due to a temporary loss-making segment.</p>
+<span class="mr-2 text-xs">Show full summary:</span>
+<button id="full-summary-switch" type="button" role="switch" aria-checked="false" data-state="unchecked"></button>
+<p>(4 min)</p>
+</body></html>
+"""
+
+PITCH_ABC_HTML_FULL = """
+<html><head><title>XYZ Corp: Hidden Value Play</title></head><body>
+<time datetime="2026-09-01">Sep 1</time>
+<p>XYZ Corp trades at 5x normalized earnings due to a temporary loss-making segment.</p>
+<span class="mr-2 text-xs">Show full summary:</span>
+<button id="full-summary-switch" type="button" role="switch" aria-checked="true" data-state="checked"></button>
+<p>Full thesis: the market is mispricing a durable cash-generative core
+business because of a temporary loss-making segment. Valuation implies a
+sum-of-the-parts discount. Catalysts include a divestiture within a year.
+Key risks include execution and customer concentration.</p>
+<p>(4 min)</p>
+</body></html>
+"""
+
 ABC_PITCH_URL = "https://www.joinyellowbrick.com/sp/139483"
 DEF_PITCH_URL = "https://www.joinyellowbrick.com/sp/133085"
 
 
-def make_page(*, feed_html=FEED_HTML, abc_html=PITCH_ABC_HTML, def_html=PITCH_DEF_HTML) -> FakePage:
+def make_page(*, feed_html=FEED_HTML, abc_html=PITCH_ABC_HTML, def_html=PITCH_DEF_HTML, expanded_html_by_url=None) -> FakePage:
     return FakePage(
         {
             yellowbrick.HOME_URL: feed_html,
             yellowbrick.FEED_URL: feed_html,
             ABC_PITCH_URL: abc_html,
             DEF_PITCH_URL: def_html,
-        }
+        },
+        expanded_html_by_url=expanded_html_by_url,
     )
 
 
@@ -796,6 +827,390 @@ def test_collect_source_does_not_affect_email_holdout_bookkeeping(tmp_path, monk
 
     assert holdout_before == holdout_after == 0
     assert shadow_prediction_count == 0  # collect-source never writes to shadow_predictions
+
+
+# --- completeness guard (Stage 5.7 full-capture fix) --------------------------
+
+
+def test_collect_source_incomplete_capture_is_saved_but_not_extracted_or_screened(tmp_path, monkeypatch, capsys):
+    """A pitch whose 'Show full summary' control can't be expanded must
+    still have its raw HTML saved for provenance, but must NOT be
+    extracted or screened -- and the run must clearly report it.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    page = make_page(abc_html=PITCH_ABC_HTML_COLLAPSED)
+    page.raise_on_click = True  # the control exists but can never be clicked
+    patch_browser(monkeypatch, page)
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "INCOMPLETE_CONTENT: 139483" in output
+    assert "Incomplete content (saved, not extracted/screened): 1" in output
+
+    conn = db.connect(config.database_path)
+    row = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    conn.close()
+
+    assert row["collection_status"] == "INCOMPLETE_CONTENT"
+    assert row["extraction_status"] == "PENDING"
+    assert Path(row["raw_html_path"]).exists()  # raw provenance still saved
+    assert "Show full summary" in Path(row["raw_html_path"]).read_text(encoding="utf-8")
+
+    # 133085 (the other pitch, unaffected) still gets extracted/screened;
+    # 139483 must never appear in either call list.
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+
+def test_collect_source_incomplete_capture_is_retried_and_succeeds_on_a_later_run(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    page1 = make_page(abc_html=PITCH_ABC_HTML_COLLAPSED)
+    page1.raise_on_click = True
+    patch_browser(monkeypatch, page1)
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    capsys.readouterr()
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_source_versions(conn, "yellowbrick") == 2  # incomplete row + the other pitch
+    conn.close()
+
+    # A later run where the control now expands successfully (e.g. a
+    # transient click failure or a page hiccup that's since resolved).
+    page2 = make_page(
+        abc_html=PITCH_ABC_HTML_COLLAPSED,
+        expanded_html_by_url={ABC_PITCH_URL: PITCH_ABC_HTML_FULL},
+    )
+    patch_browser(monkeypatch, page2)
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Incomplete content (saved, not extracted/screened): 0" in output
+
+    conn = db.connect(config.database_path)
+    latest = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    versions = db.count_collected_source_versions(conn, "yellowbrick")
+    conn.close()
+
+    assert latest["collection_status"] == "COLLECTED"
+    assert latest["extraction_status"] == "EXTRACTED"
+    assert versions == 3  # exactly one NEW version created for the full-content capture
+    assert len(extraction_calls) == 2  # 133085 (run 1) + 139483 (run 2, now complete)
+    assert len(screening_calls) == 2
+
+
+def test_collect_source_full_content_after_summary_only_supersedes_in_dedup_audit_view(tmp_path, monkeypatch, capsys):
+    """After the fix (Stage 5.11: click the role="switch" control, not
+    the label), the OLD summary-only version and its screening are
+    preserved for provenance, but the deduplicated audit view naturally
+    surfaces only the newest (full-content) screening -- see
+    show-source-screenings' Stage 5.6 default dedup behavior. Also proves
+    task section 6's full history: exactly one new version, extraction/
+    screening run exactly once for it, and an immediate targeted rerun is
+    then idempotent with zero further LLM work.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+    extraction_calls, screening_calls = [], []
+
+    # Run 1: summary-only capture succeeds (no full-summary switch at all
+    # -- this models the pre-fix production state, not an incomplete
+    # capture: source_id=12 in the real 143618 history).
+    patch_browser(monkeypatch, make_page(abc_html=PITCH_ABC_HTML))
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    capsys.readouterr()
+    assert len(extraction_calls) == 2  # both discovered pitches
+    assert len(screening_calls) == 2
+
+    conn = db.connect(config.database_path)
+    old_row = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    conn.close()
+    assert old_row["collection_status"] == "COLLECTED"
+
+    # Run 2: the SAME external_id now collected with the real switch
+    # markup, which successfully expands to the full thesis -- a genuine
+    # content change (different canonical text -> different content_hash).
+    changed_feed_html = FEED_HTML.replace(
+        "XYZ Corp: Hidden Value Play", "XYZ Corp: Hidden Value Play (UPDATED)"
+    )
+    page2 = make_page(
+        feed_html=changed_feed_html,
+        abc_html=PITCH_ABC_HTML_COLLAPSED,
+        expanded_html_by_url={ABC_PITCH_URL: PITCH_ABC_HTML_FULL},
+    )
+    patch_browser(monkeypatch, page2)
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Changed sources: 1" in output
+    assert "Ideas extracted this run: 1" in output
+    assert "Ideas screened this run: 1" in output
+    assert len(extraction_calls) == 3  # exactly one new extraction, not a re-extraction of the whole doc
+    assert len(screening_calls) == 3
+
+    conn = db.connect(config.database_path)
+    new_row = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    versions = conn.execute(
+        "SELECT * FROM collected_sources WHERE source_name='yellowbrick' AND external_id='139483' ORDER BY source_id"
+    ).fetchall()
+    conn.close()
+
+    assert len(versions) == 2  # old summary-only version retained, exactly one new version added
+    assert new_row["source_id"] == versions[1]["source_id"]
+    assert new_row["content_hash"] != old_row["content_hash"]
+    assert new_row["collection_status"] == "COLLECTED"
+    # The old row/artifact is untouched, not deleted or rewritten.
+    assert versions[0]["source_id"] == old_row["source_id"]
+    assert Path(versions[0]["raw_html_path"]).exists()
+
+    # Run 3: immediate targeted rerun of ONLY this document must be
+    # idempotent -- Already known: 1, Changed sources: 0, zero further
+    # extraction/screening calls (task section 6's exact expectation).
+    page3 = make_page(feed_html=changed_feed_html, abc_html=PITCH_ABC_HTML_FULL)
+    patch_browser(monkeypatch, page3)
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Already known: 1" in output
+    assert "Changed sources: 0" in output
+    assert "Ideas extracted this run: 0" in output
+    assert "Ideas screened this run: 0" in output
+    assert len(extraction_calls) == 3  # unchanged
+    assert len(screening_calls) == 3
+
+
+# --- --external-id single-document selector (Stage 5.8) -----------------------
+
+
+def test_collect_source_external_id_selects_exact_document_and_skips_others(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    page = make_page()
+    patch_browser(monkeypatch, page)
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "New sources saved: 1" in output
+
+    # The other discovered document's pitch page was never even visited.
+    assert ABC_PITCH_URL in page.urls_visited
+    assert DEF_PITCH_URL not in page.urls_visited
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_sources(conn, "yellowbrick") == 1
+    assert db.get_latest_collected_source(conn, "yellowbrick", "139483") is not None
+    assert db.get_latest_collected_source(conn, "yellowbrick", "133085") is None
+    conn.close()
+
+    # Only the targeted document was extracted/screened.
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+
+def test_collect_source_external_id_not_found_makes_no_writes_and_no_llm_calls(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    patch_browser(monkeypatch, make_page())
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("no LLM client should be built when the external_id is not found")
+
+    monkeypatch.setattr(idea_extraction, "build_client", fail_if_called)
+    monkeypatch.setattr(shadow, "build_client", fail_if_called)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="000000")
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "NOT_FOUND" in output
+    assert "000000" in output
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_sources(conn, "yellowbrick") == 0
+    conn.close()
+
+
+def test_collect_source_external_id_dry_run_makes_no_writes_and_no_llm_calls(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    page = make_page()
+    patch_browser(monkeypatch, page)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("no LLM client should be built during --dry-run")
+
+    monkeypatch.setattr(idea_extraction, "build_client", fail_if_called)
+    monkeypatch.setattr(shadow, "build_client", fail_if_called)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=True, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "[DRY RUN] Discovered: 1" in output
+    assert "139483" in output
+    assert "133085" not in output
+
+    # The pitch page itself is never fetched during --dry-run, regardless
+    # of --external-id -- discovery alone is enough to print it.
+    assert ABC_PITCH_URL not in page.urls_visited
+    assert DEF_PITCH_URL not in page.urls_visited
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_sources(conn, "yellowbrick") == 0
+    conn.close()
+
+
+def test_collect_source_without_external_id_behavior_is_unchanged(tmp_path, monkeypatch, capsys):
+    """Passing no --external-id at all (the default, external_id=None)
+    must sweep the whole feed exactly like before Stage 5.8.
+    """
+    config = make_config(tmp_path)
+    patch_browser(monkeypatch, make_page())
+    patch_extraction_and_screening(monkeypatch)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "New sources saved: 2" in output
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_sources(conn, "yellowbrick") == 2
+    conn.close()
+
+
+def test_collect_source_external_id_completeness_guard_still_applies(tmp_path, monkeypatch, capsys):
+    """The Stage 5.7 full-content completeness guard is the SAME code path
+    -- --external-id must not bypass it.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    page = make_page(abc_html=PITCH_ABC_HTML_COLLAPSED)
+    page.raise_on_click = True
+    patch_browser(monkeypatch, page)
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "INCOMPLETE_CONTENT: 139483" in output
+
+    conn = db.connect(config.database_path)
+    row = db.get_latest_collected_source(conn, "yellowbrick", "139483")
+    conn.close()
+    assert row["collection_status"] == "INCOMPLETE_CONTENT"
+    assert len(extraction_calls) == 0
+    assert len(screening_calls) == 0
+
+
+def test_collect_source_external_id_changed_source_creates_exactly_one_new_version(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    patch_browser(monkeypatch, make_page())
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    capsys.readouterr()
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+    changed_feed_html = FEED_HTML.replace(
+        "XYZ Corp: Hidden Value Play", "XYZ Corp: Hidden Value Play (UPDATED)"
+    )
+    changed_abc_html = PITCH_ABC_HTML.replace(
+        "5x normalized earnings", "2x normalized earnings after a guidance cut"
+    )
+    patch_browser(monkeypatch, make_page(feed_html=changed_feed_html, abc_html=changed_abc_html))
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Changed sources: 1" in output
+
+    assert len(extraction_calls) == 2  # exactly one new extraction, not a re-extraction of the whole doc
+    assert len(screening_calls) == 2
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_sources(conn, "yellowbrick") == 1  # still one logical document
+    assert db.count_collected_source_versions(conn, "yellowbrick") == 2  # exactly one new immutable version
+    assert db.get_latest_collected_source(conn, "yellowbrick", "133085") is None  # never touched
+    conn.close()
+
+
+def test_collect_source_external_id_immediate_rerun_is_idempotent(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+
+    patch_browser(monkeypatch, make_page())
+    extraction_calls, screening_calls = [], []
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    capsys.readouterr()
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+    page2 = make_page()
+    patch_browser(monkeypatch, page2)
+    patch_extraction_and_screening(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+
+    exit_code = cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Already known: 1" in output
+    assert "New sources saved: 0" in output
+    assert "Changed sources: 0" in output
+
+    # No re-fetch of the pitch page, and no new extraction/screening calls.
+    assert ABC_PITCH_URL not in page2.urls_visited
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+    conn = db.connect(config.database_path)
+    assert db.count_collected_source_versions(conn, "yellowbrick") == 1
+    conn.close()
+
+
+def test_collect_source_external_id_data_never_lands_under_real_production_state(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    patch_browser(monkeypatch, make_page())
+    patch_extraction_and_screening(monkeypatch)
+    cli.cmd_collect_source(config, "yellowbrick", dry_run=False, limit=10, external_id="139483")
+
+    real_idea_scout_local = Path.home() / "IdeaScoutLocal"
+    assert config.database_path.is_relative_to(tmp_path)
+    assert config.raw_storage_dir.is_relative_to(tmp_path)
+    assert real_idea_scout_local not in config.raw_storage_dir.parents
+
+
+def test_collect_source_external_id_and_limit_are_mutually_exclusive_at_the_cli_level():
+    parser = cli.build_parser()
+    import pytest
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["collect-source", "yellowbrick", "--limit", "5", "--external-id", "143618"])
 
 
 # --- production-state safety ---------------------------------------------------
