@@ -54,6 +54,22 @@ DEFAULT_TASTE_MODEL_NAME = "claude-opus-5"
 # writes to it.
 DEFAULT_SCREEN_RULES_PATH = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
 
+# Website-source collection (first adapter: Yellowbrick). Both live under
+# IdeaScoutLocal, same as everything else real -- never under the repo.
+# browser-profiles holds Chrome's OWN persistent profile data (including
+# whatever cookies/session state Chrome itself manages) -- IdeaScout code
+# never reads, parses, or copies anything out of it. raw holds every
+# captured source document, permanently, before any AI processing.
+DEFAULT_BROWSER_PROFILES_DIR = DEFAULT_STATE_DIR / "browser-profiles"
+DEFAULT_RAW_STORAGE_DIR = DEFAULT_STATE_DIR / "raw"
+
+# Alerting is not built yet (see ideascout/notifier.py) and must default
+# off regardless: Brad is mid-holdout on the email/Taste v1 experiment,
+# and even once alerting exists, nothing should ever be sent automatically
+# without this being explicitly turned on. Override with ALERTS_ENABLED=true
+# in .env only once outbound delivery actually exists and has been approved.
+DEFAULT_ALERTS_ENABLED = False
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
@@ -70,6 +86,9 @@ class Config:
     brad_allowed_senders: frozenset[str] = frozenset()
     taste_model_name: str = DEFAULT_TASTE_MODEL_NAME
     screen_rules_path: Path = DEFAULT_SCREEN_RULES_PATH
+    browser_profiles_dir: Path = DEFAULT_BROWSER_PROFILES_DIR
+    raw_storage_dir: Path = DEFAULT_RAW_STORAGE_DIR
+    alerts_enabled: bool = DEFAULT_ALERTS_ENABLED
 
 
 def _parse_allowed_senders(raw: str | None) -> frozenset[str]:
@@ -92,11 +111,18 @@ def find_legacy_repo_env() -> Path | None:
     return legacy_path if legacy_path.exists() else None
 
 
+def _parse_bool_env(raw: str | None, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_config(
     require_agentmail: bool = False,
     require_llm: bool = False,
     require_taste: bool = False,
     require_shadow: bool = False,
+    require_source: bool = False,
 ) -> Config:
     """Read settings from the .env file (if present) and the environment.
 
@@ -116,10 +142,18 @@ def load_config(
     screening never looks at raw email either, only already-isolated
     source text -- and does NOT check screen_rules_path exists here;
     cmd_shadow_score checks that itself so the failure message is specific
-    to shadow-screening rather than a generic config error. Commands that
-    only touch the local database (status, show-feedback, taste-status,
-    shadow-status, show-shadow-results) should leave all four False so
-    they keep working even before credentials are configured.
+    to shadow-screening rather than a generic config error. Set
+    require_source=True for website-source commands (source-login,
+    collect-source): shares ANTHROPIC_API_KEY the same way (collection's
+    extraction/screening steps need it; discovery/fetching alone do not,
+    but source-login and collect-source both load config the same way for
+    simplicity). Website credentials themselves are never part of Config
+    at all -- authentication lives entirely in Chrome's own persistent
+    profile (browser_profiles_dir), which this function only ever computes
+    a PATH to, never reads the contents of. Commands that only touch the
+    local database (status, show-feedback, taste-status, shadow-status,
+    show-shadow-results, source-status, preview-digest) should leave all
+    five False so they keep working even before credentials are configured.
     """
     load_dotenv(dotenv_path=ENV_PATH, override=False)
 
@@ -133,6 +167,9 @@ def load_config(
     database_path = Path(os.getenv("DATABASE_PATH") or DEFAULT_DATABASE_PATH)
     log_path = Path(os.getenv("LOG_PATH") or DEFAULT_LOG_PATH)
     screen_rules_path = Path(os.getenv("SCREEN_RULES_PATH") or DEFAULT_SCREEN_RULES_PATH)
+    browser_profiles_dir = Path(os.getenv("BROWSER_PROFILES_DIR") or DEFAULT_BROWSER_PROFILES_DIR)
+    raw_storage_dir = Path(os.getenv("RAW_STORAGE_DIR") or DEFAULT_RAW_STORAGE_DIR)
+    alerts_enabled = _parse_bool_env(os.getenv("ALERTS_ENABLED"), DEFAULT_ALERTS_ENABLED)
 
     missing = []
     if require_agentmail:
@@ -149,6 +186,9 @@ def load_config(
         if not anthropic_api_key:
             missing.append("ANTHROPIC_API_KEY")
     if require_shadow:
+        if not anthropic_api_key:
+            missing.append("ANTHROPIC_API_KEY")
+    if require_source:
         if not anthropic_api_key:
             missing.append("ANTHROPIC_API_KEY")
     if missing:
@@ -168,4 +208,7 @@ def load_config(
         brad_allowed_senders=brad_allowed_senders,
         taste_model_name=taste_model_name,
         screen_rules_path=screen_rules_path,
+        browser_profiles_dir=browser_profiles_dir,
+        raw_storage_dir=raw_storage_dir,
+        alerts_enabled=alerts_enabled,
     )

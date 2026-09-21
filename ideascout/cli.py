@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -18,6 +19,9 @@ from . import agentmail_client, db, idea_extraction, parser, shadow, source_isol
 from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
+from .sources import base as source_base
+from .sources import browser as source_browser
+from .sources import raw_storage, yellowbrick
 
 
 def utcnow_iso() -> str:
@@ -1087,10 +1091,14 @@ def cmd_shadow_score(config: Config) -> int:
             db.update_idea_record_extracted(
                 conn,
                 idea_id=idea_record["idea_id"],
-                company=extracted.company,
-                ticker=extracted.ticker,
-                source_title=extracted.source_title,
-                source_date=extracted.source_date,
+                company=extracted.company or None,
+                ticker=extracted.ticker or None,
+                # ExtractedIdea no longer extracts title/date (see
+                # idea_extraction.py) -- idea_records has no discovery-
+                # time source for these either, so they simply stay
+                # whatever they already were (None, for a first extraction).
+                source_title=idea_record["source_title"],
+                source_date=idea_record["source_date"],
                 business_summary=extracted.business_summary,
                 core_thesis=extracted.core_thesis,
                 why_mispriced=extracted.why_mispriced,
@@ -1231,6 +1239,444 @@ def cmd_show_shadow_results(config: Config) -> int:
     return 0
 
 
+# --- Stage 5: authenticated website-source collection (first: Yellowbrick) --
+#
+# The intelligence/screening layer (idea_extraction.py, shadow.py) has no
+# Yellowbrick-specific logic at all -- everything site-specific lives
+# behind ideascout/sources/yellowbrick.py's adapter interface. Alerts stay
+# disabled during Brad's ongoing Taste v1 holdout: preview-digest only
+# ever prints to the terminal, and there is no code path anywhere that can
+# send Brad anything (see ideascout/notifier.py).
+
+SOURCE_ADAPTERS = {
+    yellowbrick.SOURCE_NAME: yellowbrick,
+}
+
+
+class TasteOrRulesUnavailableError(RuntimeError):
+    """Raised by _load_frozen_taste_and_rules when there's no active taste
+    version, its artifact fails integrity verification, or the canonical
+    IDEA_SCREEN_RULES.md is missing. Screening simply can't happen yet --
+    this is not the same as a screening/extraction failure.
+    """
+
+
+def _load_frozen_taste_and_rules(conn, config: Config) -> tuple:
+    """Shared by collect-source's screening sweep: load the active taste
+    version (hash-verified) and canonical IDEA_SCREEN_RULES.md. Reuses the
+    SAME taste.verify_taste_version_integrity/compute_content_sha256 Stage
+    3/4 already rely on -- never re-derives that logic. Returns
+    (latest_taste_row, idea_taste_content, screen_rules_content, screen_rules_sha256).
+    """
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        raise TasteOrRulesUnavailableError("No taste model has been generated yet.")
+    try:
+        taste.verify_taste_version_integrity(latest_taste)
+    except taste.TasteIntegrityError as exc:
+        raise TasteOrRulesUnavailableError(
+            f"taste {latest_taste['version_label']} artifact integrity check failed: {exc}"
+        ) from exc
+    if not config.screen_rules_path.exists():
+        raise TasteOrRulesUnavailableError(
+            f"canonical screening rules file not found at {config.screen_rules_path}"
+        )
+    idea_taste_content = Path(latest_taste["idea_taste_path"]).read_text(encoding="utf-8")
+    screen_rules_content = config.screen_rules_path.read_text(encoding="utf-8")
+    screen_rules_sha256 = taste.compute_content_sha256(screen_rules_content)
+    return latest_taste, idea_taste_content, screen_rules_content, screen_rules_sha256
+
+
+def _read_source_raw_text(adapter, row) -> str:
+    """Re-derive plain text from a source's permanently-saved raw HTML.
+    Text is never stored separately in the database -- the raw HTML is
+    the one permanent artifact; text is just a cheap, deterministic view
+    of it, recomputed on demand for extraction.
+    """
+    html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
+    return adapter.html_to_text(html)
+
+
+def cmd_source_login(config: Config, source_name: str) -> int:
+    """Manual, one-time (per session-expiry) authentication for a
+    website-source adapter. Opens a VISIBLE Chrome window using a
+    DEDICATED persistent profile (never Brad's normal Chrome profile --
+    see ideascout/sources/browser.py), waits for Brad to log in by hand,
+    verifies access, then closes Chrome. The profile itself is preserved
+    for future runs; closing Chrome here does not log Brad out. No
+    credentials or cookies are ever read, printed, or stored by this code
+    -- Chrome's own profile storage handles the actual session.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    profile = source_browser.profile_dir(source_name, config.browser_profiles_dir)
+    print(f"Opening Chrome with the dedicated {source_name} profile at:\n  {profile}")
+    print(f"Navigating to {adapter.HOME_URL} ...")
+
+    with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=False) as context:
+        page = context.new_page()
+        page.goto(adapter.HOME_URL)
+        print(
+            f"\nIf you are not already logged in, please log in to {source_name} "
+            "manually in the Chrome window now."
+        )
+        input("Press Enter here once you are logged in (or already were)... ")
+
+        try:
+            adapter.discover(page, limit=1)
+        except source_base.AuthRequiredError:
+            print("AUTH_REQUIRED: could not verify an authenticated session. Please try again.")
+            return 1
+
+    print(f"Authenticated. Chrome closed -- the {source_name} session profile is preserved for future runs.")
+    return 0
+
+
+def cmd_collect_source(config: Config, source_name: str, *, dry_run: bool, limit: int) -> int:
+    """Discover, and (unless --dry-run) fetch/save/extract/screen, recent
+    items from one website source.
+
+    --dry-run: authenticate, discover at most `limit` items, print what
+    would be collected, and stop -- NO database changes, NO LLM calls.
+
+    Otherwise, three phases, each idempotent and skipped where already
+    done (so re-running this is always safe and never repeats work):
+      1. Discover recent items; for each NOT already known (by
+         external_id) or whose cheap discovery_title differs from what
+         was seen before, fetch its full page, save the raw HTML (before
+         any AI processing), and record its metadata. A changed item gets
+         a NEW row (previous_version_source_id links back) -- the prior
+         row and its raw artifact are never touched.
+      2. Sweep every still-PENDING source for this adapter (not just ones
+         just fetched) and attempt Level-1 compact idea extraction.
+      3. If a frozen taste version and the canonical IDEA_SCREEN_RULES.md
+         are both available, sweep every EXTRACTED source lacking a
+         screening for that exact (taste, rules) combination and screen
+         it (Level 2, reusing shadow.screen_idea -- no Yellowbrick-
+         specific logic there). If not available yet, screening is
+         skipped for this run and retried automatically on a later one.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    logger = get_logger()
+
+    with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=True) as context:
+        page = context.new_page()
+        try:
+            discovered_items = adapter.discover(page, limit=limit)
+        except source_base.AuthRequiredError:
+            print(f"AUTH_REQUIRED: run 'python run.py source-login {source_name}' first.")
+            return 1
+
+        if dry_run:
+            print(f"[DRY RUN] Discovered: {len(discovered_items)}")
+            for item in discovered_items:
+                print(adapter.format_discovered_item_for_dry_run(item))
+            print("[DRY RUN] No database changes made. No LLM calls made.")
+            return 0
+
+        conn = db.open_production_database(config.database_path)
+        stats = {"already_known": 0, "new_saved": 0, "changed": 0, "auth_required": 0, "errors": 0}
+
+        for item in discovered_items:
+            existing = db.get_latest_collected_source(conn, source_name, item.external_id)
+            looks_unchanged = existing is not None and (
+                item.title is None or existing["discovery_title"] == item.title
+            )
+            if looks_unchanged:
+                stats["already_known"] += 1
+                continue
+
+            try:
+                fetched = adapter.fetch(page, item, discovered_at=utcnow_iso())
+            except source_base.AuthRequiredError:
+                stats["auth_required"] += 1
+                continue
+            except Exception as exc:
+                stats["errors"] += 1
+                logger.exception(f"Error fetching {item.canonical_url}: {exc}")
+                continue
+
+            if existing is not None and existing["content_hash"] == fetched.content_hash:
+                stats["already_known"] += 1
+                continue
+
+            raw_path = raw_storage.save_raw_html(
+                source_name, fetched.external_id, fetched.content_hash, fetched.raw_html, config.raw_storage_dir
+            )
+            db.insert_collected_source(
+                conn,
+                source_name=source_name,
+                external_id=fetched.external_id,
+                canonical_url=fetched.canonical_url,
+                discovered_at=fetched.discovered_at,
+                discovery_title=fetched.title,
+                source_date=fetched.published_at,
+                source_title=fetched.title,
+                author=fetched.author,
+                ticker=fetched.ticker,
+                company=fetched.company,
+                source_type=fetched.source_type,
+                content_hash=fetched.content_hash,
+                raw_capture_hash=fetched.raw_capture_hash,
+                raw_html_path=str(raw_path),
+                metadata_json=json.dumps(fetched.metadata),
+                previous_version_source_id=existing["source_id"] if existing is not None else None,
+                created_at=utcnow_iso(),
+            )
+            stats["changed" if existing is not None else "new_saved"] += 1
+            time.sleep(adapter.POLITE_DELAY_SECONDS)
+
+    # Level 1: sweep every PENDING source for this adapter, not just ones
+    # fetched just now -- a prior missing API key or transient failure
+    # self-heals here on a later run, with no manual requeue needed.
+    extracted_now = 0
+    if config.anthropic_api_key:
+        extraction_client = None
+        for row in db.get_pending_extraction_sources(conn, source_name):
+            if extraction_client is None:
+                extraction_client = idea_extraction.build_client(config.anthropic_api_key)
+            try:
+                source_text = _read_source_raw_text(adapter, row)
+                extracted = idea_extraction.extract_idea(
+                    extraction_client, config.parser_model_name, source_text, logger=logger
+                )
+            except structured_llm.StructuredGenerationError as exc:
+                logger.exception(str(exc))
+                continue
+            db.update_collected_source_extracted(
+                conn,
+                source_id=row["source_id"],
+                company=extracted.company or None,
+                ticker=extracted.ticker or None,
+                # ExtractedIdea no longer extracts title/date (see
+                # idea_extraction.py) -- carry through whatever discovery
+                # already found (Yellowbrick's own card/page parsing is
+                # more reliable for these than an LLM guess anyway).
+                source_title=row["source_title"],
+                source_date=row["source_date"],
+                business_summary=extracted.business_summary,
+                core_thesis=extracted.core_thesis,
+                why_mispriced=extracted.why_mispriced,
+                future_earnings_change=extracted.future_earnings_change,
+                upside_case=extracted.upside_case,
+                downside_or_key_risks=extracted.downside_or_key_risks,
+                catalysts=extracted.catalysts,
+                what_must_be_true=extracted.what_must_be_true,
+                evidence_of_market_misunderstanding=extracted.evidence_of_market_misunderstanding,
+                known_unknowns=extracted.known_unknowns,
+                extraction_model_name=config.parser_model_name,
+                extracted_at=utcnow_iso(),
+            )
+            extracted_now += 1
+
+    # Level 2: sweep every EXTRACTED source lacking a screening for the
+    # CURRENT (taste, rules) combination. Skipped cleanly (not a failure)
+    # if taste/rules aren't ready yet -- raw capture and extraction never
+    # depend on screening being possible.
+    screened_now = 0
+    screening_note = None
+    if config.anthropic_api_key:
+        try:
+            latest_taste, idea_taste_content, screen_rules_content, screen_rules_sha256 = (
+                _load_frozen_taste_and_rules(conn, config)
+            )
+        except TasteOrRulesUnavailableError as exc:
+            screening_note = str(exc)
+        else:
+            shadow_client = None
+            for row in db.get_extracted_sources_missing_screening(
+                conn, source_name, taste_version=latest_taste["version_number"], screen_rules_sha256=screen_rules_sha256
+            ):
+                if shadow_client is None:
+                    shadow_client = shadow.build_client(config.anthropic_api_key)
+                try:
+                    prediction = shadow.screen_idea(
+                        shadow_client,
+                        config.taste_model_name,
+                        idea_taste_body=idea_taste_content,
+                        screen_rules_body=screen_rules_content,
+                        idea_record=row,
+                        logger=logger,
+                    )
+                except structured_llm.StructuredGenerationError as exc:
+                    logger.exception(str(exc))
+                    continue
+                db.insert_source_screening(
+                    conn,
+                    source_id=row["source_id"],
+                    created_at=utcnow_iso(),
+                    taste_version=latest_taste["version_number"],
+                    taste_sha256=latest_taste["idea_taste_sha256"],
+                    screen_rules_path=str(config.screen_rules_path),
+                    screen_rules_sha256=screen_rules_sha256,
+                    content_hash=row["content_hash"],
+                    model_name=config.taste_model_name,
+                    overall_prediction=prediction.overall_prediction,
+                    mispricing=prediction.mispricing,
+                    variant_perception=prediction.variant_perception,
+                    upside=prediction.upside,
+                    business_quality=prediction.business_quality,
+                    downside=prediction.downside,
+                    key_reasons_json=json.dumps(prediction.key_reasons),
+                    key_concerns_json=json.dumps(prediction.key_concerns),
+                    critical_questions_json=json.dumps(prediction.critical_questions),
+                    confidence=prediction.confidence,
+                )
+                screened_now += 1
+
+    db.set_meta(conn, f"source:{source_name}:last_collected_at", utcnow_iso())
+    db.set_meta(conn, f"source:{source_name}:last_collection_errors", str(stats["errors"]))
+    conn.close()
+
+    print("Discovered:", len(discovered_items))
+    print("Already known:", stats["already_known"])
+    print("New sources saved:", stats["new_saved"])
+    print("Changed sources:", stats["changed"])
+    print("Authentication required:", stats["auth_required"])
+    print("Errors:", stats["errors"])
+    print(f"Ideas extracted this run: {extracted_now}")
+    if screening_note:
+        print(f"Screening skipped this run: {screening_note}")
+    else:
+        print(f"Ideas screened this run: {screened_now}")
+    return 0
+
+
+def cmd_source_status(config: Config, source_name: str) -> int:
+    """"Known documents" (distinct external_id) is deliberately reported
+    separately from "Source versions" (total collected_sources rows,
+    including any legitimate additional version created by a genuine
+    content change) -- this is what makes "Known documents: 1 /
+    Extracted: 2" legible instead of mysterious (see Stage 5.4).
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    profile_present = source_browser.profile_dir(source_name, config.browser_profiles_dir).exists()
+
+    conn = db.open_production_database(config.database_path)
+    last_collected_at = db.get_meta(conn, f"source:{source_name}:last_collected_at")
+    known = db.count_collected_sources(conn, source_name)
+    versions = db.count_collected_source_versions(conn, source_name)
+    newest_source_date = db.get_newest_source_date(conn, source_name)
+    pending_extraction = db.count_collected_sources_by_extraction_status(conn, source_name, "PENDING")
+    extracted = db.count_collected_sources_by_extraction_status(conn, source_name, "EXTRACTED")
+    screened = db.count_screened_sources(conn, source_name)
+    collection_errors = db.get_meta(conn, f"source:{source_name}:last_collection_errors") or "0"
+    conn.close()
+
+    print(f"Authentication profile present: {'YES' if profile_present else 'NO'}")
+    print(f"Last successful collection: {last_collected_at or 'never'}")
+    print(f"Known documents: {known}")
+    print(f"Source versions: {versions}")
+    print(f"Newest published date: {newest_source_date or 'unknown'}")
+    print(f"Pending extraction versions: {pending_extraction}")
+    print(f"Extracted versions: {extracted}")
+    print(f"Screened versions: {screened}")
+    print(f"Collection errors: {collection_errors}")
+    return 0
+
+
+def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: str) -> int:
+    """READ-ONLY diagnostic: for one external_id, list every stored
+    version's hashes/paths and report whether their substantive pitch
+    text is actually identical -- recomputed fresh from each version's
+    own saved raw HTML file (never assumed from a possibly-stale
+    content_hash, in case this is being run to sanity-check versions
+    captured before the Stage 5.4 fix). Makes NO writes of any kind: no
+    DB writes, no file writes, no backups, no re-fetching.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    rows = db.get_collected_source_versions(conn, source_name, external_id)
+    conn.close()
+
+    if not rows:
+        print(f"No stored versions found for {source_name}/{external_id}.")
+        return 0
+
+    print(f"{len(rows)} version(s) stored for {source_name}/{external_id}:")
+    canonical_texts = []
+    for row in rows:
+        print(f"  source_id={row['source_id']}")
+        print(f"    content_hash:      {row['content_hash']}")
+        print(f"    raw_capture_hash:  {row['raw_capture_hash'] or '(not recorded -- captured before this column existed)'}")
+        print(f"    raw_html_path:     {row['raw_html_path']}")
+        print(f"    created_at:        {row['created_at']}")
+        try:
+            html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"    (could not read raw artifact to compare substantive text: {exc})")
+            continue
+        canonical_texts.append(adapter.build_canonical_source_text(html))
+
+    if len(canonical_texts) < len(rows):
+        print("Could not read every raw artifact -- substantive-text comparison is incomplete.")
+    elif len(set(canonical_texts)) == 1:
+        print("Substantive pitch text is IDENTICAL across all stored versions.")
+    else:
+        print("Substantive pitch text DIFFERS across stored versions.")
+    return 0
+
+
+def cmd_preview_digest(config: Config) -> int:
+    """LOCAL PREVIEW ONLY -- prints at most 5 new, worth-Brad's-attention
+    ideas to the terminal and marks them shown (so they're never presented
+    as "new" again). Never sends anything anywhere (see
+    ideascout/notifier.py, never imported here); works regardless of
+    Config.alerts_enabled, since printing to a terminal Brad explicitly
+    ran is not an alert.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet.")
+        return 0
+
+    candidates = db.get_unshown_screened_sources_for_taste_version(conn, latest_taste["version_number"])
+    investigate_now = [c for c in candidates if c["overall_prediction"] == "INVESTIGATE_NOW"]
+    watch = [c for c in candidates if c["overall_prediction"] == "WATCH"]
+    selected = (investigate_now + watch)[:5]
+
+    if not selected:
+        print("No new ideas to show right now.")
+        conn.close()
+        return 0
+
+    for item in selected:
+        label = item["company"] or item["ticker"] or item["external_id"]
+        ticker_suffix = f" ({item['ticker']})" if item["ticker"] and item["ticker"] != label else ""
+        key_concerns = json.loads(item["key_concerns_json"])
+
+        print(f"=== {label}{ticker_suffix} ===")
+        print(f"Source: {item['source_name']}")
+        print(f"Why surfaced: {item['overall_prediction']}")
+        print(f"Why potentially mispriced: {item['why_mispriced'] or '(not stated)'}")
+        print(f"Upside framing: {item['upside_case'] or '(not stated)'}")
+        print(f"Main concern: {key_concerns[0] if key_concerns else '(none noted)'}")
+        print(f"Original source: {item['canonical_url']}")
+        print()
+
+        db.mark_source_shown_in_digest(conn, item["source_id"], utcnow_iso())
+
+    conn.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
@@ -1297,6 +1743,37 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "show-shadow-results",
         help="Show shadow predictions next to Brad's actual verdict, for already-judged ideas only",
+    )
+    source_login_parser = subparsers.add_parser(
+        "source-login",
+        help="Open a visible Chrome window to manually authenticate a website source",
+    )
+    source_login_parser.add_argument("source_name", help="e.g. yellowbrick")
+    collect_source_parser = subparsers.add_parser(
+        "collect-source",
+        help="Discover and collect recent items from an authenticated website source",
+    )
+    collect_source_parser.add_argument("source_name", help="e.g. yellowbrick")
+    collect_source_parser.add_argument(
+        "--dry-run", action="store_true", help="Discover and print only -- no database changes, no LLM calls"
+    )
+    collect_source_parser.add_argument(
+        "--limit", type=int, default=10, help="Maximum number of recent items to discover (default: 10)"
+    )
+    source_status_parser = subparsers.add_parser(
+        "source-status",
+        help="Show collection/extraction/screening status for a website source",
+    )
+    source_status_parser.add_argument("source_name", help="e.g. yellowbrick")
+    diagnose_versions_parser = subparsers.add_parser(
+        "diagnose-source-versions",
+        help="READ-ONLY: show every stored version of one document and whether their text actually differs",
+    )
+    diagnose_versions_parser.add_argument("source_name", help="e.g. yellowbrick")
+    diagnose_versions_parser.add_argument("external_id", help="e.g. 143411")
+    subparsers.add_parser(
+        "preview-digest",
+        help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
     )
     return arg_parser
 
@@ -1380,6 +1857,30 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_show_shadow_results(config)
+        elif args.command == "source-login":
+            # No LLM calls happen here at all -- just a browser + manual
+            # login -- so this does not require ANTHROPIC_API_KEY.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_source_login(config, args.source_name)
+        elif args.command == "collect-source":
+            # --dry-run makes no LLM calls at all, so it must not require
+            # ANTHROPIC_API_KEY -- only a real (non-dry-run) run does.
+            config = load_config(require_source=not args.dry_run)
+            setup_logging(config.log_path)
+            return cmd_collect_source(config, args.source_name, dry_run=args.dry_run, limit=args.limit)
+        elif args.command == "source-status":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_source_status(config, args.source_name)
+        elif args.command == "diagnose-source-versions":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_diagnose_source_versions(config, args.source_name, args.external_id)
+        elif args.command == "preview-digest":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_preview_digest(config)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2

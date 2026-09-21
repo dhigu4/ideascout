@@ -51,3 +51,31 @@ to .env.
 If an old .env is found in the repo root (a leftover from before
 persistent state moved to IdeaScoutLocal), warn Brad to move it there
 himself. Do not move, copy, or delete it automatically.
+
+---
+
+CRITICAL: WEBSITE-SOURCE COLLECTION STATE IS ALSO PROTECTED
+
+Stage 5 (authenticated website-source collection, first adapter:
+Yellowbrick) added two more permanent production directories, both under
+IdeaScoutLocal and covered by every rule above exactly the same way:
+
+C:\Users\brad\IdeaScoutLocal\browser-profiles
+C:\Users\brad\IdeaScoutLocal\raw
+
+browser-profiles holds Chrome's own persistent, authenticated session
+data (one dedicated profile per source -- never Brad's normal Chrome
+profile). NEVER read, parse, copy, export, or print anything from inside
+it -- IdeaScout code only ever computes a PATH to it and hands that path
+to Playwright; nothing in this codebase should ever open a file under it
+directly. This is real, sensitive session state, not a cache.
+
+raw holds every website source document ever captured, permanently,
+before any AI processing -- this is provenance and must never be deleted,
+overwritten, or "cleaned up," exactly like ideas.db and backups\ above.
+
+All tests and all manual developer verification involving website-source
+collection MUST use tmp_path-based directories and a fake/mocked
+Playwright browser (see tests/browser_fakes.py) -- never a real Chrome
+instance, and never Brad's real Yellowbrick (or any other real website)
+account or session, even read-only.

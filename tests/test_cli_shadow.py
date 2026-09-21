@@ -88,7 +88,7 @@ def make_holdout_idea(
 
 def make_extracted_idea(**overrides) -> idea_extraction.ExtractedIdea:
     fields = dict(
-        company="HOLD Corp", ticker="HOLD", source_title="HOLD Corp writeup", source_date="2026-01-05",
+        company="HOLD Corp", ticker="HOLD",
         business_summary="A widget maker.", core_thesis="Hidden earnings power.",
         why_mispriced="Loss-making segment obscures true earnings.",
         future_earnings_change="Segment breakeven expected 2027.", upside_case="3-4x.",
@@ -166,6 +166,26 @@ def test_shadow_score_creates_idea_record_and_prediction_for_scorable_holdout_id
     prediction = db.get_latest_shadow_prediction_for_idea(conn, idea_record["idea_id"])
     assert prediction["overall_prediction"] == "WATCH"
     conn.close()
+
+
+def test_shadow_score_normalizes_blank_company_and_ticker_to_none_for_persistence(tmp_path, monkeypatch):
+    """ExtractedIdea (Stage 5.3) represents "not stated" as an empty
+    string, never null -- cli.py's extraction call site normalizes that
+    to None before writing to idea_records, since the DB/API's existing
+    semantics expect None for "no company/ticker known", not "".
+    """
+    config, latest_taste, feedback_id = setup_taste_and_one_holdout_idea(tmp_path, monkeypatch)
+    patch_shadow_pipeline(monkeypatch, extracted=make_extracted_idea(company="", ticker=""))
+
+    exit_code = cli.cmd_shadow_score(config)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    idea_record = db.get_idea_record_by_message_id(conn, "msg_hold_1")
+    conn.close()
+
+    assert idea_record["company"] is None
+    assert idea_record["ticker"] is None
 
 
 def test_shadow_score_marks_unscorable_source_and_skips_extraction_and_screening(tmp_path, monkeypatch):

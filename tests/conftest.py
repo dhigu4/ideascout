@@ -52,4 +52,10 @@ def _never_touch_production_state(request, tmp_path, monkeypatch):
     monkeypatch.setattr(
         ideascout_config, "DEFAULT_SCREEN_RULES_PATH", sandbox / "InvestmentBrain_TEST_SANDBOX" / "IDEA_SCREEN_RULES.md"
     )
+    # Website-source collection (Yellowbrick and beyond): browser-profiles
+    # holds Chrome's real persistent session/profile data, and raw holds
+    # every permanently-captured source document -- both real production
+    # state that must never be reachable from a test by accident.
+    monkeypatch.setattr(ideascout_config, "DEFAULT_BROWSER_PROFILES_DIR", sandbox / "browser-profiles")
+    monkeypatch.setattr(ideascout_config, "DEFAULT_RAW_STORAGE_DIR", sandbox / "raw")
     yield

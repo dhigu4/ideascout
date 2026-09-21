@@ -358,6 +358,152 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX idx_shadow_predictions_idea_id ON shadow_predictions(idea_id);
     """,
+    # Migration 10 (Stage 5): website-source collection, first adapter
+    # Yellowbrick. Deliberately a SEPARATE set of tables from Stage 4's
+    # idea_records/shadow_predictions (which are keyed to messages_raw and
+    # the email-only holdout workflow) -- collected_sources/
+    # source_screenings are source-agnostic (source_name distinguishes
+    # Yellowbrick from any future VIC/MicroCapClub/etc. adapter) and the
+    # existing email holdout/shadow experiment is untouched by any of this.
+    #
+    # collected_sources: one row per (source_name, external_id,
+    # content_hash) -- i.e. one row per DISTINCT VERSION of a source
+    # document. Re-collecting identical content is a guaranteed no-op
+    # (UNIQUE constraint + raw_storage.py's content-addressed filename);
+    # if content genuinely changes, a NEW row is inserted with
+    # previous_version_source_id pointing at the prior row, which is never
+    # updated or deleted -- "preserve prior provenance rather than
+    # silently overwriting history". extraction_status starts 'PENDING'
+    # and becomes 'EXTRACTED' once idea_extraction.extract_idea succeeds;
+    # left 'PENDING' (not a terminal error) on failure, exactly like
+    # idea_records, so the next collect-source run retries automatically.
+    #
+    # company/ticker/source_title/source_date deliberately use the SAME
+    # names as idea_records' equivalent columns (not "extracted_company"
+    # etc.): they start out populated cheaply from discovery-time feed
+    # metadata (often None) and are OVERWRITTEN with idea_extraction's own
+    # findings once extraction succeeds, since the LLM's reading of the
+    # actual document is more authoritative than a feed scrape. Using
+    # identical field names is also what lets shadow.screen_idea and
+    # shadow.format_idea_record_for_screening operate on a
+    # collected_sources row exactly as they already do on an idea_records
+    # row -- this IS the "generic screening function reusable outside the
+    # email-holdout workflow": no translation layer needed.
+    #
+    # discovery_title is separate from source_title and is NEVER
+    # overwritten by extraction -- it exists purely so a later collection
+    # run can cheaply compare a freshly-discovered title against what was
+    # seen before, to decide whether a known external_id might have
+    # changed, without that comparison being corrupted by source_title
+    # having since been refined by the LLM into different wording.
+    #
+    # source_screenings: append-only, immutable, exactly mirroring
+    # shadow_predictions's shape and guarantees (UNIQUE on
+    # (source_id, taste_version, screen_rules_sha256), no update function
+    # -- a taste or rules change produces a new coexisting row, never an
+    # overwrite) but keyed to collected_sources.source_id instead of
+    # idea_records.idea_id, since this is the generic, source-agnostic
+    # screening record.
+    #
+    # digest_shown_sources: tracks which sources preview-digest has
+    # already surfaced, so the same idea is never presented as "new" twice.
+    """
+    CREATE TABLE collected_sources (
+        source_id                            INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_name                          TEXT NOT NULL,
+        external_id                          TEXT NOT NULL,
+        canonical_url                        TEXT NOT NULL,
+        discovered_at                        TEXT NOT NULL,
+        discovery_title                      TEXT,
+        author                               TEXT,
+        source_type                          TEXT,
+        content_hash                         TEXT NOT NULL,
+        raw_html_path                        TEXT NOT NULL,
+        metadata_json                        TEXT,
+        collection_status                    TEXT NOT NULL DEFAULT 'COLLECTED',
+        previous_version_source_id           INTEGER REFERENCES collected_sources(source_id),
+
+        extraction_status                    TEXT NOT NULL DEFAULT 'PENDING',
+        company                              TEXT,
+        ticker                               TEXT,
+        source_title                         TEXT,
+        source_date                          TEXT,
+        business_summary                     TEXT,
+        core_thesis                          TEXT,
+        why_mispriced                        TEXT,
+        future_earnings_change               TEXT,
+        upside_case                          TEXT,
+        downside_or_key_risks                TEXT,
+        catalysts                            TEXT,
+        what_must_be_true                    TEXT,
+        evidence_of_market_misunderstanding  TEXT,
+        known_unknowns                       TEXT,
+        extraction_model_name                TEXT,
+        extracted_at                         TEXT,
+
+        created_at                           TEXT NOT NULL,
+
+        UNIQUE(source_name, external_id, content_hash)
+    );
+
+    CREATE INDEX idx_collected_sources_source_name ON collected_sources(source_name);
+    CREATE INDEX idx_collected_sources_external_id ON collected_sources(source_name, external_id);
+    CREATE INDEX idx_collected_sources_extraction_status ON collected_sources(extraction_status);
+
+    CREATE TABLE source_screenings (
+        screening_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id                INTEGER NOT NULL REFERENCES collected_sources(source_id),
+        created_at               TEXT NOT NULL,
+
+        taste_version            INTEGER NOT NULL,
+        taste_sha256             TEXT NOT NULL,
+
+        screen_rules_path        TEXT NOT NULL,
+        screen_rules_sha256      TEXT NOT NULL,
+
+        content_hash             TEXT NOT NULL,
+        model_name               TEXT NOT NULL,
+
+        overall_prediction       TEXT NOT NULL,
+        mispricing               TEXT NOT NULL,
+        variant_perception       TEXT NOT NULL,
+        upside                   TEXT NOT NULL,
+        business_quality         TEXT NOT NULL,
+        downside                 TEXT NOT NULL,
+
+        key_reasons_json         TEXT NOT NULL,
+        key_concerns_json        TEXT NOT NULL,
+        critical_questions_json  TEXT NOT NULL,
+        confidence               TEXT NOT NULL,
+
+        UNIQUE(source_id, taste_version, screen_rules_sha256)
+    );
+
+    CREATE INDEX idx_source_screenings_source_id ON source_screenings(source_id);
+
+    CREATE TABLE digest_shown_sources (
+        source_id     INTEGER PRIMARY KEY REFERENCES collected_sources(source_id),
+        shown_at      TEXT NOT NULL
+    );
+    """,
+    # Migration 11 (Stage 5.4): source-version idempotency fix. A real
+    # production immediate-refetch of an unchanged Yellowbrick pitch was
+    # wrongly treated as a changed version, because content_hash was
+    # (until this stage) computed over the full raw page HTML -- volatile
+    # scripts/session/hydration state mean two fetches of an identical
+    # pitch essentially never produce byte-identical HTML. content_hash
+    # now means "hash of the normalized, substantive-only canonical
+    # source text" and is what actually decides whether a document has
+    # materially changed (see ideascout/sources/yellowbrick.py's
+    # build_canonical_source_text). raw_capture_hash is purely an extra
+    # provenance/diagnostic detail -- the hash of the exact raw HTML bytes
+    # captured this specific time -- and is nullable because the two
+    # existing production rows were captured before this column existed
+    # and cannot be backfilled without re-fetching (which this migration
+    # deliberately never does).
+    """
+    ALTER TABLE collected_sources ADD COLUMN raw_capture_hash TEXT;
+    """,
 ]
 
 
@@ -1494,3 +1640,388 @@ def get_eligible_feedback_for_message(conn: sqlite3.Connection, message_id: str)
     """
     eligible = get_feedback_eligible_for_learning(conn)
     return [row for row in eligible if row["message_id"] == message_id]
+
+
+# --- Stage 5: website-source collection (first adapter: Yellowbrick) --------
+
+
+def get_latest_collected_source(conn: sqlite3.Connection, source_name: str, external_id: str) -> sqlite3.Row | None:
+    """The most recent known VERSION of one (source_name, external_id) --
+    i.e. what a collector should compare newly discovered metadata
+    against to decide whether anything has changed. None if this
+    external_id has never been collected at all.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM collected_sources
+        WHERE source_name = ? AND external_id = ?
+        ORDER BY source_id DESC LIMIT 1
+        """,
+        (source_name, external_id),
+    ).fetchone()
+
+
+def insert_collected_source(
+    conn: sqlite3.Connection,
+    *,
+    source_name: str,
+    external_id: str,
+    canonical_url: str,
+    discovered_at: str,
+    discovery_title: str | None,
+    source_date: str | None,
+    source_title: str | None,
+    author: str | None,
+    ticker: str | None,
+    company: str | None,
+    source_type: str | None,
+    content_hash: str,
+    raw_html_path: str,
+    metadata_json: str,
+    created_at: str,
+    previous_version_source_id: int | None = None,
+    raw_capture_hash: str | None = None,
+) -> int:
+    """Insert one collected source VERSION. extraction_status starts
+    'PENDING' (its column default); company/ticker/source_title/
+    source_date start out as whatever cheap discovery-time metadata gave
+    (often None) and are refined by update_collected_source_extracted
+    once Level-1 extraction succeeds. If content_hash for this
+    (source_name, external_id) has already been saved before, the UNIQUE
+    constraint makes this a safe no-op path for callers using INSERT OR
+    IGNORE-style dedupe logic -- callers are expected to check
+    get_latest_collected_source first (cheap dedupe), so this function
+    itself uses a plain INSERT and lets a genuine duplicate raise.
+
+    content_hash is the VERSION-IDENTITY hash (of normalized, substantive
+    content only -- see yellowbrick.py's build_canonical_source_text) and
+    is what the UNIQUE(source_name, external_id, content_hash) constraint
+    keys on. raw_capture_hash is a separate, purely informational
+    provenance detail (hash of the exact raw bytes captured this time);
+    it is optional (defaults to None) precisely so it can never become
+    part of any uniqueness/versioning decision.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO collected_sources (
+            source_name, external_id, canonical_url, discovered_at, discovery_title, source_date,
+            source_title, author, ticker, company, source_type,
+            content_hash, raw_capture_hash, raw_html_path, metadata_json, previous_version_source_id, created_at
+        ) VALUES (
+            :source_name, :external_id, :canonical_url, :discovered_at, :discovery_title, :source_date,
+            :source_title, :author, :ticker, :company, :source_type,
+            :content_hash, :raw_capture_hash, :raw_html_path, :metadata_json, :previous_version_source_id, :created_at
+        )
+        """,
+        {
+            "source_name": source_name,
+            "external_id": external_id,
+            "canonical_url": canonical_url,
+            "discovered_at": discovered_at,
+            "discovery_title": discovery_title,
+            "source_date": source_date,
+            "source_title": source_title,
+            "author": author,
+            "ticker": ticker,
+            "company": company,
+            "source_type": source_type,
+            "content_hash": content_hash,
+            "raw_capture_hash": raw_capture_hash,
+            "raw_html_path": raw_html_path,
+            "metadata_json": metadata_json,
+            "previous_version_source_id": previous_version_source_id,
+            "created_at": created_at,
+        },
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def update_collected_source_extracted(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    company: str | None,
+    ticker: str | None,
+    source_title: str | None,
+    source_date: str | None,
+    business_summary: str,
+    core_thesis: str,
+    why_mispriced: str,
+    future_earnings_change: str,
+    upside_case: str,
+    downside_or_key_risks: str,
+    catalysts: str,
+    what_must_be_true: str,
+    evidence_of_market_misunderstanding: str,
+    known_unknowns: str,
+    extraction_model_name: str,
+    extracted_at: str,
+) -> None:
+    """Fill in Level-1 (compact idea extraction) fields and flip
+    extraction_status to 'EXTRACTED'. company/ticker/source_title/
+    source_date are OVERWRITTEN here with extraction's own findings --
+    more authoritative than the cheap discovery-time metadata they started
+    with. Never called more than once per source_id with a real result --
+    "extraction happens once per source/content version" is enforced by
+    the caller only ever attempting this for rows still 'PENDING'.
+    """
+    conn.execute(
+        """
+        UPDATE collected_sources
+        SET extraction_status = 'EXTRACTED',
+            company = :company,
+            ticker = :ticker,
+            source_title = :source_title,
+            source_date = :source_date,
+            business_summary = :business_summary,
+            core_thesis = :core_thesis,
+            why_mispriced = :why_mispriced,
+            future_earnings_change = :future_earnings_change,
+            upside_case = :upside_case,
+            downside_or_key_risks = :downside_or_key_risks,
+            catalysts = :catalysts,
+            what_must_be_true = :what_must_be_true,
+            evidence_of_market_misunderstanding = :evidence_of_market_misunderstanding,
+            known_unknowns = :known_unknowns,
+            extraction_model_name = :extraction_model_name,
+            extracted_at = :extracted_at
+        WHERE source_id = :source_id
+        """,
+        {
+            "source_id": source_id,
+            "company": company,
+            "ticker": ticker,
+            "source_title": source_title,
+            "source_date": source_date,
+            "business_summary": business_summary,
+            "core_thesis": core_thesis,
+            "why_mispriced": why_mispriced,
+            "future_earnings_change": future_earnings_change,
+            "upside_case": upside_case,
+            "downside_or_key_risks": downside_or_key_risks,
+            "catalysts": catalysts,
+            "what_must_be_true": what_must_be_true,
+            "evidence_of_market_misunderstanding": evidence_of_market_misunderstanding,
+            "known_unknowns": known_unknowns,
+            "extraction_model_name": extraction_model_name,
+            "extracted_at": extracted_at,
+        },
+    )
+    conn.commit()
+
+
+def get_pending_extraction_sources(conn: sqlite3.Connection, source_name: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' ORDER BY source_id",
+        (source_name,),
+    ).fetchall()
+
+
+def count_collected_sources(conn: sqlite3.Connection, source_name: str) -> int:
+    """Count of DISTINCT known documents (external_id), not raw version
+    rows -- a changed source that now has two rows still counts once.
+    """
+    return conn.execute(
+        "SELECT COUNT(DISTINCT external_id) FROM collected_sources WHERE source_name = ?",
+        (source_name,),
+    ).fetchone()[0]
+
+
+def count_collected_source_versions(conn: sqlite3.Connection, source_name: str) -> int:
+    """Total collected_sources ROWS for this source -- every immutable
+    version across every document, NOT deduplicated by external_id (see
+    count_collected_sources for the distinct-document count). A document
+    with two legitimate versions (a real content change) contributes 2
+    here but only 1 there -- this is the number source-status uses to
+    make that distinction legible instead of mysterious.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM collected_sources WHERE source_name = ?", (source_name,)
+    ).fetchone()[0]
+
+
+def get_collected_source_versions(conn: sqlite3.Connection, source_name: str, external_id: str) -> list[sqlite3.Row]:
+    """Every stored version (row) for one (source_name, external_id), in
+    the order they were created -- READ-ONLY, used by the version-
+    diagnostic command to show Brad exactly what's stored without
+    modifying anything.
+    """
+    return conn.execute(
+        "SELECT * FROM collected_sources WHERE source_name = ? AND external_id = ? ORDER BY source_id",
+        (source_name, external_id),
+    ).fetchall()
+
+
+def count_collected_sources_by_extraction_status(conn: sqlite3.Connection, source_name: str, extraction_status: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM collected_sources WHERE source_name = ? AND extraction_status = ?",
+        (source_name, extraction_status),
+    ).fetchone()[0]
+
+
+def get_newest_source_date(conn: sqlite3.Connection, source_name: str) -> str | None:
+    row = conn.execute(
+        "SELECT MAX(source_date) AS newest FROM collected_sources WHERE source_name = ?",
+        (source_name,),
+    ).fetchone()
+    return row["newest"] if row else None
+
+
+def get_source_screening(
+    conn: sqlite3.Connection, *, source_id: int, taste_version: int, screen_rules_sha256: str
+) -> sqlite3.Row | None:
+    """Existence check mirroring get_shadow_prediction: is there already a
+    screening for this EXACT (source, taste version, rules hash)
+    combination? If so, callers skip re-screening -- never overwritten.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM source_screenings
+        WHERE source_id = ? AND taste_version = ? AND screen_rules_sha256 = ?
+        """,
+        (source_id, taste_version, screen_rules_sha256),
+    ).fetchone()
+
+
+def insert_source_screening(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    created_at: str,
+    taste_version: int,
+    taste_sha256: str,
+    screen_rules_path: str,
+    screen_rules_sha256: str,
+    content_hash: str,
+    model_name: str,
+    overall_prediction: str,
+    mispricing: str,
+    variant_perception: str,
+    upside: str,
+    business_quality: str,
+    downside: str,
+    key_reasons_json: str,
+    key_concerns_json: str,
+    critical_questions_json: str,
+    confidence: str,
+) -> int:
+    """Insert one immutable source screening. Never updated afterward --
+    there is deliberately no update_source_screening function, mirroring
+    shadow_predictions's immutability guarantee exactly.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO source_screenings (
+            source_id, created_at, taste_version, taste_sha256,
+            screen_rules_path, screen_rules_sha256, content_hash, model_name,
+            overall_prediction, mispricing, variant_perception, upside,
+            business_quality, downside,
+            key_reasons_json, key_concerns_json, critical_questions_json, confidence
+        ) VALUES (
+            :source_id, :created_at, :taste_version, :taste_sha256,
+            :screen_rules_path, :screen_rules_sha256, :content_hash, :model_name,
+            :overall_prediction, :mispricing, :variant_perception, :upside,
+            :business_quality, :downside,
+            :key_reasons_json, :key_concerns_json, :critical_questions_json, :confidence
+        )
+        """,
+        {
+            "source_id": source_id,
+            "created_at": created_at,
+            "taste_version": taste_version,
+            "taste_sha256": taste_sha256,
+            "screen_rules_path": screen_rules_path,
+            "screen_rules_sha256": screen_rules_sha256,
+            "content_hash": content_hash,
+            "model_name": model_name,
+            "overall_prediction": overall_prediction,
+            "mispricing": mispricing,
+            "variant_perception": variant_perception,
+            "upside": upside,
+            "business_quality": business_quality,
+            "downside": downside,
+            "key_reasons_json": key_reasons_json,
+            "key_concerns_json": key_concerns_json,
+            "critical_questions_json": critical_questions_json,
+            "confidence": confidence,
+        },
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_latest_source_screening_for_source(conn: sqlite3.Connection, source_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM source_screenings WHERE source_id = ? ORDER BY screening_id DESC LIMIT 1",
+        (source_id,),
+    ).fetchone()
+
+
+def get_extracted_sources_missing_screening(
+    conn: sqlite3.Connection, source_name: str, *, taste_version: int, screen_rules_sha256: str
+) -> list[sqlite3.Row]:
+    """EXTRACTED sources with no source_screenings row yet for this exact
+    (taste_version, screen_rules_sha256) combination -- what collect-source
+    attempts to screen on each run, so a taste/rules change or a
+    previously-unavailable taste naturally gets picked up later without
+    any manual requeue.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM collected_sources
+        WHERE source_name = ? AND extraction_status = 'EXTRACTED'
+          AND source_id NOT IN (
+              SELECT source_id FROM source_screenings
+              WHERE taste_version = ? AND screen_rules_sha256 = ?
+          )
+        ORDER BY source_id
+        """,
+        (source_name, taste_version, screen_rules_sha256),
+    ).fetchall()
+
+
+def count_screened_sources(conn: sqlite3.Connection, source_name: str) -> int:
+    return conn.execute(
+        """
+        SELECT COUNT(DISTINCT cs.source_id)
+        FROM collected_sources cs
+        JOIN source_screenings ss ON ss.source_id = cs.source_id
+        WHERE cs.source_name = ?
+        """,
+        (source_name,),
+    ).fetchone()[0]
+
+
+def mark_source_shown_in_digest(conn: sqlite3.Connection, source_id: int, shown_at: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO digest_shown_sources (source_id, shown_at) VALUES (?, ?)",
+        (source_id, shown_at),
+    )
+    conn.commit()
+
+
+def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, taste_version: int) -> list[sqlite3.Row]:
+    """Sources with a non-PASS screening for this taste_version that have
+    never been shown in a digest yet, one row per source (its LATEST
+    screening for this taste_version, in case the rules changed and it
+    was re-screened), oldest screened first. This is preview-digest's
+    entire candidate pool before it applies the INVESTIGATE_NOW-first,
+    cap-at-5 selection.
+    """
+    return conn.execute(
+        """
+        SELECT cs.*, ss.*
+        FROM collected_sources cs
+        JOIN source_screenings ss ON ss.source_id = cs.source_id
+        WHERE ss.taste_version = :taste_version
+          AND ss.overall_prediction != 'PASS'
+          AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
+          AND ss.screening_id = (
+              SELECT MAX(s2.screening_id) FROM source_screenings s2
+              WHERE s2.source_id = cs.source_id AND s2.taste_version = :taste_version
+          )
+        ORDER BY ss.created_at ASC
+        """,
+        {"taste_version": taste_version},
+    ).fetchall()

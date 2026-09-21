@@ -45,6 +45,20 @@ class _RetryableGenerationError(RuntimeError):
     """
 
 
+def _is_schema_complexity_error(exc: Exception) -> bool:
+    """True for Anthropic's 400 invalid_request_error rejecting the
+    structured-output schema itself (observed message: "Schema is too
+    complex") -- a configuration problem with the caller's output_model,
+    never something a retry of the same request could fix. Generic: not
+    tied to any particular caller/schema, just this one error shape.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    return isinstance(exc, anthropic.BadRequestError) and "schema is too complex" in str(exc).lower()
+
+
 def output_config_for(output_model: Type[BaseModel]) -> dict:
     """Build the same "strict" JSON-schema output_config that
     client.messages.parse(output_format=output_model) would build
@@ -93,6 +107,14 @@ def generate_structured(
                 output_config=output_config,
             )
         except Exception as exc:
+            if _is_schema_complexity_error(exc):
+                raise StructuredGenerationError(
+                    f"The structured-output schema for {label} was rejected by the API as too "
+                    f"complex. This is a schema/configuration problem with the output_model passed "
+                    f"in, not a retryable content issue -- simplify it (a single flat object of "
+                    f"required scalar fields, no Optional/unions, no nested models, no arrays) "
+                    f"rather than retrying this request: {exc}"
+                ) from exc
             raise StructuredGenerationError(f"LLM call failed while {label}: {exc}") from exc
 
         try:

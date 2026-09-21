@@ -53,6 +53,24 @@ def test_default_screen_rules_path_matches_the_agreed_location():
     assert config.PROJECT_ROOT not in config.DEFAULT_SCREEN_RULES_PATH.parents
 
 
+@pytest.mark.real_config_defaults
+def test_default_browser_profiles_and_raw_storage_dirs_live_under_state_dir_not_repo():
+    """Stage 5's browser-profiles (Chrome's own persistent session data)
+    and raw (permanently captured source documents) must both live under
+    IdeaScoutLocal, never under this repo.
+    """
+    assert config.DEFAULT_BROWSER_PROFILES_DIR == config.DEFAULT_STATE_DIR / "browser-profiles"
+    assert config.DEFAULT_RAW_STORAGE_DIR == config.DEFAULT_STATE_DIR / "raw"
+    assert config.PROJECT_ROOT not in config.DEFAULT_BROWSER_PROFILES_DIR.parents
+    assert config.PROJECT_ROOT not in config.DEFAULT_RAW_STORAGE_DIR.parents
+
+
+def test_alerts_enabled_defaults_false():
+    assert config.DEFAULT_ALERTS_ENABLED is False
+    resolved = config.load_config()
+    assert resolved.alerts_enabled is False
+
+
 def test_autouse_fixture_redirects_ordinary_tests_away_from_real_state_dir(tmp_path):
     """No special marker here -- this is what every ordinary test gets.
     Proves the safety net is actually active by default, not just present
@@ -66,6 +84,13 @@ def test_autouse_fixture_redirects_ordinary_tests_away_from_real_state_dir(tmp_p
     assert config.ENV_PATH.is_relative_to(tmp_path)
     assert config.DEFAULT_SCREEN_RULES_PATH != real_screen_rules_path
     assert config.DEFAULT_SCREEN_RULES_PATH.is_relative_to(tmp_path)
+
+    real_browser_profiles_dir = Path.home() / "IdeaScoutLocal" / "browser-profiles"
+    real_raw_storage_dir = Path.home() / "IdeaScoutLocal" / "raw"
+    assert config.DEFAULT_BROWSER_PROFILES_DIR != real_browser_profiles_dir
+    assert config.DEFAULT_RAW_STORAGE_DIR != real_raw_storage_dir
+    assert config.DEFAULT_BROWSER_PROFILES_DIR.is_relative_to(tmp_path)
+    assert config.DEFAULT_RAW_STORAGE_DIR.is_relative_to(tmp_path)
 
 
 def test_load_config_cannot_resolve_to_the_real_production_database(monkeypatch):
@@ -97,6 +122,19 @@ def test_load_config_cannot_resolve_screen_rules_path_to_the_real_investment_bra
     real_screen_rules_path = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SCREEN_RULES.md"
     assert resolved.screen_rules_path != real_screen_rules_path
     assert config.PROJECT_ROOT not in resolved.screen_rules_path.parents
+
+
+def test_load_config_cannot_resolve_browser_or_raw_dirs_to_real_idea_scout_local(monkeypatch):
+    monkeypatch.delenv("BROWSER_PROFILES_DIR", raising=False)
+    monkeypatch.delenv("RAW_STORAGE_DIR", raising=False)
+
+    resolved = config.load_config()
+
+    real_state_dir = Path.home() / "IdeaScoutLocal"
+    assert resolved.browser_profiles_dir != real_state_dir / "browser-profiles"
+    assert resolved.raw_storage_dir != real_state_dir / "raw"
+    assert real_state_dir not in resolved.browser_profiles_dir.parents
+    assert real_state_dir not in resolved.raw_storage_dir.parents
 
 
 def test_find_legacy_repo_env_never_reads_or_modifies_the_file(tmp_path, monkeypatch):
