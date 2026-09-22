@@ -1877,6 +1877,30 @@ def count_collected_sources_by_extraction_status(conn: sqlite3.Connection, sourc
     ).fetchone()[0]
 
 
+def count_pending_extraction_sources(conn: sqlite3.Connection, source_name: str) -> int:
+    """Same eligibility as get_pending_extraction_sources (Stage 5.7) --
+    PENDING extraction_status AND COLLECTED collection_status -- so
+    source-status reports a count that matches EXACTLY what the real
+    extraction sweep would pick up next. A row with extraction_status =
+    'PENDING' but collection_status = 'INCOMPLETE_CONTENT' (an
+    intentionally retained thin/incomplete capture -- see
+    count_collected_sources_by_collection_status) is never actionable
+    pending work and must never be counted here.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' "
+        "AND collection_status = 'COLLECTED'",
+        (source_name,),
+    ).fetchone()[0]
+
+
+def count_collected_sources_by_collection_status(conn: sqlite3.Connection, source_name: str, collection_status: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM collected_sources WHERE source_name = ? AND collection_status = ?",
+        (source_name, collection_status),
+    ).fetchone()[0]
+
+
 def get_newest_source_date(conn: sqlite3.Connection, source_name: str) -> str | None:
     row = conn.execute(
         "SELECT MAX(source_date) AS newest FROM collected_sources WHERE source_name = ?",

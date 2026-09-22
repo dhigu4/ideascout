@@ -40,6 +40,7 @@ def test_source_status_before_any_login_or_collection(tmp_path, capsys):
     assert "Known documents: 0" in output
     assert "Source versions: 0" in output
     assert "Pending extraction versions: 0" in output
+    assert "Incomplete content versions: 0" in output
     assert "Extracted versions: 0" in output
     assert "Screened versions: 0" in output
     assert "Collection errors: 0" in output
@@ -112,3 +113,118 @@ def test_source_status_distinguishes_documents_from_versions_after_a_real_change
 
     assert "Known documents: 2" in output  # still 2 distinct pitches
     assert "Source versions: 3" in output  # one of them now has 2 versions
+
+
+# --- Stage 5.12: pending-extraction vs. incomplete-content semantics -------
+
+
+def _insert_source(conn, *, external_id: str, collection_status: str) -> int:
+    return db.insert_collected_source(
+        conn,
+        source_name="yellowbrick",
+        external_id=external_id,
+        canonical_url=f"https://www.joinyellowbrick.com/sp/{external_id}",
+        discovered_at="2026-01-01T00:00:00+00:00",
+        discovery_title="X",
+        source_date=None,
+        source_title="X",
+        author=None,
+        ticker=None,
+        company=None,
+        source_type="stock_pitch",
+        content_hash=f"hash-{external_id}",
+        raw_capture_hash=f"rawhash-{external_id}",
+        raw_html_path="unused.html",
+        metadata_json="{}",
+        created_at="2026-01-01T00:00:00+00:00",
+        collection_status=collection_status,
+    )
+
+
+def _mark_extracted(conn, source_id: int) -> None:
+    db.update_collected_source_extracted(
+        conn,
+        source_id=source_id,
+        company=None,
+        ticker=None,
+        source_title="X",
+        source_date=None,
+        business_summary="",
+        core_thesis="",
+        why_mispriced="",
+        future_earnings_change="",
+        upside_case="",
+        downside_or_key_risks="",
+        catalysts="",
+        what_must_be_true="",
+        evidence_of_market_misunderstanding="",
+        known_unknowns="",
+        extraction_model_name="test-model",
+        extracted_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def test_source_status_incomplete_only_row_is_zero_pending_one_incomplete(tmp_path, capsys):
+    """Reproduces the real production finding: a retained
+    collection_status='INCOMPLETE_CONTENT' row (extraction_status stays
+    'PENDING' by default, since it's never eligible for extraction) must
+    NOT be counted as actionable pending work.
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    _insert_source(conn, external_id="1", collection_status="INCOMPLETE_CONTENT")
+    conn.close()
+
+    cli.cmd_source_status(config, "yellowbrick")
+    output = capsys.readouterr().out
+
+    assert "Pending extraction versions: 0" in output
+    assert "Incomplete content versions: 1" in output
+    assert "Source versions: 1" in output  # total count preserved
+
+
+def test_source_status_genuinely_pending_collected_row_counts_as_pending(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    _insert_source(conn, external_id="2", collection_status="COLLECTED")
+    conn.close()
+
+    cli.cmd_source_status(config, "yellowbrick")
+    output = capsys.readouterr().out
+
+    assert "Pending extraction versions: 1" in output
+    assert "Incomplete content versions: 0" in output
+
+
+def test_source_status_extracted_row_is_not_counted_as_pending(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    source_id = _insert_source(conn, external_id="3", collection_status="COLLECTED")
+    _mark_extracted(conn, source_id)
+    conn.close()
+
+    cli.cmd_source_status(config, "yellowbrick")
+    output = capsys.readouterr().out
+
+    assert "Pending extraction versions: 0" in output
+    assert "Incomplete content versions: 0" in output
+    assert "Extracted versions: 1" in output
+
+
+def test_source_status_mixture_of_pending_incomplete_and_extracted_counts_correctly(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    _insert_source(conn, external_id="10", collection_status="INCOMPLETE_CONTENT")
+    _insert_source(conn, external_id="11", collection_status="INCOMPLETE_CONTENT")
+    _insert_source(conn, external_id="12", collection_status="COLLECTED")  # genuinely pending
+    extracted_id = _insert_source(conn, external_id="13", collection_status="COLLECTED")
+    _mark_extracted(conn, extracted_id)
+    conn.close()
+
+    cli.cmd_source_status(config, "yellowbrick")
+    output = capsys.readouterr().out
+
+    assert "Source versions: 4" in output
+    assert "Pending extraction versions: 1" in output
+    assert "Incomplete content versions: 2" in output
+    assert "Extracted versions: 1" in output

@@ -1602,6 +1602,16 @@ def cmd_source_status(config: Config, source_name: str) -> int:
     including any legitimate additional version created by a genuine
     content change) -- this is what makes "Known documents: 1 /
     Extracted: 2" legible instead of mysterious (see Stage 5.4).
+
+    "Pending extraction versions" (Stage 5.12 fix) uses the EXACT same
+    eligibility as the real extraction sweep (db.get_pending_extraction_
+    sources): PENDING extraction_status AND COLLECTED collection_status.
+    A row stuck at extraction_status='PENDING' only because it's an
+    intentionally retained collection_status='INCOMPLETE_CONTENT' version
+    (Stage 5.7) is never actionable work and must never inflate this
+    count -- it's reported separately as "Incomplete content versions"
+    instead, so Brad can tell "there's real pending work" apart from
+    "there's a historical incomplete capture that isn't going anywhere."
     """
     adapter = SOURCE_ADAPTERS.get(source_name)
     if adapter is None:
@@ -1615,7 +1625,8 @@ def cmd_source_status(config: Config, source_name: str) -> int:
     known = db.count_collected_sources(conn, source_name)
     versions = db.count_collected_source_versions(conn, source_name)
     newest_source_date = db.get_newest_source_date(conn, source_name)
-    pending_extraction = db.count_collected_sources_by_extraction_status(conn, source_name, "PENDING")
+    pending_extraction = db.count_pending_extraction_sources(conn, source_name)
+    incomplete_content = db.count_collected_sources_by_collection_status(conn, source_name, "INCOMPLETE_CONTENT")
     extracted = db.count_collected_sources_by_extraction_status(conn, source_name, "EXTRACTED")
     screened = db.count_screened_sources(conn, source_name)
     collection_errors = db.get_meta(conn, f"source:{source_name}:last_collection_errors") or "0"
@@ -1627,6 +1638,7 @@ def cmd_source_status(config: Config, source_name: str) -> int:
     print(f"Source versions: {versions}")
     print(f"Newest published date: {newest_source_date or 'unknown'}")
     print(f"Pending extraction versions: {pending_extraction}")
+    print(f"Incomplete content versions: {incomplete_content}")
     print(f"Extracted versions: {extracted}")
     print(f"Screened versions: {screened}")
     print(f"Collection errors: {collection_errors}")
