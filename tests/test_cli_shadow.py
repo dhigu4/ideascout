@@ -257,6 +257,192 @@ def test_extraction_failure_leaves_pending_and_is_retried_on_next_run(tmp_path, 
     conn.close()
 
 
+# --- retrying historical UNSCORABLE_SOURCE rows (Stage 5.13) -----------------
+
+
+def test_old_unscorable_becomes_isolated_after_isolator_improvement(tmp_path, monkeypatch):
+    """The row was marked UNSCORABLE_SOURCE by an OLDER isolator that
+    couldn't recognize the inline-pasted-source format; the CURRENT
+    isolator (with the Stage 5.13 fallback) can. A later shadow-score run
+    must pick it up without any manual requeue.
+    """
+    inline_body = (
+        "Maybe\n\n"
+        "Interesting but risky.\n\n"
+        "PRN is a company with hidden earnings power due to a temporary "
+        "segment loss that the market has not yet priced in.\n"
+    )
+    config, latest_taste, feedback_id = setup_taste_and_one_holdout_idea(
+        tmp_path, monkeypatch, body_raw=inline_body, user_comment="Interesting but risky."
+    )
+
+    conn = db.connect(config.database_path)
+    # Simulate the historical failure directly (an older isolator that
+    # didn't have the inline-paste fallback would have produced exactly
+    # this outcome for this body).
+    db.insert_idea_record_unscorable(
+        conn,
+        message_id="msg_hold_1",
+        unscorable_reason="no recognized forwarded-message, quoted-reply, or explicit SOURCE: boundary found",
+        source_isolated_at="2026-01-01T00:00:00+00:00",
+    )
+    conn.close()
+
+    extraction_calls, screening_calls = [], []
+    patch_shadow_pipeline(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    exit_code = cli.cmd_shadow_score(config)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    idea_record = db.get_idea_record_by_message_id(conn, "msg_hold_1")
+    conn.close()
+
+    assert idea_record["source_status"] == "ISOLATED"
+    assert idea_record["source_type"] == "inline_pasted_source"
+    assert idea_record["unscorable_reason"] is None
+    assert idea_record["extraction_status"] == "EXTRACTED"  # normal extraction proceeded afterward
+    assert len(extraction_calls) == 1
+    assert len(screening_calls) == 1
+
+
+def test_still_ambiguous_source_remains_unscorable_after_retry(tmp_path, monkeypatch, capsys):
+    config, latest_taste, feedback_id = setup_taste_and_one_holdout_idea(
+        tmp_path, monkeypatch, body_raw=UNSCORABLE_BODY
+    )
+
+    conn = db.connect(config.database_path)
+    db.insert_idea_record_unscorable(
+        conn, message_id="msg_hold_1", unscorable_reason="some prior reason",
+        source_isolated_at="2026-01-01T00:00:00+00:00",
+    )
+    idea_id_before = db.get_idea_record_by_message_id(conn, "msg_hold_1")["idea_id"]
+    conn.close()
+
+    patch_shadow_pipeline(monkeypatch)
+    exit_code = cli.cmd_shadow_score(config)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    idea_record = db.get_idea_record_by_message_id(conn, "msg_hold_1")
+    conn.close()
+
+    assert idea_record["idea_id"] == idea_id_before  # same row, not a new one
+    assert idea_record["source_status"] == "UNSCORABLE_SOURCE"
+    assert idea_record["source_text"] is None
+    assert idea_record["extraction_status"] == "PENDING"
+
+    output = capsys.readouterr().out
+    assert "Previously-unscorable sources retried this run: 1" in output
+    assert "Previously-unscorable sources now isolated: 0" in output
+
+
+def test_retry_does_not_create_a_second_idea_record_row(tmp_path, monkeypatch):
+    config, latest_taste, feedback_id = setup_taste_and_one_holdout_idea(
+        tmp_path, monkeypatch, body_raw=UNSCORABLE_BODY
+    )
+    conn = db.connect(config.database_path)
+    db.insert_idea_record_unscorable(
+        conn, message_id="msg_hold_1", unscorable_reason="some prior reason",
+        source_isolated_at="2026-01-01T00:00:00+00:00",
+    )
+    conn.close()
+
+    patch_shadow_pipeline(monkeypatch)
+    cli.cmd_shadow_score(config)
+
+    conn = db.connect(config.database_path)
+    count = conn.execute("SELECT COUNT(*) FROM idea_records WHERE message_id = ?", ("msg_hold_1",)).fetchone()[0]
+    conn.close()
+    assert count == 1  # never a junk duplicate row
+
+
+def test_existing_isolated_and_extracted_records_are_never_reset_by_retry_logic(tmp_path, monkeypatch):
+    """The retry path must only ever touch a row whose CURRENT
+    source_status is UNSCORABLE_SOURCE -- an already-ISOLATED/EXTRACTED
+    row (a completely different message here) is never re-examined,
+    re-isolated, or reset.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    conn = db.connect(config.database_path)
+    insert_n_eligible(conn, 15)
+    conn.close()
+    build_taste_v1(config, monkeypatch)
+
+    conn = db.connect(config.database_path)
+    make_holdout_idea(conn, "msg_good", body_raw=GOOD_SOURCE_BODY, user_comment="Interesting but risky.")
+    make_holdout_idea(
+        conn, "msg_bad", body_raw="Maybe\n\nNot enough remainder.\n\n", user_comment="Not enough remainder."
+    )
+    conn.close()
+
+    extraction_calls, screening_calls = [], []
+    patch_shadow_pipeline(monkeypatch, extraction_calls=extraction_calls, screening_calls=screening_calls)
+    cli.cmd_shadow_score(config)
+
+    conn = db.connect(config.database_path)
+    good_record_before = dict(db.get_idea_record_by_message_id(conn, "msg_good"))
+    bad_record_before = dict(db.get_idea_record_by_message_id(conn, "msg_bad"))
+    conn.close()
+    assert good_record_before["source_status"] == "ISOLATED"
+    assert good_record_before["extraction_status"] == "EXTRACTED"
+    assert bad_record_before["source_status"] == "UNSCORABLE_SOURCE"
+
+    # Rerun: the good record must be completely untouched; the bad one
+    # stays unscorable (still no substantial remainder) with no writes.
+    cli.cmd_shadow_score(config)
+
+    conn = db.connect(config.database_path)
+    good_record_after = dict(db.get_idea_record_by_message_id(conn, "msg_good"))
+    bad_record_after = dict(db.get_idea_record_by_message_id(conn, "msg_bad"))
+    conn.close()
+
+    assert good_record_after == good_record_before
+    assert bad_record_after == bad_record_before
+    assert len(extraction_calls) == 1  # not re-extracted
+    assert len(screening_calls) == 1
+
+
+def test_completed_shadow_prediction_is_never_replaced_by_retry_logic(tmp_path, monkeypatch):
+    """A prediction that already exists for a message must survive the
+    retry logic untouched -- retrying isolation for OTHER unscorable rows
+    must never regenerate or replace an existing prediction.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    conn = db.connect(config.database_path)
+    insert_n_eligible(conn, 15)
+    conn.close()
+    build_taste_v1(config, monkeypatch)
+
+    conn = db.connect(config.database_path)
+    make_holdout_idea(conn, "msg_good", body_raw=GOOD_SOURCE_BODY, user_comment="Interesting but risky.")
+    make_holdout_idea(conn, "msg_bad", body_raw=UNSCORABLE_BODY, user_comment="Interesting but risky.")
+    conn.close()
+
+    patch_shadow_pipeline(monkeypatch)
+    cli.cmd_shadow_score(config)
+
+    conn = db.connect(config.database_path)
+    idea_record = db.get_idea_record_by_message_id(conn, "msg_good")
+    prediction_before = dict(db.get_latest_shadow_prediction_for_idea(conn, idea_record["idea_id"]))
+    conn.close()
+
+    # Rerun with a DIFFERENT prediction configured -- if the retry logic
+    # ever touched the completed prediction, this would reveal it.
+    patch_shadow_pipeline(monkeypatch, prediction=make_prediction(overall_prediction="INVESTIGATE_NOW"))
+    cli.cmd_shadow_score(config)
+
+    conn = db.connect(config.database_path)
+    all_predictions = conn.execute(
+        "SELECT * FROM shadow_predictions WHERE idea_id = ?", (idea_record["idea_id"],)
+    ).fetchall()
+    conn.close()
+
+    assert len(all_predictions) == 1  # never replaced, never duplicated
+    assert dict(all_predictions[0]) == prediction_before
+
+
 # --- no-leakage at the orchestration level ------------------------------------
 
 

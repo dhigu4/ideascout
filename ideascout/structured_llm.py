@@ -30,6 +30,31 @@ RETRY_REMINDER_SUFFIX = (
     "fits well within the token limit and is valid JSON."
 )
 
+# Used ONLY when the immediately preceding attempt failed specifically due
+# to output-limit truncation (stop_reason == "max_tokens"), never for a
+# malformed/incomplete-JSON failure -- those are a different failure mode
+# that a stricter length instruction wouldn't fix. Paired with a modestly
+# larger token budget for that one retry attempt (see
+# TRUNCATION_RETRY_TOKEN_MULTIPLIER) -- neither change alone is as
+# reliable as both together, and escalating tokens on every retry
+# regardless of cause would waste budget on failures a length reminder
+# alone can already fix.
+TRUNCATION_RETRY_REMINDER_SUFFIX = (
+    "\n\nIMPORTANT: your previous response did not fit within the output token "
+    "limit and was cut off mid-output -- it was truncated, not merely long. Be "
+    "SIGNIFICANTLY more concise this time: keep every field to at most one or two "
+    "short sentences. Still cover everything asked for, but prioritize returning a "
+    "short, COMPLETE, valid response over a longer one that risks being cut off "
+    "again."
+)
+
+# A retry immediately following a truncation gets a LARGER token budget
+# than the original request, but only a modest, bounded multiple of it --
+# never an unconditionally huge fixed number -- so a genuinely oversized
+# request doesn't just get a bigger budget forever, and ordinary
+# (non-truncated) requests never pay for headroom they don't need.
+TRUNCATION_RETRY_TOKEN_MULTIPLIER = 1.5
+
 
 class StructuredGenerationError(RuntimeError):
     """Raised when a structured-output LLM call fails outright, or returns
@@ -91,17 +116,35 @@ def generate_structured(
     retrying it would just repeat the same failure. Never repairs or
     guesses at broken JSON with string/regex patching: an attempt either
     validates cleanly against `output_model`, or is discarded and retried.
+    Never returns a partial/incomplete structured object -- a call that
+    exhausts every attempt raises StructuredGenerationError instead.
+
+    A retry immediately following a TRUNCATION-caused failure (never a
+    malformed-JSON one) uses a stricter compactness reminder and a
+    modestly larger max_tokens for that one attempt only (see
+    TRUNCATION_RETRY_TOKEN_MULTIPLIER) -- the base max_output_tokens is
+    otherwise used for every attempt, so ordinary requests never pay for
+    headroom they don't need.
     """
     output_config = output_config_for(output_model)
     last_error: Exception | None = None
+    previous_attempt_truncated = False
 
     for attempt in range(1, max_attempts + 1):
-        content = user_content + (RETRY_REMINDER_SUFFIX if attempt > 1 else "")
+        if attempt == 1:
+            content = user_content
+            attempt_max_tokens = max_output_tokens
+        elif previous_attempt_truncated:
+            content = user_content + TRUNCATION_RETRY_REMINDER_SUFFIX
+            attempt_max_tokens = int(max_output_tokens * TRUNCATION_RETRY_TOKEN_MULTIPLIER)
+        else:
+            content = user_content + RETRY_REMINDER_SUFFIX
+            attempt_max_tokens = max_output_tokens
 
         try:
             response = client.messages.create(
                 model=model_name,
-                max_tokens=max_output_tokens,
+                max_tokens=attempt_max_tokens,
                 system=system_prompt,
                 messages=[{"role": "user", "content": content}],
                 output_config=output_config,
@@ -119,9 +162,12 @@ def generate_structured(
 
         try:
             if response.stop_reason == "max_tokens":
+                previous_attempt_truncated = True
                 raise _RetryableGenerationError(
-                    f"{label}: response truncated at output limit (attempt {attempt}/{max_attempts})"
+                    f"{label}: response truncated at output limit (attempt {attempt}/{max_attempts}, "
+                    f"max_tokens={attempt_max_tokens})"
                 )
+            previous_attempt_truncated = False
 
             text = next((block.text for block in response.content if getattr(block, "type", None) == "text"), "")
             try:

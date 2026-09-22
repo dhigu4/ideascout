@@ -63,12 +63,20 @@ Every field in your response is a required string. Rules:
 - Every other field should be a short, neutral, faithful summary of what \
   the source text says, in your own words, without adding an opinion of \
   your own about whether the idea is good or bad.
+- BE GENUINELY COMPACT. Each field is a compression of the source, not a \
+  retelling of it: at most 1-3 short sentences per field, even when the \
+  source material is long (a source can run to tens of thousands of \
+  characters; your summary of it must not). Use plain, direct sentences, \
+  not lists of clauses strung together. A short, complete answer for \
+  every field is always better than a long, detailed one -- do not pad a \
+  field with extra detail, caveats, or restated context just because the \
+  source discusses it at length.
 - If the source text doesn't address a field at all, return an empty \
   string for it rather than inventing something or padding it with \
   filler text.
 - known_unknowns should clearly separate what the source itself claims \
   from what is genuinely unknown -- list what a reader would need to \
-  find out that this source text does not itself answer.
+  find out that this source text does not itself answer, briefly.
 """
 
 

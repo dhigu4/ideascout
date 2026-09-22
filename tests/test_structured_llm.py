@@ -145,6 +145,115 @@ def test_other_bad_request_errors_still_raise_clearly_without_retry():
     assert len(client.messages.calls) == 1
 
 
+# --- truncation-aware retry escalation (Stage 5.13) --------------------------
+
+
+def test_normal_compact_response_succeeds_on_first_attempt_with_base_token_budget():
+    client = _ScriptedClient([_FakeResponse("end_turn", '{"a": "1", "b": "2"}')])
+
+    result = structured_llm.generate_structured(
+        client, model_name="fake-model", system_prompt="system", user_content="content",
+        output_model=_SimpleModel, max_output_tokens=100, max_attempts=3, label="a test call",
+    )
+
+    assert result.a == "1"
+    assert len(client.messages.calls) == 1
+    assert client.messages.calls[0]["max_tokens"] == 100
+
+
+def test_truncation_then_retry_uses_larger_token_budget_and_stricter_reminder():
+    client = _ScriptedClient(
+        [
+            _FakeResponse("max_tokens", ""),
+            _FakeResponse("end_turn", '{"a": "1", "b": "2"}'),
+        ]
+    )
+
+    result = structured_llm.generate_structured(
+        client, model_name="fake-model", system_prompt="system", user_content="content",
+        output_model=_SimpleModel, max_output_tokens=100, max_attempts=3, label="a test call",
+    )
+
+    assert result.a == "1"
+    assert len(client.messages.calls) == 2
+    assert client.messages.calls[0]["max_tokens"] == 100
+    # Modestly larger, never the same, never absurdly huge.
+    retry_tokens = client.messages.calls[1]["max_tokens"]
+    assert retry_tokens > 100
+    assert retry_tokens == int(100 * structured_llm.TRUNCATION_RETRY_TOKEN_MULTIPLIER)
+
+    retry_content = client.messages.calls[1]["messages"][0]["content"]
+    assert "truncat" in retry_content.lower()
+    assert "SIGNIFICANTLY more concise" in retry_content
+
+
+def test_repeated_truncation_fails_safely_with_no_partial_result():
+    client = _ScriptedClient([_FakeResponse("max_tokens", "")] * 3)
+
+    with pytest.raises(structured_llm.StructuredGenerationError) as exc_info:
+        structured_llm.generate_structured(
+            client, model_name="fake-model", system_prompt="system", user_content="content",
+            output_model=_SimpleModel, max_output_tokens=100, max_attempts=3, label="a test call",
+        )
+
+    assert len(client.messages.calls) == 3
+    assert "truncat" in str(exc_info.value).lower()
+    # Never a growing-forever budget -- capped by the fixed multiplier
+    # applied to the ORIGINAL base each time, not compounded attempt over
+    # attempt.
+    assert client.messages.calls[1]["max_tokens"] == client.messages.calls[2]["max_tokens"]
+
+
+def test_malformed_json_retry_does_not_escalate_tokens_or_use_truncation_reminder():
+    """A validation failure is a DIFFERENT failure mode from truncation --
+    it must keep using the base token budget and the existing generic
+    reminder, never the truncation-specific one.
+    """
+    client = _ScriptedClient(
+        [
+            _FakeResponse("end_turn", '{"a": "1"'),  # malformed/incomplete JSON, NOT truncated
+            _FakeResponse("end_turn", '{"a": "1", "b": "2"}'),
+        ]
+    )
+
+    result = structured_llm.generate_structured(
+        client, model_name="fake-model", system_prompt="system", user_content="content",
+        output_model=_SimpleModel, max_output_tokens=100, max_attempts=3, label="a test call",
+    )
+
+    assert result.a == "1"
+    assert client.messages.calls[1]["max_tokens"] == 100  # unchanged
+    retry_content = client.messages.calls[1]["messages"][0]["content"]
+    assert "SIGNIFICANTLY more concise" not in retry_content
+    assert "did not fit in the available output space" in retry_content
+
+
+def test_truncation_recovering_into_malformed_json_does_not_keep_escalating():
+    """After a truncation-caused retry SUCCEEDS in getting past max_tokens
+    but still returns malformed JSON, the NEXT retry must fall back to the
+    base token budget and the generic reminder -- escalation is tied to
+    the immediately preceding failure's cause, not sticky for the rest of
+    the call.
+    """
+    client = _ScriptedClient(
+        [
+            _FakeResponse("max_tokens", ""),
+            _FakeResponse("end_turn", '{"a": "1"'),  # not truncated this time, just malformed
+            _FakeResponse("end_turn", '{"a": "1", "b": "2"}'),
+        ]
+    )
+
+    result = structured_llm.generate_structured(
+        client, model_name="fake-model", system_prompt="system", user_content="content",
+        output_model=_SimpleModel, max_output_tokens=100, max_attempts=3, label="a test call",
+    )
+
+    assert result.a == "1"
+    assert len(client.messages.calls) == 3
+    assert client.messages.calls[1]["max_tokens"] == int(100 * structured_llm.TRUNCATION_RETRY_TOKEN_MULTIPLIER)
+    assert client.messages.calls[2]["max_tokens"] == 100  # back to base -- attempt 2 wasn't truncated
+
+
 def test_generic_success_path_unaffected_by_the_schema_complexity_check():
     client = _ScriptedClient([_FakeResponse("end_turn", '{"a": "1", "b": "2"}')])
 

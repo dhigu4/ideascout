@@ -262,6 +262,52 @@ def test_extract_idea_retries_on_truncation_then_succeeds():
     assert len(client.messages.calls) == 2
 
 
+def test_extract_idea_truncation_retry_uses_a_larger_token_budget(monkeypatch):
+    """Stage 5.13: a retry caused specifically by output truncation (the
+    real GME/OMDA production failure -- "response truncated at output
+    limit") must get a modestly larger max_tokens than the first attempt,
+    never the same fixed budget every time.
+    """
+    client = _ScriptedClient(
+        [
+            _FakeResponse("max_tokens", ""),
+            _FakeResponse("end_turn", _valid_extraction_json()),
+        ]
+    )
+
+    idea_extraction.extract_idea(client, "fake-model", SOURCE_TEXT)
+
+    first_call_tokens = client.messages.calls[0]["max_tokens"]
+    retry_call_tokens = client.messages.calls[1]["max_tokens"]
+    assert first_call_tokens == idea_extraction.MAX_OUTPUT_TOKENS
+    assert retry_call_tokens > first_call_tokens
+
+
+def test_extract_idea_repeated_truncation_fails_safely_with_no_partial_extraction():
+    """A LONG source (like the real GME/~67k-char or OMDA/~60k-char
+    holdout emails) that truncates on every attempt must fail cleanly --
+    never return a partial ExtractedIdea, and remain safely
+    PENDING/retryable at the caller level (see test_cli_shadow.py).
+    """
+    client = _ScriptedClient([_FakeResponse("max_tokens", "")] * idea_extraction.MAX_ATTEMPTS)
+
+    with pytest.raises(structured_llm.StructuredGenerationError) as exc_info:
+        idea_extraction.extract_idea(client, "fake-model", SOURCE_TEXT)
+
+    assert len(client.messages.calls) == idea_extraction.MAX_ATTEMPTS
+    assert "truncat" in str(exc_info.value).lower()
+
+
+def test_extraction_system_prompt_instructs_genuine_compactness():
+    """Direct guard for the prompt-strengthening half of the Stage 5.13
+    fix -- the model must be explicitly told to keep fields short, not
+    just implicitly hope for brevity.
+    """
+    prompt = idea_extraction.SYSTEM_PROMPT.lower()
+    assert "concise" in prompt or "compact" in prompt
+    assert "short" in prompt
+
+
 def test_extract_idea_exhausts_retries_and_raises_clearly():
     client = _ScriptedClient([_FakeResponse("max_tokens", "")] * idea_extraction.MAX_ATTEMPTS)
 

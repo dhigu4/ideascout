@@ -1517,6 +1517,49 @@ def update_idea_record_extracted(
     conn.commit()
 
 
+def update_idea_record_reisolated(
+    conn: sqlite3.Connection,
+    *,
+    idea_id: int,
+    source_type: str,
+    source_text: str,
+    source_hash: str,
+    source_isolated_at: str,
+) -> None:
+    """Transitions an idea_records row from UNSCORABLE_SOURCE to ISOLATED
+    after a successful RE-isolation attempt with improved deterministic
+    isolator logic (Stage 5.13 robustness fix). Populates the same Level-0
+    columns insert_idea_record_isolated would have on a first attempt and
+    clears unscorable_reason; extraction_status is left completely
+    untouched (it is already 'PENDING', its column default, since a row
+    that was never ISOLATED could never have been extracted) so normal
+    Level-1 extraction picks it up on this same or a later run. Never
+    called for a row that is already ISOLATED/EXTRACTED -- callers only
+    ever call this for a row whose current source_status is
+    'UNSCORABLE_SOURCE'.
+    """
+    conn.execute(
+        """
+        UPDATE idea_records
+        SET source_status = 'ISOLATED',
+            unscorable_reason = NULL,
+            source_type = :source_type,
+            source_text = :source_text,
+            source_hash = :source_hash,
+            source_isolated_at = :source_isolated_at
+        WHERE idea_id = :idea_id
+        """,
+        {
+            "idea_id": idea_id,
+            "source_type": source_type,
+            "source_text": source_text,
+            "source_hash": source_hash,
+            "source_isolated_at": source_isolated_at,
+        },
+    )
+    conn.commit()
+
+
 def count_idea_records_by_source_status(conn: sqlite3.Connection, source_status: str) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM idea_records WHERE source_status = ?", (source_status,)

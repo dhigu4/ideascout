@@ -1037,8 +1037,19 @@ def cmd_shadow_score(config: Config) -> int:
     message_ids = list(dict.fromkeys(row["message_id"] for row in holdout_rows))
     print(f"Holdout messages to consider: {len(message_ids)}")
 
+    # The already-parsed feedback event's own user_comment, keyed by
+    # message_id -- used ONLY by source_isolation's inline-pasted-source
+    # fallback as a delimiter (Stage 5.13), never as source material
+    # itself. setdefault keeps the FIRST feedback row's comment when a
+    # message produced more than one event.
+    comment_by_message_id: dict[str, str | None] = {}
+    for row in holdout_rows:
+        comment_by_message_id.setdefault(row["message_id"], row["user_comment"])
+
     isolated_now = 0
     unscorable_now = 0
+    reisolation_attempts = 0
+    reisolated_now = 0
     extracted_now = 0
     predictions_now = 0
     already_predicted = 0
@@ -1051,7 +1062,10 @@ def cmd_shadow_score(config: Config) -> int:
 
         if idea_record is None:
             message = db.get_message(conn, message_id)
-            isolation = source_isolation.isolate_source(message["body_raw"] if message is not None else None)
+            isolation = source_isolation.isolate_source(
+                message["body_raw"] if message is not None else None,
+                user_comment=comment_by_message_id.get(message_id),
+            )
             isolated_at = utcnow_iso()
             if not isolation.scorable:
                 db.insert_idea_record_unscorable(
@@ -1074,8 +1088,38 @@ def cmd_shadow_score(config: Config) -> int:
             isolated_now += 1
             idea_record = db.get_idea_record_by_message_id(conn, message_id)
 
+        elif idea_record["source_status"] == "UNSCORABLE_SOURCE":
+            # Stage 5.13 robustness fix: the deterministic isolator may
+            # have improved since this row was marked unscorable (e.g.
+            # the new inline-pasted-source fallback). Safe to retry with
+            # the CURRENT isolator on every run -- it's pure/free/no-LLM
+            # -- since a genuinely still-ambiguous message just fails the
+            # same way again, cheaply, with zero DB writes. Never touches
+            # a row that has already reached ISOLATED/EXTRACTED.
+            reisolation_attempts += 1
+            message = db.get_message(conn, message_id)
+            isolation = source_isolation.isolate_source(
+                message["body_raw"] if message is not None else None,
+                user_comment=comment_by_message_id.get(message_id),
+            )
+            if isolation.scorable:
+                source_hash = taste.compute_content_sha256(isolation.source_text)
+                db.update_idea_record_reisolated(
+                    conn,
+                    idea_id=idea_record["idea_id"],
+                    source_type=isolation.source_type,
+                    source_text=isolation.source_text,
+                    source_hash=source_hash,
+                    source_isolated_at=utcnow_iso(),
+                )
+                reisolated_now += 1
+                idea_record = db.get_idea_record_by_message_id(conn, message_id)
+            # else: still unscorable -- leave the row exactly as it is,
+            # with no write at all, so timestamps/reason text are never
+            # churned when nothing has actually changed.
+
         if idea_record["source_status"] != "ISOLATED":
-            continue  # UNSCORABLE_SOURCE from a previous run -- never retried automatically
+            continue  # still UNSCORABLE_SOURCE -- never guessed at, never force-processed
 
         if idea_record["extraction_status"] != "EXTRACTED":
             if idea_extraction_client is None:
@@ -1168,6 +1212,9 @@ def cmd_shadow_score(config: Config) -> int:
 
     print(f"Sources isolated this run: {isolated_now}")
     print(f"Unscorable sources this run: {unscorable_now}")
+    if reisolation_attempts:
+        print(f"Previously-unscorable sources retried this run: {reisolation_attempts}")
+        print(f"Previously-unscorable sources now isolated: {reisolated_now}")
     print(f"Ideas extracted this run: {extracted_now}")
     print(f"Shadow predictions created this run: {predictions_now}")
     if already_predicted:
