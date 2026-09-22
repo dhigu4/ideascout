@@ -1206,6 +1206,17 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
     ).fetchall()
 
 
+def get_feedback_by_id(conn: sqlite3.Connection, feedback_id: int) -> sqlite3.Row | None:
+    """One feedback row by its primary key -- used by exclude-feedback/
+    include-feedback's --feedback-id targeting so exactly one duplicate/
+    follow-up feedback event can be excluded without matching every other
+    row for the same ticker/company.
+    """
+    return conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?", (feedback_id,)
+    ).fetchone()
+
+
 def get_feedback_by_ticker_or_company(conn: sqlite3.Connection, value: str) -> list[sqlite3.Row]:
     """Feedback events whose ticker or company matches `value`
     case-insensitively. Used by exclude-feedback/include-feedback -- a

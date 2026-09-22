@@ -6,6 +6,8 @@ messages_raw/feedback directly and check what the commands do to them.
 Nothing here calls a real LLM or AgentMail.
 """
 
+import pytest
+
 from ideascout import cli, db, parser
 from ideascout.config import Config
 
@@ -289,6 +291,226 @@ def test_include_feedback_never_deletes_anything_either(tmp_path):
     assert message_row["body_raw"] == "Keep me too."
     assert db.count_feedback_records(conn) == 1
     conn.close()
+
+
+# --- exact feedback_id targeting (duplicate/follow-up judgments) -----------
+
+
+def test_exclude_feedback_by_id_excludes_only_that_row_same_ticker(tmp_path, capsys):
+    """Reproduces the real BAR case: two feedback rows for the same
+    ticker (an original judgment and a later duplicate/follow-up) --
+    excluding by feedback_id must affect ONLY the targeted row.
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_original")
+    insert_feedback_row(conn, "msg_original", ticker="BAR", company="Barco")
+    original_row = conn.execute(
+        "SELECT feedback_id FROM feedback WHERE message_id = 'msg_original'"
+    ).fetchone()
+    insert_raw_message(conn, "msg_followup")
+    insert_feedback_row(conn, "msg_followup", ticker="BAR", company="Barco")
+    followup_row = conn.execute(
+        "SELECT feedback_id FROM feedback WHERE message_id = 'msg_followup'"
+    ).fetchone()
+    conn.close()
+
+    exit_code = cli.cmd_exclude_feedback(config, None, feedback_id=followup_row["feedback_id"])
+    assert exit_code == 0
+
+    output = capsys.readouterr().out
+    assert "Feedback records excluded: 1" in output
+    assert f"feedback_id: {followup_row['feedback_id']}" in output
+    assert "ticker/company: BAR / Barco" in output
+
+    conn = db.connect(config.database_path)
+    original_after = conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?", (original_row["feedback_id"],)
+    ).fetchone()
+    followup_after = conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?", (followup_row["feedback_id"],)
+    ).fetchone()
+    conn.close()
+
+    assert followup_after["excluded_from_learning"] == 1
+    assert original_after["excluded_from_learning"] == 0  # the ORIGINAL judgment untouched
+
+
+def test_include_feedback_by_id_reverses_only_that_row(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_original")
+    insert_feedback_row(conn, "msg_original", ticker="BAR", company="Barco")
+    original_row = conn.execute(
+        "SELECT feedback_id FROM feedback WHERE message_id = 'msg_original'"
+    ).fetchone()
+    insert_raw_message(conn, "msg_followup")
+    insert_feedback_row(conn, "msg_followup", ticker="BAR", company="Barco")
+    followup_row = conn.execute(
+        "SELECT feedback_id FROM feedback WHERE message_id = 'msg_followup'"
+    ).fetchone()
+    conn.close()
+
+    cli.cmd_exclude_feedback(config, None, feedback_id=followup_row["feedback_id"])
+    cli.cmd_exclude_feedback(config, None, feedback_id=original_row["feedback_id"])
+    capsys.readouterr()
+
+    exit_code = cli.cmd_include_feedback(config, None, feedback_id=followup_row["feedback_id"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Feedback records included: 1" in output
+    assert f"feedback_id: {followup_row['feedback_id']}" in output
+
+    conn = db.connect(config.database_path)
+    original_after = conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?", (original_row["feedback_id"],)
+    ).fetchone()
+    followup_after = conn.execute(
+        "SELECT * FROM feedback WHERE feedback_id = ?", (followup_row["feedback_id"],)
+    ).fetchone()
+    conn.close()
+
+    assert followup_after["excluded_from_learning"] == 0  # reversed
+    assert original_after["excluded_from_learning"] == 1  # untouched by the include call
+
+
+def test_exclude_feedback_by_id_nonexistent_fails_clearly_with_no_changes(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1")
+    insert_feedback_row(conn, "msg_1", ticker="XYZ")
+    conn.close()
+
+    exit_code = cli.cmd_exclude_feedback(config, None, feedback_id=999999)
+    assert exit_code != 0
+    output = capsys.readouterr().out
+    assert "No feedback record found" in output
+    assert "999999" in output
+
+    conn = db.connect(config.database_path)
+    row = conn.execute("SELECT * FROM feedback WHERE message_id = 'msg_1'").fetchone()
+    assert row["excluded_from_learning"] == 0  # untouched
+    assert db.count_feedback_records(conn) == 1  # nothing created or deleted
+    conn.close()
+
+
+def test_include_feedback_by_id_nonexistent_fails_clearly_with_no_changes(tmp_path, capsys):
+    config = make_config(tmp_path)
+    db.connect(config.database_path).close()
+
+    exit_code = cli.cmd_include_feedback(config, None, feedback_id=999999)
+    assert exit_code != 0
+    assert "No feedback record found" in capsys.readouterr().out
+
+
+def test_exclude_feedback_by_id_is_idempotent(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1")
+    insert_feedback_row(conn, "msg_1", ticker="BAR")
+    feedback_id = conn.execute("SELECT feedback_id FROM feedback").fetchone()["feedback_id"]
+    conn.close()
+
+    exit_code_1 = cli.cmd_exclude_feedback(config, None, feedback_id=feedback_id)
+    assert exit_code_1 == 0
+    first_output = capsys.readouterr().out
+    assert "(already set, no change)" not in first_output
+
+    exit_code_2 = cli.cmd_exclude_feedback(config, None, feedback_id=feedback_id)
+    assert exit_code_2 == 0
+    second_output = capsys.readouterr().out
+    assert "(already set, no change)" in second_output
+    assert "Feedback records excluded: 1" in second_output
+
+    conn = db.connect(config.database_path)
+    row = conn.execute("SELECT * FROM feedback WHERE feedback_id = ?", (feedback_id,)).fetchone()
+    assert row["excluded_from_learning"] == 1
+    conn.close()
+
+
+def test_include_feedback_by_id_is_idempotent(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1")
+    insert_feedback_row(conn, "msg_1", ticker="BAR")
+    feedback_id = conn.execute("SELECT feedback_id FROM feedback").fetchone()["feedback_id"]
+    conn.close()
+
+    # Already-included (default state) -- including it again must be safe.
+    exit_code = cli.cmd_include_feedback(config, None, feedback_id=feedback_id)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "(already set, no change)" in output
+    assert "Feedback records included: 1" in output
+
+    conn = db.connect(config.database_path)
+    row = conn.execute("SELECT * FROM feedback WHERE feedback_id = ?", (feedback_id,)).fetchone()
+    assert row["excluded_from_learning"] == 0
+    conn.close()
+
+
+def test_exclude_feedback_by_id_never_deletes_raw_message_or_feedback_row(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1", subject="Original subject, verbatim", body_raw="Original body, verbatim.")
+    insert_feedback_row(conn, "msg_1", ticker="BAR", verdict="STRONG_LIKE")
+    feedback_id = conn.execute("SELECT feedback_id FROM feedback").fetchone()["feedback_id"]
+    conn.close()
+
+    cli.cmd_exclude_feedback(config, None, feedback_id=feedback_id)
+
+    conn = db.connect(config.database_path)
+    message_row = db.get_message(conn, "msg_1")
+    assert message_row["subject"] == "Original subject, verbatim"
+    assert message_row["body_raw"] == "Original body, verbatim."
+
+    feedback_row = conn.execute("SELECT * FROM feedback WHERE feedback_id = ?", (feedback_id,)).fetchone()
+    assert feedback_row["ticker"] == "BAR"
+    assert feedback_row["verdict"] == "STRONG_LIKE"
+    assert feedback_row["excluded_from_learning"] == 1
+    assert db.count_feedback_records(conn) == 1
+    conn.close()
+
+
+# --- CLI argument parsing: exactly-one targeting mode -----------------------
+
+
+def test_exclude_feedback_cli_rejects_both_ticker_and_feedback_id():
+    parser_obj = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser_obj.parse_args(["exclude-feedback", "BAR", "--feedback-id", "27"])
+
+
+def test_exclude_feedback_cli_rejects_neither_ticker_nor_feedback_id():
+    parser_obj = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser_obj.parse_args(["exclude-feedback"])
+
+
+def test_include_feedback_cli_rejects_both_ticker_and_feedback_id():
+    parser_obj = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser_obj.parse_args(["include-feedback", "BAR", "--feedback-id", "27"])
+
+
+def test_include_feedback_cli_rejects_neither_ticker_nor_feedback_id():
+    parser_obj = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser_obj.parse_args(["include-feedback"])
+
+
+def test_exclude_feedback_cli_accepts_ticker_only():
+    parser_obj = cli.build_parser()
+    args = parser_obj.parse_args(["exclude-feedback", "BAR"])
+    assert args.ticker == "BAR"
+    assert args.feedback_id is None
+
+
+def test_exclude_feedback_cli_accepts_feedback_id_only():
+    parser_obj = cli.build_parser()
+    args = parser_obj.parse_args(["exclude-feedback", "--feedback-id", "27"])
+    assert args.ticker is None
+    assert args.feedback_id == 27
 
 
 # --- show-feedback indicates excluded records --------------------------------

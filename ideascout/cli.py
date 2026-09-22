@@ -404,12 +404,17 @@ def _describe_feedback_row(row) -> str:
     )
 
 
+def _ticker_company_label(row) -> str:
+    return f"{row['ticker'] or '-'} / {row['company'] or '-'}"
+
+
 def _set_feedback_exclusion(config: Config, ticker: str, excluded: bool) -> int:
-    """Shared logic for exclude-feedback / include-feedback: find every
-    feedback row whose ticker or company matches, show it, and flip its
-    excluded_from_learning flag. Never touches the raw email, never
-    touches any other feedback row, and never deletes anything -- only
-    this one boolean column on the matched row(s) changes.
+    """Shared logic for exclude-feedback / include-feedback (ticker/company
+    targeting): find every feedback row whose ticker or company matches,
+    show it, and flip its excluded_from_learning flag. Never touches the
+    raw email, never touches any other feedback row, and never deletes
+    anything -- only this one boolean column on the matched row(s)
+    changes. Unchanged from before --feedback-id targeting was added.
     """
     conn = db.open_production_database(config.database_path)
     matches = db.get_feedback_by_ticker_or_company(conn, ticker)
@@ -438,21 +443,66 @@ def _set_feedback_exclusion(config: Config, ticker: str, excluded: bool) -> int:
     return 0
 
 
-def cmd_exclude_feedback(config: Config, ticker: str) -> int:
-    """Mark every feedback record matching `ticker` (by ticker or company,
-    case-insensitive) as excluded_from_learning -- e.g. artificial
-    smoke-test records that must stay in the database for audit/history
-    but must never be used when a later stage learns Brad's preferences.
-    The raw email and the feedback row itself are never deleted or
-    otherwise modified.
+def _set_feedback_exclusion_by_id(config: Config, feedback_id: int, excluded: bool) -> int:
+    """Same guarantees as _set_feedback_exclusion, but targets EXACTLY ONE
+    feedback row by primary key -- added so one duplicate/follow-up
+    feedback event (e.g. a later reply/addendum judging the same idea a
+    second time) can be excluded from learning without also excluding
+    another, still-eligible feedback row for the same ticker/company.
+    Never deletes anything; only that one row's excluded_from_learning
+    column ever changes. A nonexistent feedback_id makes zero DB changes
+    and fails clearly.
     """
+    conn = db.open_production_database(config.database_path)
+    row = db.get_feedback_by_id(conn, feedback_id)
+
+    if row is None:
+        conn.close()
+        print(f"No feedback record found with feedback_id={feedback_id}. Nothing changed.")
+        return 1
+
+    already_set = bool(row["excluded_from_learning"]) == excluded
+    action = "Excluding from learning" if excluded else "Re-including in learning"
+    print(f"{action} -- feedback_id={feedback_id}:")
+    note = "  (already set, no change)" if already_set else ""
+    print(f"  {_describe_feedback_row(row)}{note}")
+
+    db.set_feedback_excluded_from_learning(conn, feedback_id, excluded)
+    conn.close()
+
+    changed = 0 if already_set else 1
+    verb = "excluded from" if excluded else "included back into"
+    print(f"Feedback records {'excluded' if excluded else 'included'}: 1")
+    print(f"feedback_id: {feedback_id}")
+    print(f"ticker/company: {_ticker_company_label(row)}")
+    print(f"Done: 1 record now {verb} learning ({changed} changed).")
+    return 0
+
+
+def cmd_exclude_feedback(config: Config, ticker: str | None, *, feedback_id: int | None = None) -> int:
+    """Mark feedback record(s) as excluded_from_learning -- e.g. artificial
+    smoke-test records, or one duplicate/follow-up judgment, that must
+    stay in the database for audit/history but must never be used when a
+    later stage learns Brad's preferences. The raw email and the feedback
+    row itself are never deleted or otherwise modified.
+
+    Exactly one targeting mode is used: `ticker` (by ticker or company,
+    case-insensitive, may match several rows) OR `feedback_id` (exactly
+    one row, by primary key) -- enforced by build_parser()'s mutually
+    exclusive, required argument group, never by this function itself.
+    """
+    if feedback_id is not None:
+        return _set_feedback_exclusion_by_id(config, feedback_id, excluded=True)
     return _set_feedback_exclusion(config, ticker, excluded=True)
 
 
-def cmd_include_feedback(config: Config, ticker: str) -> int:
+def cmd_include_feedback(config: Config, ticker: str | None, *, feedback_id: int | None = None) -> int:
     """Reverse an accidental exclude-feedback: clears excluded_from_learning
-    for every feedback record matching `ticker`.
+    for the targeted feedback record(s) -- see cmd_exclude_feedback for the
+    exactly-one-targeting-mode contract.
     """
+    if feedback_id is not None:
+        return _set_feedback_exclusion_by_id(config, feedback_id, excluded=False)
     return _set_feedback_exclusion(config, ticker, excluded=False)
 
 
@@ -1945,14 +1995,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     exclude_parser = subparsers.add_parser(
         "exclude-feedback",
-        help="Mark feedback record(s) for a ticker/company as excluded from learning",
+        help="Mark feedback record(s) for a ticker/company (or one exact feedback_id) as excluded from learning",
     )
-    exclude_parser.add_argument("ticker", help="Ticker or company name to match")
+    exclude_group = exclude_parser.add_mutually_exclusive_group(required=True)
+    exclude_group.add_argument("ticker", nargs="?", default=None, help="Ticker or company name to match")
+    exclude_group.add_argument(
+        "--feedback-id", type=int, default=None, help="Exact feedback_id to target (instead of ticker/company)"
+    )
     include_parser = subparsers.add_parser(
         "include-feedback",
-        help="Reverse exclude-feedback for a ticker/company",
+        help="Reverse exclude-feedback for a ticker/company (or one exact feedback_id)",
     )
-    include_parser.add_argument("ticker", help="Ticker or company name to match")
+    include_group = include_parser.add_mutually_exclusive_group(required=True)
+    include_group.add_argument("ticker", nargs="?", default=None, help="Ticker or company name to match")
+    include_group.add_argument(
+        "--feedback-id", type=int, default=None, help="Exact feedback_id to target (instead of ticker/company)"
+    )
     subparsers.add_parser(
         "show-review",
         help="Show every message awaiting human review, with its derived feedback event(s)",
@@ -2087,11 +2145,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "exclude-feedback":
             config = load_config()
             setup_logging(config.log_path)
-            return cmd_exclude_feedback(config, args.ticker)
+            return cmd_exclude_feedback(config, args.ticker, feedback_id=args.feedback_id)
         elif args.command == "include-feedback":
             config = load_config()
             setup_logging(config.log_path)
-            return cmd_include_feedback(config, args.ticker)
+            return cmd_include_feedback(config, args.ticker, feedback_id=args.feedback_id)
         elif args.command == "show-review":
             config = load_config()
             setup_logging(config.log_path)
