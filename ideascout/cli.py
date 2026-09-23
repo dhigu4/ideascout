@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -1843,20 +1844,113 @@ def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: 
 
 DIGEST_MAX_IDEAS = 5
 
+_LEADING_DOLLAR_PATTERN = re.compile(r"^\$")
+_COMPANY_PUNCTUATION_PATTERN = re.compile(r"[^\w\s]")
 
-def select_digest_candidates(conn, taste_version: int) -> list:
+
+def _normalize_ticker(raw: str | None) -> str | None:
+    """Trim whitespace, uppercase, drop one optional leading "$" -- e.g.
+    " $bbgi " and "BBGI" both normalize to "BBGI". Deliberately NOT more
+    aggressive than this (no exchange-suffix stripping, no share-class
+    normalization, ...): those could incorrectly merge different
+    international securities, which this suppression must never risk.
+    Returns None for missing/blank input, never an empty string.
+    """
+    if not raw:
+        return None
+    normalized = _LEADING_DOLLAR_PATTERN.sub("", raw.strip()).upper()
+    return normalized or None
+
+
+def _normalize_company_name(raw: str | None) -> str | None:
+    """Lowercase, trim/collapse whitespace, and strip basic punctuation
+    (periods, commas, etc.) only -- e.g. "Beasley Broadcast Group, Inc."
+    and "Beasley Broadcast Group Inc" normalize the same. Deliberately
+    does NOT strip corporate suffixes ("Inc"/"Corp"/"Ltd"/...), abbreviate,
+    or otherwise fuzzy-match: two textually-different company names must
+    never be treated as the same one. Returns None for missing/blank
+    input, never an empty string.
+    """
+    if not raw:
+        return None
+    stripped_punctuation = _COMPANY_PUNCTUATION_PATTERN.sub("", raw)
+    normalized = " ".join(stripped_punctuation.split()).lower()
+    return normalized or None
+
+
+def _judged_identity_sets(conn) -> tuple[set[str], set[str]]:
+    """Normalized (ticker, company) identities from every genuinely
+    learning-eligible feedback judgment -- reuses
+    db.get_feedback_eligible_for_learning, the ONE canonical eligibility
+    query (excluded_from_learning=0 AND feedback_parse_status='PARSED'),
+    rather than reimplementing that filter here. Used ONLY to suppress a
+    website-source digest candidate Brad has already judged via email;
+    never inspects verdict/user_comment content -- the mere presence of
+    an eligible judgment is enough.
+    """
+    eligible = db.get_feedback_eligible_for_learning(conn)
+    judged_tickers: set[str] = set()
+    judged_companies: set[str] = set()
+    for row in eligible:
+        ticker = _normalize_ticker(row["ticker"])
+        if ticker:
+            judged_tickers.add(ticker)
+        company = _normalize_company_name(row["company"])
+        if company:
+            judged_companies.add(company)
+    return judged_tickers, judged_companies
+
+
+def _is_already_judged_by_brad(candidate, judged_tickers: set[str], judged_companies: set[str]) -> bool:
+    """Primary match: normalized ticker exact match. Fallback ONLY when
+    the CANDIDATE has no usable ticker of its own: normalized company-
+    name exact match. A candidate WITH a ticker that simply doesn't match
+    anything never falls through to a company-name check -- that would
+    risk matching a different judged company under a different ticker
+    entirely. Never fuzzy in either direction.
+    """
+    candidate_ticker = _normalize_ticker(candidate["ticker"])
+    if candidate_ticker:
+        return candidate_ticker in judged_tickers
+    candidate_company = _normalize_company_name(candidate["company"])
+    if candidate_company:
+        return candidate_company in judged_companies
+    return False
+
+
+def select_digest_candidates(conn, taste_version: int) -> tuple[list, int]:
     """THE ONE candidate-selection function preview-digest AND send-digest
-    both use -- do not reimplement this elsewhere. INVESTIGATE_NOW first,
-    then WATCH, capped at DIGEST_MAX_IDEAS. The underlying query
-    (db.get_unshown_screened_sources_for_taste_version) already applies
-    latest-version-only, non-PASS, and not-yet-shown filtering at the SQL
-    level; this is purely a read followed by a pure-Python ordering/cap --
-    no LLM calls, no DB writes.
+    both use -- do not reimplement this elsewhere. Returns (selected,
+    already_judged_suppressed_count).
+
+    The underlying query (db.get_unshown_screened_sources_for_taste_
+    version) already applies latest-version-only, non-PASS, and not-yet-
+    shown filtering at the SQL level. On top of that, a candidate whose
+    ticker or (ticker-absent fallback) company name matches a genuinely
+    learning-eligible feedback judgment is suppressed here -- Brad has
+    already judged it via email, so a website-source digest must not
+    present it as if it were a new discovery, even from a materially
+    changed later source version (see module docstring / task notes;
+    explicit re-surfacing logic is intentionally not built yet). A
+    suppressed candidate is simply excluded, never marked shown.
+    Remaining candidates: INVESTIGATE_NOW first, then WATCH, capped at
+    DIGEST_MAX_IDEAS. No LLM calls, no DB writes anywhere in this
+    function.
     """
     candidates = db.get_unshown_screened_sources_for_taste_version(conn, taste_version)
-    investigate_now = [c for c in candidates if c["overall_prediction"] == "INVESTIGATE_NOW"]
-    watch = [c for c in candidates if c["overall_prediction"] == "WATCH"]
-    return (investigate_now + watch)[:DIGEST_MAX_IDEAS]
+    judged_tickers, judged_companies = _judged_identity_sets(conn)
+
+    eligible = []
+    suppressed_count = 0
+    for candidate in candidates:
+        if _is_already_judged_by_brad(candidate, judged_tickers, judged_companies):
+            suppressed_count += 1
+        else:
+            eligible.append(candidate)
+
+    investigate_now = [c for c in eligible if c["overall_prediction"] == "INVESTIGATE_NOW"]
+    watch = [c for c in eligible if c["overall_prediction"] == "WATCH"]
+    return (investigate_now + watch)[:DIGEST_MAX_IDEAS], suppressed_count
 
 
 def cmd_preview_digest(config: Config) -> int:
@@ -1874,7 +1968,9 @@ def cmd_preview_digest(config: Config) -> int:
         print("No taste model has been generated yet.")
         return 0
 
-    selected = select_digest_candidates(conn, latest_taste["version_number"])
+    selected, suppressed_count = select_digest_candidates(conn, latest_taste["version_number"])
+    if suppressed_count:
+        print(f"Already-judged ideas suppressed: {suppressed_count}")
 
     if not selected:
         print("No new ideas to show right now.")
@@ -1953,7 +2049,8 @@ def cmd_send_digest(config: Config, *, dry_run: bool) -> int:
         print("No taste model has been generated yet.")
         return 0
 
-    selected = select_digest_candidates(conn, latest_taste["version_number"])
+    selected, suppressed_count = select_digest_candidates(conn, latest_taste["version_number"])
+    print(f"Already-judged ideas suppressed: {suppressed_count}")
     print(f"Candidates selected: {len(selected)}")
 
     if not selected:

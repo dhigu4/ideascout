@@ -47,6 +47,9 @@ def build_taste_v1(config, monkeypatch, body: str = "## Strong Positive Signals\
     return latest
 
 
+_UNSET = object()
+
+
 def insert_scored_source(
     conn,
     latest_taste,
@@ -56,11 +59,22 @@ def insert_scored_source(
     overall_prediction: str = "WATCH",
     content_hash: str | None = None,
     created_at: str = "2026-01-01T00:00:00+00:00",
-    company: str | None = None,
-    ticker: str | None = None,
+    company=_UNSET,
+    ticker=_UNSET,
 ) -> int:
-    company = company or f"Company {external_id}"
-    ticker = ticker or f"T{external_id}"
+    # A sentinel (not `x or default`) so a test can explicitly pass
+    # ticker=None/company=None to mean "genuinely absent" (e.g. testing
+    # Stage 7's company-name fallback), distinct from "not provided at
+    # all" (apply the default below).
+    if company is _UNSET:
+        company = f"Company {external_id}"
+    # "YB" prefix deliberately avoids colliding with insert_n_eligible's
+    # own "T{i}" ticker scheme (used by build_taste_v1's 15 training
+    # records) -- a real collision there would make a fixture accidentally
+    # exercise Stage 7's already-judged suppression instead of the
+    # unrelated behavior most of these tests are checking.
+    if ticker is _UNSET:
+        ticker = f"YB{external_id}"
     content_hash = content_hash or f"hash-{external_id}"
     source_id = db.insert_collected_source(
         conn, source_name="yellowbrick", external_id=external_id,
@@ -510,9 +524,10 @@ def test_preview_digest_and_send_digest_use_identical_candidate_selection(tmp_pa
     insert_scored_source(conn, latest_taste, config, external_id="1", overall_prediction="INVESTIGATE_NOW")
     insert_scored_source(conn, latest_taste, config, external_id="2", overall_prediction="WATCH")
     insert_scored_source(conn, latest_taste, config, external_id="3", overall_prediction="PASS")
-    selected = cli.select_digest_candidates(conn, latest_taste["version_number"])
+    selected, suppressed_count = cli.select_digest_candidates(conn, latest_taste["version_number"])
     conn.close()
 
+    assert suppressed_count == 0
     assert [row["external_id"] for row in selected] == ["1", "2"]
 
 

@@ -142,12 +142,12 @@ def test_preview_digest_prefers_investigate_now_before_watch_under_cap(tmp_path,
         source_id = db.insert_collected_source(
             conn, source_name="yellowbrick", external_id=f"id{i}", canonical_url=f"https://x/pitch/id{i}",
             discovered_at="2026-01-01T00:00:00+00:00", discovery_title=f"Title {i}", source_date=None,
-            source_title=f"Title {i}", author=None, ticker=f"T{i}", company=f"Company {i}",
+            source_title=f"Title {i}", author=None, ticker=f"YB{i}", company=f"Company {i}",
             source_type="stock_pitch", content_hash=f"hash{i}", raw_html_path=f"/x/{i}.html",
             metadata_json="{}", created_at="2026-01-01T00:00:00+00:00",
         )
         db.update_collected_source_extracted(
-            conn, source_id=source_id, company=f"Company {i}", ticker=f"T{i}", source_title=f"Title {i}",
+            conn, source_id=source_id, company=f"Company {i}", ticker=f"YB{i}", source_title=f"Title {i}",
             source_date=None, business_summary="x", core_thesis="x", why_mispriced="x",
             future_earnings_change="x", upside_case="x", downside_or_key_risks="x", catalysts="x",
             what_must_be_true="x", evidence_of_market_misunderstanding="x", known_unknowns="x",
@@ -185,12 +185,12 @@ def test_preview_digest_never_shows_more_than_five(tmp_path, monkeypatch, capsys
         source_id = db.insert_collected_source(
             conn, source_name="yellowbrick", external_id=f"id{i}", canonical_url=f"https://x/pitch/id{i}",
             discovered_at="2026-01-01T00:00:00+00:00", discovery_title=f"Title {i}", source_date=None,
-            source_title=f"Title {i}", author=None, ticker=f"T{i}", company=f"Company {i}",
+            source_title=f"Title {i}", author=None, ticker=f"YB{i}", company=f"Company {i}",
             source_type="stock_pitch", content_hash=f"hash{i}", raw_html_path=f"/x/{i}.html",
             metadata_json="{}", created_at="2026-01-01T00:00:00+00:00",
         )
         db.update_collected_source_extracted(
-            conn, source_id=source_id, company=f"Company {i}", ticker=f"T{i}", source_title=f"Title {i}",
+            conn, source_id=source_id, company=f"Company {i}", ticker=f"YB{i}", source_title=f"Title {i}",
             source_date=None, business_summary="x", core_thesis="x", why_mispriced="x",
             future_earnings_change="x", upside_case="x", downside_or_key_risks="x", catalysts="x",
             what_must_be_true="x", evidence_of_market_misunderstanding="x", known_unknowns="x",
