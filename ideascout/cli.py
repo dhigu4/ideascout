@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from . import agentmail_client, db, idea_extraction, parser, shadow, source_isolation, structured_llm, taste
+from . import agentmail_client, db, idea_extraction, notifier, parser, shadow, source_isolation, structured_llm, taste
 from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
@@ -1340,10 +1340,10 @@ def cmd_show_shadow_results(config: Config) -> int:
 #
 # The intelligence/screening layer (idea_extraction.py, shadow.py) has no
 # Yellowbrick-specific logic at all -- everything site-specific lives
-# behind ideascout/sources/yellowbrick.py's adapter interface. Alerts stay
-# disabled during Brad's ongoing Taste v1 holdout: preview-digest only
-# ever prints to the terminal, and there is no code path anywhere that can
-# send Brad anything (see ideascout/notifier.py).
+# behind ideascout/sources/yellowbrick.py's adapter interface. preview-digest
+# only ever prints to the terminal and never imports notifier/agentmail_client
+# at all. Real outbound delivery (Stage 6: send-digest) exists but is gated
+# by Config.alerts_enabled (default false) -- see cmd_send_digest.
 
 SOURCE_ADAPTERS = {
     yellowbrick.SOURCE_NAME: yellowbrick,
@@ -1841,13 +1841,31 @@ def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: 
     return 0
 
 
+DIGEST_MAX_IDEAS = 5
+
+
+def select_digest_candidates(conn, taste_version: int) -> list:
+    """THE ONE candidate-selection function preview-digest AND send-digest
+    both use -- do not reimplement this elsewhere. INVESTIGATE_NOW first,
+    then WATCH, capped at DIGEST_MAX_IDEAS. The underlying query
+    (db.get_unshown_screened_sources_for_taste_version) already applies
+    latest-version-only, non-PASS, and not-yet-shown filtering at the SQL
+    level; this is purely a read followed by a pure-Python ordering/cap --
+    no LLM calls, no DB writes.
+    """
+    candidates = db.get_unshown_screened_sources_for_taste_version(conn, taste_version)
+    investigate_now = [c for c in candidates if c["overall_prediction"] == "INVESTIGATE_NOW"]
+    watch = [c for c in candidates if c["overall_prediction"] == "WATCH"]
+    return (investigate_now + watch)[:DIGEST_MAX_IDEAS]
+
+
 def cmd_preview_digest(config: Config) -> int:
     """LOCAL PREVIEW ONLY -- prints at most 5 new, worth-Brad's-attention
     ideas to the terminal and marks them shown (so they're never presented
-    as "new" again). Never sends anything anywhere (see
-    ideascout/notifier.py, never imported here); works regardless of
-    Config.alerts_enabled, since printing to a terminal Brad explicitly
-    ran is not an alert.
+    as "new" again). Never sends anything anywhere -- this function never
+    imports or calls ideascout.notifier or agentmail_client at all; works
+    regardless of Config.alerts_enabled, since printing to a terminal Brad
+    explicitly ran is not an alert.
     """
     conn = db.open_production_database(config.database_path)
     latest_taste = db.get_latest_taste_version(conn)
@@ -1856,10 +1874,7 @@ def cmd_preview_digest(config: Config) -> int:
         print("No taste model has been generated yet.")
         return 0
 
-    candidates = db.get_unshown_screened_sources_for_taste_version(conn, latest_taste["version_number"])
-    investigate_now = [c for c in candidates if c["overall_prediction"] == "INVESTIGATE_NOW"]
-    watch = [c for c in candidates if c["overall_prediction"] == "WATCH"]
-    selected = (investigate_now + watch)[:5]
+    selected = select_digest_candidates(conn, latest_taste["version_number"])
 
     if not selected:
         print("No new ideas to show right now.")
@@ -1883,6 +1898,157 @@ def cmd_preview_digest(config: Config) -> int:
         db.mark_source_shown_in_digest(conn, item["source_id"], utcnow_iso())
 
     conn.close()
+    return 0
+
+
+def _digest_item_from_row(row) -> notifier.DigestItem:
+    """Converts one select_digest_candidates() row into a DigestItem --
+    only ever copies already-stored extraction/screening fields, applies
+    the required 2/2/1 caps, and never invents or rewrites anything.
+    """
+    return notifier.DigestItem(
+        company=row["company"],
+        ticker=row["ticker"],
+        source_name=row["source_name"],
+        canonical_url=row["canonical_url"],
+        overall_prediction=row["overall_prediction"],
+        confidence=row["confidence"],
+        mispricing=row["mispricing"],
+        variant_perception=row["variant_perception"],
+        upside=row["upside"],
+        business_quality=row["business_quality"],
+        downside=row["downside"],
+        key_reasons=json.loads(row["key_reasons_json"])[:2],
+        key_concerns=json.loads(row["key_concerns_json"])[:2],
+        critical_questions=json.loads(row["critical_questions_json"])[:1],
+    )
+
+
+def cmd_send_digest(config: Config, *, dry_run: bool) -> int:
+    """Production email delivery for the SAME candidate pool preview-digest
+    shows (select_digest_candidates) -- never a separate ranking. Uses
+    ONLY stored extraction/screening fields; no LLM call is made anywhere
+    in this function.
+
+    Delivery safety (the one thing this function most needs to get
+    right): digest_shown_sources is written ONLY after AgentMail confirms
+    the send (no exception raised). A send failure marks nothing and
+    returns nonzero, leaving every candidate eligible for the next run
+    unchanged. A send success is followed by ONE atomic DB-marking call
+    (db.mark_sources_shown_in_digest) for exactly the source_ids that were
+    actually included; if THAT fails after a successful send, this prints
+    a loud, explicit warning (a rerun could resend the same ideas) and
+    returns nonzero rather than silently hiding the inconsistency.
+
+    --dry-run selects exactly what a real send would select, prints the
+    rendered email, and makes zero network calls and zero DB writes --
+    works regardless of Config.alerts_enabled, exactly like preview-digest.
+    A real send additionally requires Config.alerts_enabled=True (the
+    explicit kill switch) and a configured recipient/AgentMail credentials.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet.")
+        return 0
+
+    selected = select_digest_candidates(conn, latest_taste["version_number"])
+    print(f"Candidates selected: {len(selected)}")
+
+    if not selected:
+        conn.close()
+        print("No new ideas to send.")
+        if dry_run:
+            print("DRY RUN — no email sent and no database changes")
+        return 0
+
+    items = [_digest_item_from_row(row) for row in selected]
+    source_ids = [row["source_id"] for row in selected]
+    sent_date = utcnow_iso()[:10]
+    subject = notifier.digest_subject(sent_date)
+    body = notifier.render_digest_body(items)
+
+    if dry_run:
+        print(f"Subject: {subject}")
+        print()
+        print(body)
+        print()
+        print("Email sent: NO")
+        print("Sources marked shown: 0")
+        print("DRY RUN — no email sent and no database changes")
+        conn.close()
+        return 0
+
+    if not config.alerts_enabled:
+        conn.close()
+        print("Email sent: NO")
+        print("Sources marked shown: 0")
+        print(
+            "send-digest FAILED: ALERTS_ENABLED is not true, so a real send is refused. "
+            "Run 'send-digest --dry-run' to review the email, then set ALERTS_ENABLED=true "
+            f"in {config_module.ENV_PATH} once ready."
+        )
+        return 1
+
+    missing = [
+        name
+        for name, value in (
+            ("AGENTMAIL_API_KEY", config.agentmail_api_key),
+            ("AGENTMAIL_INBOX_ID", config.agentmail_inbox_id),
+            ("DIGEST_RECIPIENT_EMAIL", config.digest_recipient_email),
+        )
+        if not value
+    ]
+    if missing:
+        conn.close()
+        print("Email sent: NO")
+        print("Sources marked shown: 0")
+        print(
+            f"send-digest FAILED: missing required setting(s): {', '.join(missing)}. "
+            f"Add them to {config_module.ENV_PATH} (see .env.example)."
+        )
+        return 1
+
+    logger = get_logger()
+    idempotency_key = notifier.digest_idempotency_key(sent_date, source_ids)
+
+    try:
+        client = agentmail_client.build_client(config.agentmail_api_key)
+        notifier.send_digest_email(
+            client,
+            inbox_id=config.agentmail_inbox_id,
+            recipient_email=config.digest_recipient_email,
+            subject=subject,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
+    except Exception as exc:
+        logger.exception(f"send-digest: email send failed: {exc}")
+        conn.close()
+        print("Email sent: NO")
+        print("Sources marked shown: 0")
+        print(f"send-digest FAILED: could not send email: {exc}")
+        print("No database changes were made -- these candidates remain eligible for the next run.")
+        return 1
+
+    print("Email sent: YES")
+
+    try:
+        db.mark_sources_shown_in_digest(conn, source_ids, utcnow_iso())
+    except Exception as exc:
+        logger.exception(f"send-digest: DB marking failed after a successful send: {exc}")
+        conn.close()
+        print("Sources marked shown: 0")
+        print(
+            "*** CRITICAL: the email WAS sent successfully, but marking the sources as shown in "
+            "the database FAILED. Rerunning send-digest now could send a DUPLICATE email for the "
+            f"same ideas. Manual investigation is required before rerunning. Error: {exc}"
+        )
+        return 1
+
+    conn.close()
+    print(f"Sources marked shown: {len(source_ids)}")
     return 0
 
 
@@ -2084,6 +2250,13 @@ def build_parser() -> argparse.ArgumentParser:
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
     )
+    send_digest_parser = subparsers.add_parser(
+        "send-digest",
+        help="Email up to 5 new worth-attention ideas to the configured recipient",
+    )
+    send_digest_parser.add_argument(
+        "--dry-run", action="store_true", help="Select and render the digest, but send zero emails and change nothing"
+    )
     show_source_screenings_parser = subparsers.add_parser(
         "show-source-screenings",
         help="READ-ONLY: show recent website-source screening decisions, newest first",
@@ -2210,6 +2383,12 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_preview_digest(config)
+        elif args.command == "send-digest":
+            # --dry-run makes no network calls at all, so it must not
+            # require AgentMail credentials -- only a real send does.
+            config = load_config(require_agentmail=not args.dry_run)
+            setup_logging(config.log_path)
+            return cmd_send_digest(config, dry_run=args.dry_run)
         elif args.command == "show-source-screenings":
             config = load_config()
             setup_logging(config.log_path)

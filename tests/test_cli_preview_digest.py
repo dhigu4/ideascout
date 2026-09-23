@@ -251,10 +251,25 @@ def test_preview_digest_does_not_update_taste(tmp_path, monkeypatch):
     assert Path(latest_taste["idea_taste_path"]).read_text(encoding="utf-8") == original_content
 
 
-def test_preview_digest_never_sends_anything():
-    """Structural guarantee: cli.py never imports ideascout.notifier at
-    all, so cmd_preview_digest has no way to reach any (even disabled)
-    send path -- this is stronger than just checking notifier.py raises.
+def test_preview_digest_never_sends_anything(tmp_path, monkeypatch):
+    """cli.py now imports notifier (send-digest needs it), so the
+    guarantee is scoped to cmd_preview_digest itself: it must never call
+    anything that could send an email, no matter what candidates exist.
     """
-    assert not hasattr(cli, "notifier")
-    assert "notifier" not in vars(cli)
+    from ideascout import notifier
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("cmd_preview_digest must never attempt to send anything")
+
+    monkeypatch.setattr(notifier, "send_digest_email", fail_if_called)
+
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    build_taste_v1(config, monkeypatch)
+    collect_two_sources(
+        config, monkeypatch,
+        predictions={"XYZ": make_prediction(overall_prediction="WATCH"), "ABC": make_prediction(overall_prediction="WATCH")},
+    )
+
+    exit_code = cli.cmd_preview_digest(config)
+    assert exit_code == 0

@@ -63,11 +63,11 @@ DEFAULT_SCREEN_RULES_PATH = Path.home() / "Repos" / "InvestmentBrain" / "IDEA_SC
 DEFAULT_BROWSER_PROFILES_DIR = DEFAULT_STATE_DIR / "browser-profiles"
 DEFAULT_RAW_STORAGE_DIR = DEFAULT_STATE_DIR / "raw"
 
-# Alerting is not built yet (see ideascout/notifier.py) and must default
-# off regardless: Brad is mid-holdout on the email/Taste v1 experiment,
-# and even once alerting exists, nothing should ever be sent automatically
-# without this being explicitly turned on. Override with ALERTS_ENABLED=true
-# in .env only once outbound delivery actually exists and has been approved.
+# Alerting (outbound digest email, see ideascout/notifier.py) defaults off
+# regardless of what else is configured: nothing should ever be sent
+# automatically without this being explicitly turned on. Only a REAL
+# `send-digest` send (never --dry-run, never preview-digest) checks this.
+# Override with ALERTS_ENABLED=true in .env once ready for real sends.
 DEFAULT_ALERTS_ENABLED = False
 
 
@@ -89,6 +89,7 @@ class Config:
     browser_profiles_dir: Path = DEFAULT_BROWSER_PROFILES_DIR
     raw_storage_dir: Path = DEFAULT_RAW_STORAGE_DIR
     alerts_enabled: bool = DEFAULT_ALERTS_ENABLED
+    digest_recipient_email: str | None = None
 
 
 def _parse_allowed_senders(raw: str | None) -> frozenset[str]:
@@ -171,6 +172,16 @@ def load_config(
     raw_storage_dir = Path(os.getenv("RAW_STORAGE_DIR") or DEFAULT_RAW_STORAGE_DIR)
     alerts_enabled = _parse_bool_env(os.getenv("ALERTS_ENABLED"), DEFAULT_ALERTS_ENABLED)
 
+    # send-digest's "to" address. Prefers an explicit DIGEST_RECIPIENT_EMAIL;
+    # falls back to BRAD_ALLOWED_SENDERS only when that set has EXACTLY one
+    # address, since that's the only case where reusing it is unambiguous --
+    # BRAD_ALLOWED_SENDERS is documented as an inbound-only allowlist (who
+    # may submit ideas), not a recipient list, so a multi-address set is
+    # never guessed at.
+    digest_recipient_email = os.getenv("DIGEST_RECIPIENT_EMAIL") or None
+    if not digest_recipient_email and len(brad_allowed_senders) == 1:
+        digest_recipient_email = next(iter(brad_allowed_senders))
+
     missing = []
     if require_agentmail:
         if not api_key:
@@ -211,4 +222,5 @@ def load_config(
         browser_profiles_dir=browser_profiles_dir,
         raw_storage_dir=raw_storage_dir,
         alerts_enabled=alerts_enabled,
+        digest_recipient_email=digest_recipient_email,
     )

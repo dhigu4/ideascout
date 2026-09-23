@@ -86,3 +86,35 @@ def extract_body(message) -> tuple[str, str]:
 
 def format_recipients(message) -> str:
     return ", ".join(message.to) if message.to else ""
+
+
+def send_message(
+    client: AgentMail,
+    *,
+    inbox_id: str,
+    to: str,
+    subject: str,
+    text: str,
+    idempotency_key: str | None = None,
+):
+    """Sends one plain-text email FROM `inbox_id` TO `to`. Any exception
+    the SDK raises (a rejected message, a validation error, a network
+    failure, ...) propagates uncaught -- callers must treat ANY exception
+    here as "the send did not happen," never as a partial success.
+
+    idempotency_key (confirmed against the installed SDK's own send()
+    signature): a retry using the SAME key AND the SAME message content
+    returns the original send instead of creating a duplicate; AgentMail
+    expires each key 24 hours after the send completes. Callers should
+    derive this from something that uniquely identifies the exact content
+    being sent (see notifier.digest_idempotency_key) so a genuine retry of
+    the same digest is deduplicated, but a later, different digest is not
+    blocked by it.
+    """
+    return client.inboxes.messages.send(
+        inbox_id=inbox_id,
+        to=to,
+        subject=subject,
+        text=text,
+        idempotency_key=idempotency_key,
+    )

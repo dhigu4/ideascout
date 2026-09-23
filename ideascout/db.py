@@ -2096,13 +2096,37 @@ def mark_source_shown_in_digest(conn: sqlite3.Connection, source_id: int, shown_
     conn.commit()
 
 
+def mark_sources_shown_in_digest(conn: sqlite3.Connection, source_ids: list[int], shown_at: str) -> None:
+    """Marks MULTIPLE sources shown in a digest in ONE transaction (Stage
+    6 send-digest): executemany runs inside the connection's current
+    transaction and commit() is called exactly once at the end, so either
+    every source_id in this call is recorded or (if something raises
+    partway through) none of them are -- there is no way for a single
+    send-digest run to mark only some of its emailed ideas. Reuses the
+    same idempotent INSERT OR IGNORE semantics as
+    mark_source_shown_in_digest -- a source_id already marked shown is a
+    safe no-op, never a duplicate row or an error.
+    """
+    conn.executemany(
+        "INSERT OR IGNORE INTO digest_shown_sources (source_id, shown_at) VALUES (?, ?)",
+        [(source_id, shown_at) for source_id in source_ids],
+    )
+    conn.commit()
+
+
 def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, taste_version: int) -> list[sqlite3.Row]:
     """Sources with a non-PASS screening for this taste_version that have
-    never been shown in a digest yet, one row per source (its LATEST
-    screening for this taste_version, in case the rules changed and it
-    was re-screened), oldest screened first. This is preview-digest's
-    entire candidate pool before it applies the INVESTIGATE_NOW-first,
-    cap-at-5 selection.
+    never been shown in a digest yet -- one row per LOGICAL document
+    (source_name, external_id), never per stored version (Stage 6 fix:
+    considers ONLY each document's LATEST collected_sources row, so an
+    old, already-superseded version can never resurface as a candidate
+    just because ITS OWN source_id was never marked shown -- only the
+    latest version's own current screening ever decides eligibility). For
+    that latest version, uses its LATEST screening for this taste_version
+    (in case the rules changed and it was re-screened), oldest screened
+    first. This is the entire candidate pool before the INVESTIGATE_NOW-
+    first, cap-at-5 selection (see cli.py's select_digest_candidates,
+    shared by preview-digest and send-digest).
     """
     return conn.execute(
         """
@@ -2112,6 +2136,12 @@ def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, tas
         WHERE ss.taste_version = :taste_version
           AND ss.overall_prediction != 'PASS'
           AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
+          AND cs.source_id = (
+              SELECT cs2.source_id FROM collected_sources cs2
+              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+              ORDER BY cs2.source_id DESC
+              LIMIT 1
+          )
           AND ss.screening_id = (
               SELECT MAX(s2.screening_id) FROM source_screenings s2
               WHERE s2.source_id = cs.source_id AND s2.taste_version = :taste_version
