@@ -237,6 +237,37 @@ def test_send_digest_one_watch_sends_one_email(tmp_path, monkeypatch, capsys):
     assert messages.calls[0]["inbox_id"] == "inbox_abc"
 
 
+def test_send_digest_passes_sanitized_idempotency_key_to_agentmail(tmp_path, monkeypatch):
+    """Stage 8 production fix: the real send path must pass AgentMail
+    exactly the sanitized (SHA-256-derived) key -- no literal ":" or any
+    other character outside AgentMail's allowed set -- and it must match
+    what notifier.digest_idempotency_key computes for the same batch.
+    """
+    import re
+
+    from ideascout import notifier
+
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    latest_taste = build_taste_v1(config, monkeypatch)
+    conn = db.connect(config.database_path)
+    source_id = insert_scored_source(conn, latest_taste, config, external_id="1", overall_prediction="WATCH")
+    conn.close()
+    messages = patch_agentmail(monkeypatch)
+
+    cli.cmd_send_digest(config, dry_run=False)
+
+    assert len(messages.calls) == 1
+    key = messages.calls[0]["idempotency_key"]
+    assert re.fullmatch(r"[A-Za-z0-9._~-]+", key)
+    assert ":" not in key
+
+    from ideascout.cli import utcnow_iso
+
+    expected_date = utcnow_iso()[:10]
+    assert key == notifier.digest_idempotency_key(expected_date, [source_id])
+
+
 def test_send_digest_investigate_now_sorts_before_watch(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     write_screen_rules(config)

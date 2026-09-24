@@ -12,10 +12,17 @@ select_digest_candidates, shared with preview-digest).
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import List
 
 from . import agentmail_client
+
+# AgentMail's own validation for the Idempotency-Key header (confirmed from
+# a real production 400 ValidationError): only these characters are
+# accepted. digest_idempotency_key's output must never contain anything
+# outside this set.
+_IDEMPOTENCY_KEY_ALLOWED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 
 DIGEST_SUBJECT_TEMPLATE = "IdeaScout — New Ideas Worth Attention — {date}"
 
@@ -102,9 +109,24 @@ def digest_idempotency_key(date_str: str, source_ids: List[int]) -> str:
     real send even before cli.py's own DB check would catch it. A later,
     genuinely different digest naturally gets a different key (different
     date and/or different source_id set), so this never blocks real work.
+
+    PRODUCTION FIX: a real send hit AgentMail's HTTP 400 ValidationError
+    -- "Idempotency-Key must contain only the following characters: A-Z
+    a-z 0-9 - . _ ~" -- because the previous key (an f-string with literal
+    ":" separators, e.g. "ideascout-digest:2026-09-23:1-2") used characters
+    outside that set. The key is now a SHA-256 hex digest of a canonical
+    "{date}|{sorted-source-ids}" payload, truncated to 32 hex characters
+    and joined with the literal "ideascout-"/"-" separators -- every
+    character in the result is a hex digit, a letter, or "-", all within
+    AgentMail's allowed set by construction, so this can never recur
+    regardless of what date format or source_ids are passed in. The hash
+    still covers the full payload (date AND every source_id); truncating
+    the digest only shortens the key, it never drops an input from what
+    determines it.
     """
-    ids_part = "-".join(str(source_id) for source_id in sorted(source_ids))
-    return f"ideascout-digest:{date_str}:{ids_part}"
+    canonical = f"{date_str}|{'-'.join(str(source_id) for source_id in sorted(source_ids))}"
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"ideascout-{date_str}-{digest[:32]}"
 
 
 def send_digest_email(

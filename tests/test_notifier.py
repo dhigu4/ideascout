@@ -5,6 +5,8 @@ send test -- no real network call, no real AgentMail credentials.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ideascout import notifier
@@ -99,6 +101,35 @@ def test_render_digest_body_falls_back_when_company_missing():
 
 
 # --- idempotency key -----------------------------------------------------------
+#
+# Stage 8 production fix: a real send hit AgentMail's HTTP 400
+# ValidationError ("Idempotency-Key must contain only the following
+# characters: A-Z a-z 0-9 - . _ ~") because the previous key format used
+# literal ":" separators. digest_idempotency_key is now a SHA-256-derived
+# key built only from that allowed character set.
+
+_ALLOWED_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
+def test_digest_idempotency_key_contains_only_permitted_characters():
+    cases = [
+        ("2026-09-23", [27]),
+        ("2026-09-23", [5, 2, 8, 27, 100000]),
+        ("2026-01-01", [1]),
+        ("2026-12-31", []),
+    ]
+    for date_str, source_ids in cases:
+        key = notifier.digest_idempotency_key(date_str, source_ids)
+        assert _ALLOWED_IDEMPOTENCY_KEY_PATTERN.match(key), f"disallowed character(s) in {key!r}"
+        assert set(key) <= set(notifier._IDEMPOTENCY_KEY_ALLOWED_CHARS)
+
+
+def test_digest_idempotency_key_never_contains_a_colon():
+    """Direct regression guard for the exact character AgentMail's real
+    400 error was caused by.
+    """
+    key = notifier.digest_idempotency_key("2026-09-23", [27, 5])
+    assert ":" not in key
 
 
 def test_digest_idempotency_key_is_deterministic_and_order_independent():
@@ -111,6 +142,12 @@ def test_digest_idempotency_key_differs_by_date_or_source_ids():
     base = notifier.digest_idempotency_key("2026-09-23", [1, 2])
     assert notifier.digest_idempotency_key("2026-09-24", [1, 2]) != base
     assert notifier.digest_idempotency_key("2026-09-23", [1, 3]) != base
+
+
+def test_digest_idempotency_key_does_not_contain_recipient_or_secrets():
+    key = notifier.digest_idempotency_key("2026-09-23", [27, 5])
+    assert "brad" not in key.lower()
+    assert "@" not in key
 
 
 # --- send_digest_email: delegates to agentmail_client, no real network ------
