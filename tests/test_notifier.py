@@ -100,6 +100,33 @@ def test_render_digest_body_falls_back_when_company_missing():
     assert "XYZ" in body
 
 
+# --- Stage 9: digest-reply instructions footer --------------------------------
+
+
+def test_render_digest_body_appends_reply_instructions_after_existing_content():
+    body = notifier.render_digest_body([make_item()])
+    assert "reply to this email" in body.lower()
+    assert "Valid ratings: STRONG LIKE, LIKE, MAYBE, PASS, STRONG PASS." in body
+    # The existing investment content still comes first, unchanged.
+    assert body.index("XYZ Corp") < body.index("Valid ratings:")
+
+
+def test_render_digest_body_footer_never_exposes_internal_ids():
+    body = notifier.render_digest_body([make_item()])
+    assert "source_id" not in body.lower()
+
+
+def test_render_digest_body_single_item_footer_shows_bare_verdict_example():
+    body = notifier.render_digest_body([make_item()])
+    assert "\nLIKE\n" in body
+
+
+def test_render_digest_body_multi_item_footer_shows_labeled_example():
+    body = notifier.render_digest_body([make_item(ticker="XYZ"), make_item(ticker="ABC", company="ABC Inc")])
+    assert "XYZ - LIKE" in body
+    assert "you only need to reply about the idea(s) you have a view on" in body.lower()
+
+
 # --- idempotency key -----------------------------------------------------------
 #
 # Stage 8 production fix: a real send hit AgentMail's HTTP 400

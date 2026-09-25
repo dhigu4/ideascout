@@ -323,6 +323,49 @@ def test_unapproved_needs_review_feedback_remains_ineligible_for_learning(tmp_pa
     conn.close()
 
 
+# --- Stage 9: zero-events NEEDS_REVIEW (digest-reply fail-closed cases) -----
+
+
+def test_approve_review_refuses_needs_review_message_with_zero_feedback_events(tmp_path):
+    """UNMATCHED_DIGEST_REPLY / DIGEST_REPLY_PARSE_FAILED (Stage 9) are the
+    first-ever NEEDS_REVIEW cases with no feedback rows at all -- approving
+    one must refuse rather than flip straight to PARSED with nothing to
+    show for it (the exact impossible state migrations 4/6 exist to
+    repair).
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1")
+    db.set_feedback_parse_status(conn, "msg_1", "NEEDS_REVIEW", error="UNMATCHED_DIGEST_REPLY: no delivery match")
+    conn.close()
+
+    exit_code = cli.cmd_approve_review(config, "msg_1")
+    assert exit_code == 1
+
+    conn = db.connect(config.database_path)
+    row = db.get_message(conn, "msg_1")
+    assert row["feedback_parse_status"] == "NEEDS_REVIEW"  # unchanged
+    conn.close()
+
+
+def test_show_review_prints_reason_for_zero_feedback_event_message(tmp_path, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_raw_message(conn, "msg_1")
+    db.set_feedback_parse_status(
+        conn, "msg_1", "NEEDS_REVIEW", error="UNMATCHED_DIGEST_REPLY: no delivery match"
+    )
+    conn.close()
+
+    exit_code = cli.cmd_show_review(config)
+    assert exit_code == 0
+
+    output = capsys.readouterr().out
+    assert "UNMATCHED_DIGEST_REPLY" in output
+    assert "Cannot be approved" in output
+    assert "requeue-feedback" in output
+
+
 def test_excluded_feedback_stays_ineligible_even_after_approval(tmp_path):
     """excluded_from_learning and feedback_parse_status are independent
     gates -- approval alone must not override an explicit exclusion.

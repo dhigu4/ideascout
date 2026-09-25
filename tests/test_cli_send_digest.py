@@ -107,22 +107,36 @@ def insert_scored_source(
 
 
 class _FakeSendResponse:
-    def __init__(self, message_id="msg_fake"):
+    def __init__(self, message_id="msg_fake", thread_id="thread_fake"):
         self.message_id = message_id
-        self.thread_id = "thread_fake"
+        self.thread_id = thread_id
 
 
 class _FakeMessages:
     def __init__(self, response=None, exc=None):
-        self._response = response if response is not None else _FakeSendResponse()
+        # A FIXED response (when the caller explicitly passes one) is
+        # returned every time -- used by tests asserting an exact
+        # message_id/thread_id. Otherwise (the common case) a NEW,
+        # uniquely-id'd response is generated on EACH call, exactly like
+        # two real, distinct AgentMail sends would produce -- this is
+        # what makes digest_deliveries.provider_message_id's UNIQUE
+        # constraint (Stage 9) safe to exercise across more than one
+        # send-digest call within a single test.
+        self._response = response
         self._exc = exc
         self.calls: list[dict] = []
+        self._send_count = 0
 
     def send(self, **kwargs):
         self.calls.append(kwargs)
         if self._exc is not None:
             raise self._exc
-        return self._response
+        if self._response is not None:
+            return self._response
+        self._send_count += 1
+        return _FakeSendResponse(
+            message_id=f"msg_fake_{self._send_count}", thread_id=f"thread_fake_{self._send_count}"
+        )
 
 
 class _FakeInboxes:
@@ -326,6 +340,88 @@ def test_send_digest_caps_at_five(tmp_path, monkeypatch):
     assert included == 5
 
 
+def test_send_digest_records_delivery_with_provider_ids_and_items_in_order(tmp_path, monkeypatch):
+    """DELIVERY (Stage 9): a successful send persists the EXACT
+    provider-assigned message_id/thread_id, and the exact set of
+    source_ids that were included, in the order they were sent.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    latest_taste = build_taste_v1(config, monkeypatch)
+    conn = db.connect(config.database_path)
+    source_ids = [
+        insert_scored_source(
+            conn, latest_taste, config, external_id=str(i), overall_prediction="INVESTIGATE_NOW",
+            company=f"Company{i}", created_at=f"2026-01-01T00:0{i}:00+00:00",
+        )
+        for i in range(3)
+    ]
+    conn.close()
+    messages = patch_agentmail(monkeypatch)
+
+    exit_code = cli.cmd_send_digest(config, dry_run=False)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    delivery = conn.execute("SELECT * FROM digest_deliveries").fetchone()
+    assert delivery["provider_message_id"] == "msg_fake_1"
+    assert delivery["provider_thread_id"] == "thread_fake_1"
+    assert delivery["taste_version"] == latest_taste["version_number"]
+
+    items = conn.execute(
+        "SELECT source_id, position FROM digest_delivery_items WHERE delivery_id = ? ORDER BY position",
+        (delivery["delivery_id"],),
+    ).fetchall()
+    conn.close()
+
+    assert [item["source_id"] for item in items] == source_ids
+    assert [item["position"] for item in items] == [0, 1, 2]
+
+
+def test_send_digest_failed_send_creates_no_delivery_or_item_rows(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    latest_taste = build_taste_v1(config, monkeypatch)
+    conn = db.connect(config.database_path)
+    insert_scored_source(conn, latest_taste, config, external_id="1", overall_prediction="WATCH")
+    conn.close()
+    patch_agentmail(monkeypatch, exc=RuntimeError("simulated AgentMail rejection"))
+
+    exit_code = cli.cmd_send_digest(config, dry_run=False)
+    assert exit_code != 0
+
+    conn = db.connect(config.database_path)
+    assert conn.execute("SELECT COUNT(*) FROM digest_deliveries").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM digest_delivery_items").fetchone()[0] == 0
+    conn.close()
+
+
+def test_send_digest_db_marking_failure_creates_no_shown_rows_but_provider_already_sent(tmp_path, monkeypatch):
+    """The provider-idempotency-protects-retry half of the DELIVERY spec:
+    if DB persistence fails after a successful provider send, no
+    digest_shown_sources rows are created, so a naive retry attempt would
+    re-select the same candidates -- but it is AgentMail's own
+    idempotency_key (unchanged by this failure) that prevents a real
+    second email, not anything in this database.
+    """
+    config = make_config(tmp_path)
+    write_screen_rules(config)
+    latest_taste = build_taste_v1(config, monkeypatch)
+    conn = db.connect(config.database_path)
+    insert_scored_source(conn, latest_taste, config, external_id="1", overall_prediction="WATCH")
+    conn.close()
+    patch_agentmail(monkeypatch)
+
+    monkeypatch.setattr(db, "record_digest_delivery", lambda conn_arg, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated DB failure")))
+
+    exit_code = cli.cmd_send_digest(config, dry_run=False)
+    assert exit_code != 0
+
+    conn = db.connect(config.database_path)
+    assert conn.execute("SELECT COUNT(*) FROM digest_shown_sources").fetchone()[0] == 0
+    conn.close()
+
+
 def test_send_digest_successful_send_marks_only_included_source_ids(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     write_screen_rules(config)
@@ -475,10 +571,10 @@ def test_send_digest_db_marking_failure_after_success_warns_loudly(tmp_path, mon
     conn.close()
     patch_agentmail(monkeypatch)
 
-    def failing_mark(conn_arg, source_ids, shown_at):
+    def failing_record(conn_arg, **kwargs):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(db, "mark_sources_shown_in_digest", failing_mark)
+    monkeypatch.setattr(db, "record_digest_delivery", failing_record)
 
     exit_code = cli.cmd_send_digest(config, dry_run=False)
     assert exit_code != 0

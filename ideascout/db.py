@@ -504,6 +504,78 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE collected_sources ADD COLUMN raw_capture_hash TEXT;
     """,
+    # Migration 12 (Stage 9): digest-reply feedback.
+    #
+    # Brad can now reply directly to a send-digest email with his verdict
+    # and reasoning. Two additive concerns, in one migration:
+    #
+    # (a) DURABLE DELIVERY PROVENANCE -- digest_deliveries/
+    #     digest_delivery_items record exactly which source_id(s), in
+    #     which position, were included in one successfully-sent digest
+    #     email, keyed by AgentMail's own provider_message_id/
+    #     provider_thread_id. This is what lets a later inbound reply be
+    #     correlated back to the EXACT ideas Brad saw (via thread_id --
+    #     see cli.py's cmd_parse_mail and ideascout/digest_reply.py),
+    #     rather than guessed at from ticker text alone. provider_
+    #     message_id is nullable (a dry-run or a future delivery path
+    #     might not always have one) but UNIQUE when present -- SQLite's
+    #     UNIQUE index already treats multiple NULLs as distinct, so "if
+    #     present" needs no extra logic. idempotency_key is always
+    #     present (see notifier.digest_idempotency_key) and always
+    #     unique -- one row per real send attempt that AgentMail accepted.
+    #
+    # (b) LEARNING vs. CLEAN-HOLDOUT ELIGIBILITY -- these were previously
+    #     conflated (excluded_from_learning was the only flag). A digest
+    #     reply is NOT a clean blind holdout judgment (Brad has already
+    #     seen IdeaScout's own screen result/rationale before writing it),
+    #     but it IS still legitimate signal for a future Taste build.
+    #     feedback_origin ('DIRECT' or 'DIGEST_REPLY') and holdout_eligible
+    #     record that distinction structurally, per feedback row, so every
+    #     consumer of "the holdout" (taste-status, build-taste's freeze
+    #     check, shadow-score, shadow-status) can filter on it via ONE
+    #     shared DB helper (db.get_eligible_feedback_after) rather than
+    #     each reimplementing the rule. Every EXISTING feedback row -- and
+    #     every future row from the unchanged, LLM-based direct-feedback
+    #     path -- defaults to feedback_origin='DIRECT',
+    #     holdout_eligible=1, exactly matching today's behavior; nothing
+    #     is rewritten or deleted. source_id/digest_delivery_id are
+    #     nullable and are only ever populated for a DIGEST_REPLY row
+    #     (the exact collected_sources.source_id and digest_deliveries.
+    #     delivery_id it was derived from) -- see
+    #     get_feedback_eligible_for_learning, which is UNCHANGED, so a
+    #     learning-eligible DIGEST_REPLY row still trains a future Taste
+    #     exactly like any other eligible feedback.
+    """
+    CREATE TABLE digest_deliveries (
+        delivery_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_message_id   TEXT,
+        provider_thread_id    TEXT,
+        idempotency_key       TEXT NOT NULL,
+        subject               TEXT NOT NULL,
+        sent_at               TEXT NOT NULL,
+        taste_version         INTEGER NOT NULL,
+
+        UNIQUE(provider_message_id),
+        UNIQUE(idempotency_key)
+    );
+
+    CREATE INDEX idx_digest_deliveries_provider_thread_id ON digest_deliveries(provider_thread_id);
+
+    CREATE TABLE digest_delivery_items (
+        delivery_id  INTEGER NOT NULL REFERENCES digest_deliveries(delivery_id),
+        source_id    INTEGER NOT NULL REFERENCES collected_sources(source_id),
+        position     INTEGER NOT NULL,
+
+        PRIMARY KEY (delivery_id, source_id)
+    );
+
+    CREATE INDEX idx_digest_delivery_items_source_id ON digest_delivery_items(source_id);
+
+    ALTER TABLE feedback ADD COLUMN feedback_origin TEXT NOT NULL DEFAULT 'DIRECT';
+    ALTER TABLE feedback ADD COLUMN holdout_eligible INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE feedback ADD COLUMN source_id INTEGER REFERENCES collected_sources(source_id);
+    ALTER TABLE feedback ADD COLUMN digest_delivery_id INTEGER REFERENCES digest_deliveries(delivery_id);
+    """,
 ]
 
 
@@ -893,9 +965,12 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def get_messages_pending_feedback_parse(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Messages eligible for the feedback parser, oldest first: never
     attempted, or a previous attempt failed for a transient reason.
+    thread_id (Stage 9) is included so cmd_parse_mail can check it against
+    digest_deliveries.provider_thread_id without a second per-message
+    lookup -- see ideascout/digest_reply.py.
     """
     return conn.execute(
-        "SELECT message_id, subject, body_raw, sender, sender_authenticated FROM messages_raw "
+        "SELECT message_id, subject, body_raw, sender, sender_authenticated, thread_id FROM messages_raw "
         "WHERE feedback_parse_status IN ('UNPARSED', 'RETRYABLE_ERROR') "
         "ORDER BY id"
     ).fetchall()
@@ -1035,6 +1110,10 @@ def insert_feedback(
     confidence: float | None,
     created_at: str,
     event_index: int = 0,
+    feedback_origin: str = "DIRECT",
+    holdout_eligible: bool = True,
+    source_id: int | None = None,
+    digest_delivery_id: int | None = None,
 ) -> bool:
     """Insert one feedback event. Returns True if a new row was written.
 
@@ -1045,6 +1124,10 @@ def insert_feedback(
     other constraint failure is surfaced loudly instead of being swallowed
     by OR IGNORE.
 
+    feedback_origin/holdout_eligible/source_id/digest_delivery_id (Stage
+    9) default to exactly today's DIRECT-feedback shape; cli.py's
+    digest-reply path passes them explicitly.
+
     For inserting *all* of one message's events together, prefer
     insert_feedback_events below -- it commits them as a single
     all-or-nothing unit, which this single-row function does not.
@@ -1054,11 +1137,13 @@ def insert_feedback(
         INSERT OR IGNORE INTO feedback (
             message_id, event_index, event_type, verdict, ticker, company,
             novelty, user_comment, parsed_json, parser_version, model_name,
-            confidence, created_at
+            confidence, created_at, feedback_origin, holdout_eligible,
+            source_id, digest_delivery_id
         ) VALUES (
             :message_id, :event_index, :event_type, :verdict, :ticker, :company,
             :novelty, :user_comment, :parsed_json, :parser_version, :model_name,
-            :confidence, :created_at
+            :confidence, :created_at, :feedback_origin, :holdout_eligible,
+            :source_id, :digest_delivery_id
         )
         """,
         {
@@ -1075,6 +1160,10 @@ def insert_feedback(
             "model_name": model_name,
             "confidence": confidence,
             "created_at": created_at,
+            "feedback_origin": feedback_origin,
+            "holdout_eligible": 1 if holdout_eligible else 0,
+            "source_id": source_id,
+            "digest_delivery_id": digest_delivery_id,
         },
     )
     conn.commit()
@@ -1114,6 +1203,14 @@ def insert_feedback_events(
 
     Each dict in `events` must supply the same fields as insert_feedback's
     keyword arguments, excluding message_id/event_index (filled in here).
+
+    Stage 9: an event dict MAY additionally supply feedback_origin,
+    holdout_eligible, source_id, and/or digest_delivery_id. Any that are
+    omitted default here to exactly today's behavior (feedback_origin=
+    'DIRECT', holdout_eligible=True, source_id=None, digest_delivery_id=
+    None) -- the existing LLM-based direct-feedback call site in cli.py
+    never needs to know these fields exist. cli.py's digest-reply path
+    explicitly supplies all four.
     """
     with conn:
         for index, event in enumerate(events):
@@ -1122,14 +1219,24 @@ def insert_feedback_events(
                 INSERT INTO feedback (
                     message_id, event_index, event_type, verdict, ticker,
                     company, novelty, user_comment, parsed_json,
-                    parser_version, model_name, confidence, created_at
+                    parser_version, model_name, confidence, created_at,
+                    feedback_origin, holdout_eligible, source_id, digest_delivery_id
                 ) VALUES (
                     :message_id, :event_index, :event_type, :verdict, :ticker,
                     :company, :novelty, :user_comment, :parsed_json,
-                    :parser_version, :model_name, :confidence, :created_at
+                    :parser_version, :model_name, :confidence, :created_at,
+                    :feedback_origin, :holdout_eligible, :source_id, :digest_delivery_id
                 )
                 """,
-                {"message_id": message_id, "event_index": index, **event},
+                {
+                    "message_id": message_id,
+                    "event_index": index,
+                    **event,
+                    "feedback_origin": event.get("feedback_origin", "DIRECT"),
+                    "holdout_eligible": 1 if event.get("holdout_eligible", True) else 0,
+                    "source_id": event.get("source_id"),
+                    "digest_delivery_id": event.get("digest_delivery_id"),
+                },
             )
 
 
@@ -1196,9 +1303,12 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
             feedback.verdict, feedback.ticker, feedback.company, feedback.novelty,
             feedback.user_comment, feedback.confidence, feedback.created_at,
             feedback.excluded_from_learning,
+            feedback.feedback_origin, feedback.holdout_eligible, feedback.source_id,
+            collected_sources.source_name AS origin_source_name,
             messages_raw.received_at, messages_raw.sender, messages_raw.subject
         FROM feedback
         JOIN messages_raw ON messages_raw.message_id = feedback.message_id
+        LEFT JOIN collected_sources ON collected_sources.source_id = feedback.source_id
         ORDER BY feedback.feedback_id DESC
         LIMIT ?
         """,
@@ -1303,16 +1413,31 @@ def find_feedback_invariant_violations(conn: sqlite3.Connection) -> list[str]:
 
 
 def get_eligible_feedback_after(conn: sqlite3.Connection, checkpoint_feedback_id: int) -> list[sqlite3.Row]:
-    """Eligible feedback rows (via the one canonical
-    get_feedback_eligible_for_learning query) with feedback_id strictly
-    greater than checkpoint_feedback_id -- i.e. judgments that showed up
-    after a taste version's training checkpoint. This is how the holdout
-    count is computed; it deliberately filters the canonical query's own
-    result rather than writing a second, separate eligibility query, so
-    the two can never drift apart.
+    """The CLEAN HOLDOUT judgment pool: eligible feedback rows (via the
+    one canonical get_feedback_eligible_for_learning query) with
+    feedback_id strictly greater than checkpoint_feedback_id (i.e.
+    judgments that showed up after a taste version's training checkpoint)
+    AND holdout_eligible = 1 (Stage 9). This is how EVERY consumer of "the
+    holdout" -- taste-status, build-taste's freeze check, shadow-score,
+    shadow-status -- computes it; it deliberately filters the canonical
+    learning-eligibility query's own result rather than writing a second,
+    separate eligibility query, so the two can never drift apart.
+
+    holdout_eligible=0 (currently: every DIGEST_REPLY feedback row -- see
+    db.py's Migration 12 and cli.py's cmd_parse_mail) is EXCLUDED here even
+    though it is still learning-eligible: Brad has already seen
+    IdeaScout's own screen result/rationale before writing a digest reply,
+    so it can never count as a genuine blind holdout judgment, no matter
+    how recent its feedback_id is. It still fully counts for
+    get_feedback_eligible_for_learning/build-taste's TRAINING set, which
+    does not call this function at all.
     """
     eligible = get_feedback_eligible_for_learning(conn)
-    return [row for row in eligible if row["feedback_id"] > checkpoint_feedback_id]
+    return [
+        row
+        for row in eligible
+        if row["feedback_id"] > checkpoint_feedback_id and row["holdout_eligible"]
+    ]
 
 
 def get_latest_taste_version(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -2096,22 +2221,112 @@ def mark_source_shown_in_digest(conn: sqlite3.Connection, source_id: int, shown_
     conn.commit()
 
 
-def mark_sources_shown_in_digest(conn: sqlite3.Connection, source_ids: list[int], shown_at: str) -> None:
-    """Marks MULTIPLE sources shown in a digest in ONE transaction (Stage
-    6 send-digest): executemany runs inside the connection's current
-    transaction and commit() is called exactly once at the end, so either
-    every source_id in this call is recorded or (if something raises
-    partway through) none of them are -- there is no way for a single
-    send-digest run to mark only some of its emailed ideas. Reuses the
-    same idempotent INSERT OR IGNORE semantics as
-    mark_source_shown_in_digest -- a source_id already marked shown is a
-    safe no-op, never a duplicate row or an error.
+def record_digest_delivery(
+    conn: sqlite3.Connection,
+    *,
+    provider_message_id: str | None,
+    provider_thread_id: str | None,
+    idempotency_key: str,
+    subject: str,
+    sent_at: str,
+    taste_version: int,
+    source_ids: list[int],
+) -> int:
+    """Records ONE successful digest send (Stage 9) -- the digest_
+    deliveries row, every (delivery_id, source_id, position) digest_
+    delivery_items row, AND the corresponding digest_shown_sources marks
+    -- as a SINGLE atomic transaction: either everything here is
+    recorded, or (if anything raises partway through) none of it is,
+    since commit() is only ever reached at the very end. Must only ever
+    be called AFTER AgentMail has already confirmed the send; this is
+    what makes durable delivery provenance possible for correlating a
+    later reply back to the exact source_ids Brad saw (see
+    get_digest_delivery_by_thread_id / ideascout/digest_reply.py).
+    Returns the new delivery_id.
+
+    Reuses the same idempotent INSERT OR IGNORE semantics as
+    mark_source_shown_in_digest for the shown-marks themselves -- a
+    source_id already marked shown is a safe no-op, never a duplicate row
+    or an error (should never actually happen here, since a candidate
+    already in digest_shown_sources would never have been selected again,
+    but this keeps the guarantee unconditional regardless).
     """
-    conn.executemany(
-        "INSERT OR IGNORE INTO digest_shown_sources (source_id, shown_at) VALUES (?, ?)",
-        [(source_id, shown_at) for source_id in source_ids],
-    )
-    conn.commit()
+    with conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO digest_deliveries (
+                provider_message_id, provider_thread_id, idempotency_key, subject, sent_at, taste_version
+            ) VALUES (
+                :provider_message_id, :provider_thread_id, :idempotency_key, :subject, :sent_at, :taste_version
+            )
+            """,
+            {
+                "provider_message_id": provider_message_id,
+                "provider_thread_id": provider_thread_id,
+                "idempotency_key": idempotency_key,
+                "subject": subject,
+                "sent_at": sent_at,
+                "taste_version": taste_version,
+            },
+        )
+        delivery_id = cursor.lastrowid
+        for position, source_id in enumerate(source_ids):
+            conn.execute(
+                "INSERT INTO digest_delivery_items (delivery_id, source_id, position) VALUES (?, ?, ?)",
+                (delivery_id, source_id, position),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO digest_shown_sources (source_id, shown_at) VALUES (?, ?)",
+                (source_id, sent_at),
+            )
+    return delivery_id
+
+
+def get_digest_delivery_by_thread_id(conn: sqlite3.Connection, provider_thread_id: str | None) -> sqlite3.Row | None:
+    """The digest delivery a reply's thread_id correlates to -- the
+    PRIMARY, trusted signal for identifying a digest reply (Stage 9; see
+    ideascout/digest_reply.py). None (no query even attempted) for a
+    missing/blank thread_id. If more than one delivery somehow shares a
+    thread_id, the most recent one is treated as authoritative -- provider_
+    thread_id is deliberately NOT unique in the schema (a real email
+    thread can legitimately span more than one send), so this is a
+    reasonable tie-break, not a data-integrity assumption.
+    """
+    if not provider_thread_id:
+        return None
+    return conn.execute(
+        "SELECT * FROM digest_deliveries WHERE provider_thread_id = ? ORDER BY delivery_id DESC LIMIT 1",
+        (provider_thread_id,),
+    ).fetchone()
+
+
+def get_digest_delivery_items_with_source_info(conn: sqlite3.Connection, delivery_id: int) -> list[sqlite3.Row]:
+    """Every item in one digest delivery, in the order it was sent,
+    joined with its collected_sources row for ticker/company -- what
+    ideascout/digest_reply.py's parser matches Brad's reply against (the
+    "actual delivery items" allowed idea set for that specific email).
+    """
+    return conn.execute(
+        """
+        SELECT ddi.delivery_id, ddi.source_id, ddi.position, cs.ticker, cs.company,
+               cs.source_name, cs.canonical_url
+        FROM digest_delivery_items ddi
+        JOIN collected_sources cs ON cs.source_id = ddi.source_id
+        WHERE ddi.delivery_id = ?
+        ORDER BY ddi.position
+        """,
+        (delivery_id,),
+    ).fetchall()
+
+
+def count_feedback_by_origin(conn: sqlite3.Connection, feedback_origin: str) -> int:
+    """Total feedback rows with this feedback_origin ('DIRECT' or
+    'DIGEST_REPLY') -- an informational count only (see cli.py's
+    taste-status), never used to decide learning or holdout eligibility.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM feedback WHERE feedback_origin = ?", (feedback_origin,)
+    ).fetchone()[0]
 
 
 def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, taste_version: int) -> list[sqlite3.Row]:

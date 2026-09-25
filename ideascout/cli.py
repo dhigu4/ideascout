@@ -16,7 +16,18 @@ from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from . import agentmail_client, db, idea_extraction, notifier, parser, shadow, source_isolation, structured_llm, taste
+from . import (
+    agentmail_client,
+    db,
+    digest_reply,
+    idea_extraction,
+    notifier,
+    parser,
+    shadow,
+    source_isolation,
+    structured_llm,
+    taste,
+)
 from . import config as config_module
 from .config import Config, ConfigError, load_config
 from .logger import get_logger, setup_logging
@@ -279,6 +290,102 @@ def cmd_parse_mail(config: Config) -> int:
 
         db.record_parse_attempt(conn, message_id, utcnow_iso())
 
+        # Stage 9: a reply to a send-digest email is NEVER handed to the
+        # LLM-based direct-feedback parser below -- it is a fundamentally
+        # different case (Brad has already seen IdeaScout's own screen
+        # result/rationale, so it can never be a clean holdout judgment;
+        # see digest_reply.py's module docstring) and is routed through a
+        # wholly separate, deterministic, no-LLM parser instead. The ONLY
+        # trusted signal that a message is a digest reply is its
+        # thread_id matching a recorded digest_deliveries row -- a
+        # digest-reply-looking subject with no such match is a fail-closed
+        # safety net (UNMATCHED_DIGEST_REPLY), never treated as a genuine
+        # digest reply and never treated as ordinary direct feedback.
+        digest_delivery = db.get_digest_delivery_by_thread_id(conn, row["thread_id"])
+
+        if digest_delivery is not None:
+            delivery_items = [
+                digest_reply.DeliveryItem(
+                    source_id=item_row["source_id"],
+                    ticker=item_row["ticker"],
+                    company=item_row["company"],
+                    position=item_row["position"],
+                )
+                for item_row in db.get_digest_delivery_items_with_source_info(
+                    conn, digest_delivery["delivery_id"]
+                )
+            ]
+            parse_result = digest_reply.parse_digest_reply(row["body_raw"], delivery_items)
+
+            if not parse_result.ok:
+                message_text = (
+                    f"Digest-reply parse failed for message_id={message_id}: {parse_result.reason}"
+                )
+                logger.warning(message_text)
+                db.set_feedback_parse_status(
+                    conn,
+                    message_id,
+                    "NEEDS_REVIEW",
+                    error=f"DIGEST_REPLY_PARSE_FAILED: {parse_result.reason}",
+                )
+                needs_review += 1
+                continue
+
+            try:
+                db.insert_feedback_events(
+                    conn,
+                    message_id=message_id,
+                    events=[
+                        {
+                            "event_type": "FEEDBACK",
+                            "verdict": block.verdict,
+                            "ticker": block.item.ticker,
+                            "company": block.item.company,
+                            "novelty": None,
+                            "user_comment": block.comment,
+                            "parsed_json": "{}",
+                            "parser_version": digest_reply.PARSER_VERSION,
+                            "model_name": digest_reply.MODEL_NAME,
+                            "confidence": None,
+                            "created_at": utcnow_iso(),
+                            "feedback_origin": "DIGEST_REPLY",
+                            "holdout_eligible": False,
+                            "source_id": block.item.source_id,
+                            "digest_delivery_id": digest_delivery["delivery_id"],
+                        }
+                        for block in parse_result.blocks
+                    ],
+                )
+            except Exception as exc:
+                message_text = f"Failed to save digest-reply feedback for message_id={message_id}: {exc}"
+                logger.exception(message_text)
+                db.set_meta(conn, "last_error", f"{utcnow_iso()} {message_text}")
+                errors += 1
+                continue
+
+            db.set_feedback_parse_status(conn, message_id, "PARSED")
+            parsed += 1
+            continue
+
+        if digest_reply.looks_like_digest_reply_subject(row["subject"]):
+            message_text = (
+                f"Message {message_id} subject looks like a digest reply but no matching "
+                "digest_delivery thread was found"
+            )
+            logger.warning(message_text)
+            db.set_feedback_parse_status(
+                conn,
+                message_id,
+                "NEEDS_REVIEW",
+                error=(
+                    "UNMATCHED_DIGEST_REPLY: subject looks like a reply to a digest email, but no "
+                    "recorded digest delivery matches this message's thread. Refusing to guess -- "
+                    "review manually."
+                ),
+            )
+            needs_review += 1
+            continue
+
         try:
             events = parser.parse_message(client, config.parser_model_name, row["subject"], row["body_raw"])
         except parser.RetryableParserError as exc:
@@ -391,6 +498,18 @@ def cmd_show_feedback(config: Config, limit: int = 10) -> int:
             f"{verdict} | confidence={confidence_text}{excluded_marker}"
         )
         print(f'    "{comment}"')
+        # Stage 9: DIGEST_REPLY feedback is learning-eligible but never a
+        # clean holdout judgment (Brad already saw IdeaScout's screen
+        # result before replying) -- always shown explicitly so this is
+        # never mistaken for a blind DIRECT judgment.
+        if row["feedback_origin"] == "DIGEST_REPLY":
+            source_label = row["origin_source_name"] or "unknown"
+            if row["ticker"]:
+                source_label = f"{source_label}/{row['ticker']}"
+            print(
+                f"    Origin: DIGEST_REPLY | Holdout eligible: "
+                f"{'YES' if row['holdout_eligible'] else 'NO'} | Source: {source_label}"
+            )
 
     return 0
 
@@ -707,12 +826,24 @@ def cmd_show_review(config: Config) -> int:
             f"message_id={message['message_id']} | subject={message['subject']!r} | "
             f"received_at={message['received_at']}"
         )
+        if message["error"]:
+            print(f"  reason: {message['error']}")
         for event in events:
             print(f"  {_describe_feedback_event(event)}")
-        print(
-            f"  -> NOT YET APPROVED. Approve with: python run.py approve-review "
-            f"{message['message_id']}"
-        )
+        if not events:
+            # Stage 9: UNMATCHED_DIGEST_REPLY and DIGEST_REPLY_PARSE_FAILED
+            # are the first-ever NEEDS_REVIEW cases with zero feedback
+            # events -- there is nothing here for approve-review to
+            # promote, so it must be requeued (or ignored) instead.
+            print(
+                f"  -> No feedback events were extracted. Cannot be approved. Use "
+                f"requeue-feedback {message['message_id']!r} to force a fresh parse, or leave as-is."
+            )
+        else:
+            print(
+                f"  -> NOT YET APPROVED. Approve with: python run.py approve-review "
+                f"{message['message_id']}"
+            )
         print()
 
     conn.close()
@@ -752,6 +883,22 @@ def cmd_approve_review(config: Config, message_id: str) -> int:
         return 1
 
     events = db.get_feedback_events_for_message(conn, message_id)
+    if not events:
+        # Stage 9: UNMATCHED_DIGEST_REPLY and DIGEST_REPLY_PARSE_FAILED are
+        # the first-ever NEEDS_REVIEW cases with zero feedback events.
+        # Flipping straight to PARSED here would recreate exactly the
+        # "PARSED with nothing to show for it" state Migrations 4 and 6
+        # exist to repair -- refuse instead, and point at requeue-feedback,
+        # which is the only path that can still do something useful (force
+        # a fresh parse attempt).
+        conn.close()
+        print(
+            f"message_id={message_id!r} has NO feedback events to approve (reason: "
+            f"{row['error'] or 'unknown'}) -- refusing. Use requeue-feedback {message_id!r} "
+            "to force a fresh parse instead."
+        )
+        return 1
+
     db.set_feedback_parse_status(conn, message_id, "PARSED", error=None)
     conn.close()
 
@@ -992,6 +1139,7 @@ def cmd_taste_status(config: Config) -> int:
         return 0
 
     holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
+    digest_reply_count = db.count_feedback_by_origin(conn, "DIGEST_REPLY")
     conn.close()
 
     frozen = len(holdout) < taste.HOLDOUT_SIZE
@@ -1000,6 +1148,10 @@ def cmd_taste_status(config: Config) -> int:
     print(f"Training judgments: {latest['training_count']}")
     print(f"Holdout judgments collected: {len(holdout)} / {taste.HOLDOUT_SIZE}")
     print(f"Taste frozen: {'YES' if frozen else 'NO'}")
+    if digest_reply_count:
+        # Stage 9: learning-eligible but NEVER counted in "Holdout
+        # judgments collected" above -- see db.get_eligible_feedback_after.
+        print(f"Digest-reply feedback records: {digest_reply_count}")
 
     # Fail loudly rather than silently trusting a file that may have been
     # edited, truncated, or lost since this version was activated. This
@@ -2112,7 +2264,7 @@ def cmd_send_digest(config: Config, *, dry_run: bool) -> int:
 
     try:
         client = agentmail_client.build_client(config.agentmail_api_key)
-        notifier.send_digest_email(
+        send_response = notifier.send_digest_email(
             client,
             inbox_id=config.agentmail_inbox_id,
             recipient_email=config.digest_recipient_email,
@@ -2131,16 +2283,32 @@ def cmd_send_digest(config: Config, *, dry_run: bool) -> int:
 
     print("Email sent: YES")
 
+    # Stage 9: records digest_deliveries + digest_delivery_items + the
+    # digest_shown_sources marks in ONE atomic transaction -- this is what
+    # later lets a reply to this exact email be correlated back to these
+    # exact source_ids via provider_thread_id (see
+    # ideascout/digest_reply.py). provider_message_id/provider_thread_id
+    # come straight from AgentMail's own send confirmation, never guessed.
     try:
-        db.mark_sources_shown_in_digest(conn, source_ids, utcnow_iso())
+        db.record_digest_delivery(
+            conn,
+            provider_message_id=getattr(send_response, "message_id", None),
+            provider_thread_id=getattr(send_response, "thread_id", None),
+            idempotency_key=idempotency_key,
+            subject=subject,
+            sent_at=utcnow_iso(),
+            taste_version=latest_taste["version_number"],
+            source_ids=source_ids,
+        )
     except Exception as exc:
-        logger.exception(f"send-digest: DB marking failed after a successful send: {exc}")
+        logger.exception(f"send-digest: delivery/DB marking failed after a successful send: {exc}")
         conn.close()
         print("Sources marked shown: 0")
         print(
-            "*** CRITICAL: the email WAS sent successfully, but marking the sources as shown in "
-            "the database FAILED. Rerunning send-digest now could send a DUPLICATE email for the "
-            f"same ideas. Manual investigation is required before rerunning. Error: {exc}"
+            "*** CRITICAL: the email WAS sent successfully, but recording the delivery and marking "
+            "the sources as shown in the database FAILED. Rerunning send-digest now could send a "
+            f"DUPLICATE email for the same ideas. Manual investigation is required before "
+            f"rerunning. Error: {exc}"
         )
         return 1
 

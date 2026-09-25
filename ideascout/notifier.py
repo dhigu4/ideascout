@@ -87,14 +87,51 @@ def _format_item(item: DigestItem) -> str:
     return "\n".join(lines)
 
 
+def _render_reply_instructions(items: List[DigestItem]) -> str:
+    """Stage 9: concise reply instructions appended to every digest so
+    Brad can reply directly instead of using show-feedback. Deliberately
+    never mentions source_id or any other internal DB id -- ideascout/
+    digest_reply.py matches replies back to ideas by ticker/company only.
+    """
+    lines = [
+        "-" * 40,
+        "",
+        "To give feedback, just reply to this email.",
+        "",
+        "Valid ratings: STRONG LIKE, LIKE, MAYBE, PASS, STRONG PASS.",
+        "",
+    ]
+    if len(items) == 1:
+        lines.append("Reply with your rating, then your reasoning on the next line(s), e.g.:")
+        lines.append("")
+        lines.append("LIKE")
+        lines.append("Good margins, worth tracking next quarter.")
+    else:
+        lines.append(
+            "If you're rating more than one idea, start each one with its ticker or company "
+            "name, a dash, and your rating, e.g.:"
+        )
+        lines.append("")
+        example_item = items[0]
+        example_label = example_item.ticker or example_item.company or "TICKER"
+        lines.append(f"{example_label} - LIKE")
+        lines.append("Good margins, worth tracking next quarter.")
+        lines.append("")
+        lines.append("You only need to reply about the idea(s) you have a view on.")
+    return "\n".join(lines)
+
+
 def render_digest_body(items: List[DigestItem]) -> str:
     """Plain-text digest email body -- pure string composition, no LLM
     call, no rewriting. Every value is taken verbatim from `items`, which
     itself only ever carries already-stored extraction/screening fields
-    (see cli.py's _digest_item_from_row).
+    (see cli.py's _digest_item_from_row). Stage 9 appends concise reply
+    instructions after the existing investment content, unchanged above
+    this point.
     """
     separator = "\n\n" + ("-" * 40) + "\n\n"
-    return separator.join(_format_item(item) for item in items)
+    body = separator.join(_format_item(item) for item in items)
+    return body + "\n\n" + _render_reply_instructions(items)
 
 
 def digest_idempotency_key(date_str: str, source_ids: List[int]) -> str:
