@@ -442,6 +442,44 @@ def test_zero_reasons_concerns_questions_does_not_crash(tmp_path, capsys):
     assert "Questions:" in output
 
 
+# --- Stage 10: review reference display -----------------------------------------
+
+
+def test_review_ref_is_displayed_and_matches_screening_id(tmp_path, capsys):
+    from ideascout import screen_review
+
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    source_id = make_screened_source(conn, external_id="1", created_at="2026-01-01T00:00:00+00:00", ticker="ABC")
+    screening_id = conn.execute(
+        "SELECT screening_id FROM source_screenings WHERE source_id = ?", (source_id,)
+    ).fetchone()["screening_id"]
+    conn.close()
+
+    exit_code = cli.cmd_show_source_screenings(config, limit=10)
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert f"Review ref: {screen_review.format_review_ref(screening_id)}" in output
+    assert f"Review ref: SR-{screening_id}" in output
+
+
+def test_review_ref_stays_associated_with_the_correct_screening_among_several(tmp_path, capsys):
+    from ideascout import screen_review
+
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    make_screened_source(conn, external_id="1", created_at="2026-01-01T00:00:00+00:00", ticker="AAA")
+    make_screened_source(conn, external_id="2", created_at="2026-01-02T00:00:00+00:00", ticker="BBB")
+    rows = conn.execute("SELECT source_id, screening_id FROM source_screenings ORDER BY screening_id").fetchall()
+    conn.close()
+
+    cli.cmd_show_source_screenings(config, limit=10)
+    output = capsys.readouterr().out
+
+    for row in rows:
+        assert screen_review.format_review_ref(row["screening_id"]) in output
+
+
 # --- read-only guarantees -------------------------------------------------------
 
 

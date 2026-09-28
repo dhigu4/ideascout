@@ -166,18 +166,24 @@ _VERDICT_CANONICAL = {
 }
 # Longer phrases ("strong like") must be tried before their shorter
 # substrings ("like") -- the alternation order below is deliberate.
-_VERDICT_WORDS = r"strong\s+like|strong\s+pass|like|maybe|pass"
+# Public (used by ideascout/screen_review.py too, Stage 10, so both
+# deterministic email parsers agree on exactly one verdict vocabulary).
+VERDICT_WORDS = r"strong\s+like|strong\s+pass|like|maybe|pass"
 
-_BARE_VERDICT_LINE_PATTERN = re.compile(rf"^\s*({_VERDICT_WORDS})\s*[.:!]?\s*$", re.IGNORECASE)
+_BARE_VERDICT_LINE_PATTERN = re.compile(rf"^\s*({VERDICT_WORDS})\s*[.:!]?\s*$", re.IGNORECASE)
 _LABELED_VERDICT_LINE_PATTERN = re.compile(
-    rf"^\s*(?P<label>.+?)\s*(?:--?|—|:)\s*(?P<verdict>{_VERDICT_WORDS})\s*[.:!]?\s*$", re.IGNORECASE
+    rf"^\s*(?P<label>.+?)\s*(?:--?|—|:)\s*(?P<verdict>{VERDICT_WORDS})\s*[.:!]?\s*$", re.IGNORECASE
 )
 
 _LEADING_DOLLAR_PATTERN = re.compile(r"^\$")
 _COMPANY_PUNCTUATION_PATTERN = re.compile(r"[^\w\s]")
 
 
-def _canonical_verdict(text: str) -> str | None:
+def canonical_verdict(text: str) -> str | None:
+    """Public (Stage 10: ideascout/screen_review.py reuses this so both
+    deterministic parsers canonicalize STRONG LIKE/LIKE/MAYBE/PASS/STRONG
+    PASS identically, case/punctuation-insensitively).
+    """
     normalized = re.sub(r"\s+", " ", text.strip().lower())
     return _VERDICT_CANONICAL.get(normalized)
 
@@ -274,14 +280,14 @@ def _parse_single_item_reply(
 
     bare_match = _BARE_VERDICT_LINE_PATTERN.match(first_line)
     if bare_match:
-        verdict = _canonical_verdict(bare_match.group(1))
+        verdict = canonical_verdict(bare_match.group(1))
         comment = "\n".join(lines[first_line_index + 1 :]).strip()
         return ParsedReplyBlock(item=delivery_item, verdict=verdict, comment=comment), None
 
     labeled_match = _LABELED_VERDICT_LINE_PATTERN.match(first_line)
     if labeled_match:
         label = labeled_match.group("label").strip()
-        verdict = _canonical_verdict(labeled_match.group("verdict"))
+        verdict = canonical_verdict(labeled_match.group("verdict"))
         resolved_item, resolution_error = _resolve_delivery_item(label, [delivery_item])
         if resolved_item is None:
             return None, f"labeled header {label!r} did not match the single delivered idea ({resolution_error})"
@@ -310,7 +316,7 @@ def _parse_multi_item_reply(
     errors: list[str] = []
     for idx, (line_index, match) in enumerate(zip(header_indices, header_matches)):
         label = match.group("label").strip()
-        verdict = _canonical_verdict(match.group("verdict"))
+        verdict = canonical_verdict(match.group("verdict"))
         resolved_item, resolution_error = _resolve_delivery_item(label, delivery_items)
         if resolved_item is None:
             errors.append(f"header {label!r} could not be unambiguously resolved ({resolution_error})")

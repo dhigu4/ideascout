@@ -23,6 +23,7 @@ from . import (
     idea_extraction,
     notifier,
     parser,
+    screen_review,
     shadow,
     source_isolation,
     structured_llm,
@@ -290,6 +291,68 @@ def cmd_parse_mail(config: Config) -> int:
 
         db.record_parse_attempt(conn, message_id, utcnow_iso())
 
+        # Stage 10: an "IdeaScout Screen Review" email is NEVER handed to
+        # the LLM-based direct-feedback parser below, for the same reason
+        # a digest reply isn't -- Brad has already seen IdeaScout's own
+        # past screen result for the exact screening he's judging, so it
+        # can never be a clean holdout judgment (see screen_review.py's
+        # module docstring). Detection is subject-only (a screen review
+        # isn't tied to any single digest delivery/thread the way a
+        # digest reply is), checked before the digest-reply/thread check
+        # below since the two subject shapes never overlap in practice.
+        if screen_review.looks_like_screen_review_subject(row["subject"]):
+            parse_result = screen_review.parse_screen_review(conn, row["body_raw"])
+
+            if not parse_result.ok:
+                message_text = (
+                    f"Screen-review parse failed for message_id={message_id}: {parse_result.reason}"
+                )
+                logger.warning(message_text)
+                db.set_feedback_parse_status(
+                    conn,
+                    message_id,
+                    "NEEDS_REVIEW",
+                    error=f"SCREEN_REVIEW_PARSE_FAILED: {parse_result.reason}",
+                )
+                needs_review += 1
+                continue
+
+            try:
+                db.insert_feedback_events(
+                    conn,
+                    message_id=message_id,
+                    events=[
+                        {
+                            "event_type": "FEEDBACK",
+                            "verdict": block.verdict,
+                            "ticker": block.screening_row["ticker"],
+                            "company": block.screening_row["company"],
+                            "novelty": None,
+                            "user_comment": block.comment,
+                            "parsed_json": "{}",
+                            "parser_version": screen_review.PARSER_VERSION,
+                            "model_name": screen_review.MODEL_NAME,
+                            "confidence": None,
+                            "created_at": utcnow_iso(),
+                            "feedback_origin": "SCREEN_REVIEW",
+                            "holdout_eligible": False,
+                            "source_id": block.screening_row["source_id"],
+                            "screening_id": block.screening_row["screening_id"],
+                        }
+                        for block in parse_result.blocks
+                    ],
+                )
+            except Exception as exc:
+                message_text = f"Failed to save screen-review feedback for message_id={message_id}: {exc}"
+                logger.exception(message_text)
+                db.set_meta(conn, "last_error", f"{utcnow_iso()} {message_text}")
+                errors += 1
+                continue
+
+            db.set_feedback_parse_status(conn, message_id, "PARSED")
+            parsed += 1
+            continue
+
         # Stage 9: a reply to a send-digest email is NEVER handed to the
         # LLM-based direct-feedback parser below -- it is a fundamentally
         # different case (Brad has already seen IdeaScout's own screen
@@ -498,18 +561,25 @@ def cmd_show_feedback(config: Config, limit: int = 10) -> int:
             f"{verdict} | confidence={confidence_text}{excluded_marker}"
         )
         print(f'    "{comment}"')
-        # Stage 9: DIGEST_REPLY feedback is learning-eligible but never a
-        # clean holdout judgment (Brad already saw IdeaScout's screen
-        # result before replying) -- always shown explicitly so this is
-        # never mistaken for a blind DIRECT judgment.
-        if row["feedback_origin"] == "DIGEST_REPLY":
+        # Stage 9/10: DIGEST_REPLY and SCREEN_REVIEW feedback are both
+        # learning-eligible but never a clean holdout judgment (Brad
+        # already saw IdeaScout's screen result before responding) --
+        # always shown explicitly so neither is ever mistaken for a blind
+        # DIRECT judgment.
+        if row["feedback_origin"] in ("DIGEST_REPLY", "SCREEN_REVIEW"):
             source_label = row["origin_source_name"] or "unknown"
             if row["ticker"]:
                 source_label = f"{source_label}/{row['ticker']}"
             print(
-                f"    Origin: DIGEST_REPLY | Holdout eligible: "
+                f"    Origin: {row['feedback_origin']} | Holdout eligible: "
                 f"{'YES' if row['holdout_eligible'] else 'NO'} | Source: {source_label}"
             )
+            if row["feedback_origin"] == "SCREEN_REVIEW":
+                print(
+                    f"    Reviewed screen: Taste v{row['reviewed_taste_version']} / "
+                    f"{row['reviewed_overall_prediction']} | "
+                    f"Review ref: {screen_review.format_review_ref(row['screening_id'])}"
+                )
 
     return 0
 
@@ -1140,6 +1210,7 @@ def cmd_taste_status(config: Config) -> int:
 
     holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
     digest_reply_count = db.count_feedback_by_origin(conn, "DIGEST_REPLY")
+    screen_review_count = db.count_feedback_by_origin(conn, "SCREEN_REVIEW")
     conn.close()
 
     frozen = len(holdout) < taste.HOLDOUT_SIZE
@@ -1152,6 +1223,9 @@ def cmd_taste_status(config: Config) -> int:
         # Stage 9: learning-eligible but NEVER counted in "Holdout
         # judgments collected" above -- see db.get_eligible_feedback_after.
         print(f"Digest-reply feedback records: {digest_reply_count}")
+    if screen_review_count:
+        # Stage 10: same structural exclusion, informational only.
+        print(f"Screen-review feedback records: {screen_review_count}")
 
     # Fail loudly rather than silently trusting a file that may have been
     # edited, truncated, or lost since this version was activated. This
@@ -2365,6 +2439,7 @@ def cmd_show_source_screenings(config: Config, *, limit: int, all_versions: bool
         critical_questions = json.loads(row["critical_questions_json"])[:2]
 
         print(f"{_source_screening_label(row)} | {row['overall_prediction']}")
+        print(f"Review ref: {screen_review.format_review_ref(row['screening_id'])}")
         print(
             f"Mispricing: {row['mispricing']} | Variant: {row['variant_perception']} | "
             f"Upside: {row['upside']}"

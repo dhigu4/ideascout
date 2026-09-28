@@ -576,6 +576,35 @@ MIGRATIONS: list[str] = [
     ALTER TABLE feedback ADD COLUMN source_id INTEGER REFERENCES collected_sources(source_id);
     ALTER TABLE feedback ADD COLUMN digest_delivery_id INTEGER REFERENCES digest_deliveries(delivery_id);
     """,
+    # Migration 13 (Stage 10): SCREEN_REVIEW feedback provenance.
+    #
+    # Brad can now email deterministic feedback on a specific PAST
+    # screening result (subject "IdeaScout Screen Review", see
+    # ideascout/screen_review.py), referencing it by a short human-typeable
+    # "SR-<screening_id>" reference. source_screenings.screening_id is
+    # already the existing, durable, natural unique key for "one exact
+    # screening result" (an INTEGER PRIMARY KEY AUTOINCREMENT, further
+    # constrained UNIQUE(source_id, taste_version, screen_rules_sha256) --
+    # see Migration -1/the original schema) -- reused as-is rather than
+    # inventing a second identity system. The one thing that table cannot
+    # answer on its own is "which of its rows, if any, has Brad already
+    # given SCREEN_REVIEW feedback on", so this migration adds exactly one
+    # additive, nullable column to link a feedback row back to the EXACT
+    # screening it judges, without copying any of that screening's model
+    # text (prediction/reasons/concerns/etc.) into feedback.user_comment --
+    # the link IS the provenance; the screening row itself remains the
+    # single source of truth for what IdeaScout said. NULL for every
+    # existing DIRECT/DIGEST_REPLY row and for all future rows on those two
+    # paths; populated only by the SCREEN_REVIEW path, which (per Migration
+    # 12's precedent) always pairs it with feedback_origin='SCREEN_REVIEW'
+    # and holdout_eligible=0 so it is learning-eligible but structurally
+    # excluded from db.get_eligible_feedback_after's clean-holdout pool,
+    # exactly like a digest reply.
+    """
+    ALTER TABLE feedback ADD COLUMN screening_id INTEGER REFERENCES source_screenings(screening_id);
+
+    CREATE INDEX idx_feedback_screening_id ON feedback(screening_id);
+    """,
 ]
 
 
@@ -1114,6 +1143,7 @@ def insert_feedback(
     holdout_eligible: bool = True,
     source_id: int | None = None,
     digest_delivery_id: int | None = None,
+    screening_id: int | None = None,
 ) -> bool:
     """Insert one feedback event. Returns True if a new row was written.
 
@@ -1126,7 +1156,10 @@ def insert_feedback(
 
     feedback_origin/holdout_eligible/source_id/digest_delivery_id (Stage
     9) default to exactly today's DIRECT-feedback shape; cli.py's
-    digest-reply path passes them explicitly.
+    digest-reply path passes them explicitly. screening_id (Stage 10) is
+    the exact source_screenings row a SCREEN_REVIEW judgment refers to --
+    cli.py's screen-review path passes it explicitly; every other path
+    leaves it None.
 
     For inserting *all* of one message's events together, prefer
     insert_feedback_events below -- it commits them as a single
@@ -1138,12 +1171,12 @@ def insert_feedback(
             message_id, event_index, event_type, verdict, ticker, company,
             novelty, user_comment, parsed_json, parser_version, model_name,
             confidence, created_at, feedback_origin, holdout_eligible,
-            source_id, digest_delivery_id
+            source_id, digest_delivery_id, screening_id
         ) VALUES (
             :message_id, :event_index, :event_type, :verdict, :ticker, :company,
             :novelty, :user_comment, :parsed_json, :parser_version, :model_name,
             :confidence, :created_at, :feedback_origin, :holdout_eligible,
-            :source_id, :digest_delivery_id
+            :source_id, :digest_delivery_id, :screening_id
         )
         """,
         {
@@ -1164,6 +1197,7 @@ def insert_feedback(
             "holdout_eligible": 1 if holdout_eligible else 0,
             "source_id": source_id,
             "digest_delivery_id": digest_delivery_id,
+            "screening_id": screening_id,
         },
     )
     conn.commit()
@@ -1211,6 +1245,11 @@ def insert_feedback_events(
     None) -- the existing LLM-based direct-feedback call site in cli.py
     never needs to know these fields exist. cli.py's digest-reply path
     explicitly supplies all four.
+
+    Stage 10: an event dict MAY additionally supply screening_id (the
+    exact source_screenings row a SCREEN_REVIEW judgment refers to);
+    omitted defaults to None. cli.py's screen-review path supplies it
+    alongside feedback_origin='SCREEN_REVIEW'/holdout_eligible=False.
     """
     with conn:
         for index, event in enumerate(events):
@@ -1220,12 +1259,14 @@ def insert_feedback_events(
                     message_id, event_index, event_type, verdict, ticker,
                     company, novelty, user_comment, parsed_json,
                     parser_version, model_name, confidence, created_at,
-                    feedback_origin, holdout_eligible, source_id, digest_delivery_id
+                    feedback_origin, holdout_eligible, source_id, digest_delivery_id,
+                    screening_id
                 ) VALUES (
                     :message_id, :event_index, :event_type, :verdict, :ticker,
                     :company, :novelty, :user_comment, :parsed_json,
                     :parser_version, :model_name, :confidence, :created_at,
-                    :feedback_origin, :holdout_eligible, :source_id, :digest_delivery_id
+                    :feedback_origin, :holdout_eligible, :source_id, :digest_delivery_id,
+                    :screening_id
                 )
                 """,
                 {
@@ -1236,6 +1277,7 @@ def insert_feedback_events(
                     "holdout_eligible": 1 if event.get("holdout_eligible", True) else 0,
                     "source_id": event.get("source_id"),
                     "digest_delivery_id": event.get("digest_delivery_id"),
+                    "screening_id": event.get("screening_id"),
                 },
             )
 
@@ -1304,11 +1346,15 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
             feedback.user_comment, feedback.confidence, feedback.created_at,
             feedback.excluded_from_learning,
             feedback.feedback_origin, feedback.holdout_eligible, feedback.source_id,
+            feedback.screening_id,
             collected_sources.source_name AS origin_source_name,
+            source_screenings.taste_version AS reviewed_taste_version,
+            source_screenings.overall_prediction AS reviewed_overall_prediction,
             messages_raw.received_at, messages_raw.sender, messages_raw.subject
         FROM feedback
         JOIN messages_raw ON messages_raw.message_id = feedback.message_id
         LEFT JOIN collected_sources ON collected_sources.source_id = feedback.source_id
+        LEFT JOIN source_screenings ON source_screenings.screening_id = feedback.screening_id
         ORDER BY feedback.feedback_id DESC
         LIMIT ?
         """,
@@ -2175,6 +2221,47 @@ def get_latest_source_screening_for_source(conn: sqlite3.Connection, source_id: 
     return conn.execute(
         "SELECT * FROM source_screenings WHERE source_id = ? ORDER BY screening_id DESC LIMIT 1",
         (source_id,),
+    ).fetchone()
+
+
+def get_source_screening_by_id(conn: sqlite3.Connection, screening_id: int) -> sqlite3.Row | None:
+    """The EXACT screening a SCREEN_REVIEW review reference ("SR-<id>")
+    resolves to (see ideascout/screen_review.py) -- a direct primary-key
+    lookup, joined to its collected_sources row so callers get ticker/
+    company/source_name/canonical_url without a second query. Returns
+    None for an unknown screening_id; screen_review.py treats that as an
+    unresolvable review ref and fails the whole message closed rather
+    than guess.
+    """
+    return conn.execute(
+        """
+        SELECT ss.*, cs.ticker, cs.company, cs.source_name, cs.canonical_url, cs.external_id
+        FROM source_screenings ss
+        JOIN collected_sources cs ON cs.source_id = ss.source_id
+        WHERE ss.screening_id = ?
+        """,
+        (screening_id,),
+    ).fetchone()
+
+
+def get_learning_eligible_screen_review_feedback_for_screening(
+    conn: sqlite3.Connection, screening_id: int
+) -> sqlite3.Row | None:
+    """Is there already a learning-eligible SCREEN_REVIEW judgment for this
+    EXACT screening? Used to fail a second, independent review of the same
+    screening closed (DUPLICATE_SCREEN_REVIEW) rather than silently
+    accumulate repeated judgments -- see ideascout/screen_review.py.
+    Deliberately does NOT match a row Brad has since excluded via
+    exclude-feedback (excluded_from_learning = 1): an explicit exclusion
+    signals "don't use this one," not "no review was ever given," so a
+    fresh review is allowed again afterward.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM feedback
+        WHERE feedback_origin = 'SCREEN_REVIEW' AND screening_id = ? AND excluded_from_learning = 0
+        """,
+        (screening_id,),
     ).fetchone()
 
 
