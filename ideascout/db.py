@@ -605,6 +605,71 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX idx_feedback_screening_id ON feedback(screening_id);
     """,
+    # Migration 14 (Stage 11): BLIND_REVIEW / clean-holdout provenance.
+    #
+    # Brad can now be assigned specific EXTRACTED sources to judge BLIND --
+    # before ever seeing Taste v2's prediction/reasons/concerns for them
+    # (subject "IdeaScout Blind Review", see cli.py's cmd_blind_review and
+    # ideascout/blind_review.py) -- to collect the genuinely clean forward
+    # holdout judgments the current frozen Taste version needs. This is the
+    # OPPOSITE structural case from Migrations 12/13: a BLIND_REVIEW
+    # judgment IS a clean holdout judgment (feedback_origin='BLIND_REVIEW',
+    # holdout_eligible=1), so it counts toward db.get_eligible_feedback_
+    # after exactly like a DIRECT judgment.
+    #
+    # blind_review_assignments is the durable exposure record: the ONE
+    # thing that makes "once shown, never treated as unseen again"
+    # structural rather than a manual convention. UNIQUE(source_id) means
+    # a given source (exact content version) can only ever be assigned
+    # once, full stop -- whether or not it was ever judged -- so a rerun of
+    # `blind-review` can never silently substitute a different, "fresher"
+    # exposure for one Brad has already been shown. judged_at is set (in
+    # the SAME transaction as the feedback insert -- see
+    # insert_feedback_events) only once a learning-eligible BLIND_REVIEW
+    # feedback row exists for it; merely displaying an assignment never
+    # judges it. taste_version_at_assignment is PURE PROVENANCE/AUDIT --
+    # recorded once at assignment time and never read by any selection,
+    # eligibility, or display logic (selection must be model-score-
+    # independent; see cli.py's cmd_blind_review docstring).
+    #
+    # feedback.blind_review_assignment_id links a feedback row back to the
+    # EXACT assignment it judges (mirroring Migration 13's screening_id),
+    # so blind-review-results can reveal Brad's verdict next to Taste v2's
+    # prediction only for that assignment's exact source/source-version --
+    # never a ticker-based guess.
+    #
+    # taste_versions.build_unlocked (added here, not a separate migration,
+    # because this migration had not yet reached production when the gap
+    # below was found): HOLDOUT COMPLETE (20/20 eligible judgments
+    # collected) and TASTE BUILD UNLOCKED are deliberately two different
+    # conditions, not one. Reaching 20/20 on its own must never be enough
+    # to let build-taste regenerate a new version -- Taste v2 stays
+    # protected until Brad has actually evaluated the completed holdout
+    # and explicitly authorized moving past it. build_unlocked defaults to
+    # 0 for every version (including brand-new ones insert_taste_version
+    # creates); there is deliberately no command yet that ever sets it to
+    # 1 -- that belongs to a future holdout-evaluation workflow. Until such
+    # a workflow exists, a version whose holdout completes simply stays
+    # frozen indefinitely, which is the intended fail-safe default.
+    """
+    CREATE TABLE blind_review_assignments (
+        assignment_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id                     INTEGER NOT NULL REFERENCES collected_sources(source_id),
+        assigned_at                   TEXT NOT NULL,
+        taste_version_at_assignment   INTEGER,
+        judged_at                     TEXT,
+
+        UNIQUE(source_id)
+    );
+
+    CREATE INDEX idx_blind_review_assignments_judged_at ON blind_review_assignments(judged_at);
+
+    ALTER TABLE feedback ADD COLUMN blind_review_assignment_id INTEGER REFERENCES blind_review_assignments(assignment_id);
+
+    CREATE INDEX idx_feedback_blind_review_assignment_id ON feedback(blind_review_assignment_id);
+
+    ALTER TABLE taste_versions ADD COLUMN build_unlocked INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 
 
@@ -1144,6 +1209,7 @@ def insert_feedback(
     source_id: int | None = None,
     digest_delivery_id: int | None = None,
     screening_id: int | None = None,
+    blind_review_assignment_id: int | None = None,
 ) -> bool:
     """Insert one feedback event. Returns True if a new row was written.
 
@@ -1159,7 +1225,11 @@ def insert_feedback(
     digest-reply path passes them explicitly. screening_id (Stage 10) is
     the exact source_screenings row a SCREEN_REVIEW judgment refers to --
     cli.py's screen-review path passes it explicitly; every other path
-    leaves it None.
+    leaves it None. blind_review_assignment_id (Stage 11) is the exact
+    blind_review_assignments row a BLIND_REVIEW judgment refers to --
+    cli.py's blind-review path passes it explicitly, alongside
+    holdout_eligible=True (unlike DIGEST_REPLY/SCREEN_REVIEW, a blind
+    review IS a clean holdout judgment).
 
     For inserting *all* of one message's events together, prefer
     insert_feedback_events below -- it commits them as a single
@@ -1171,12 +1241,12 @@ def insert_feedback(
             message_id, event_index, event_type, verdict, ticker, company,
             novelty, user_comment, parsed_json, parser_version, model_name,
             confidence, created_at, feedback_origin, holdout_eligible,
-            source_id, digest_delivery_id, screening_id
+            source_id, digest_delivery_id, screening_id, blind_review_assignment_id
         ) VALUES (
             :message_id, :event_index, :event_type, :verdict, :ticker, :company,
             :novelty, :user_comment, :parsed_json, :parser_version, :model_name,
             :confidence, :created_at, :feedback_origin, :holdout_eligible,
-            :source_id, :digest_delivery_id, :screening_id
+            :source_id, :digest_delivery_id, :screening_id, :blind_review_assignment_id
         )
         """,
         {
@@ -1198,6 +1268,7 @@ def insert_feedback(
             "source_id": source_id,
             "digest_delivery_id": digest_delivery_id,
             "screening_id": screening_id,
+            "blind_review_assignment_id": blind_review_assignment_id,
         },
     )
     conn.commit()
@@ -1250,6 +1321,19 @@ def insert_feedback_events(
     exact source_screenings row a SCREEN_REVIEW judgment refers to);
     omitted defaults to None. cli.py's screen-review path supplies it
     alongside feedback_origin='SCREEN_REVIEW'/holdout_eligible=False.
+
+    Stage 11: an event dict MAY additionally supply blind_review_
+    assignment_id (the exact blind_review_assignments row a BLIND_REVIEW
+    judgment refers to); omitted defaults to None. cli.py's blind-review
+    path supplies it alongside feedback_origin='BLIND_REVIEW'/
+    holdout_eligible=True -- unlike DIGEST_REPLY/SCREEN_REVIEW, this one
+    IS meant to count toward the clean holdout. When present, the
+    corresponding blind_review_assignments row is marked judged (judged_at
+    = this event's created_at) IN THE SAME transaction as the feedback
+    insert -- never as a separate follow-up call -- so a message can never
+    end up with a committed BLIND_REVIEW feedback row whose assignment is
+    still (incorrectly) shown as unjudged, which would risk re-displaying
+    an idea Brad has already given a clean judgment on.
     """
     with conn:
         for index, event in enumerate(events):
@@ -1260,13 +1344,13 @@ def insert_feedback_events(
                     company, novelty, user_comment, parsed_json,
                     parser_version, model_name, confidence, created_at,
                     feedback_origin, holdout_eligible, source_id, digest_delivery_id,
-                    screening_id
+                    screening_id, blind_review_assignment_id
                 ) VALUES (
                     :message_id, :event_index, :event_type, :verdict, :ticker,
                     :company, :novelty, :user_comment, :parsed_json,
                     :parser_version, :model_name, :confidence, :created_at,
                     :feedback_origin, :holdout_eligible, :source_id, :digest_delivery_id,
-                    :screening_id
+                    :screening_id, :blind_review_assignment_id
                 )
                 """,
                 {
@@ -1278,8 +1362,15 @@ def insert_feedback_events(
                     "source_id": event.get("source_id"),
                     "digest_delivery_id": event.get("digest_delivery_id"),
                     "screening_id": event.get("screening_id"),
+                    "blind_review_assignment_id": event.get("blind_review_assignment_id"),
                 },
             )
+            blind_review_assignment_id = event.get("blind_review_assignment_id")
+            if blind_review_assignment_id is not None:
+                conn.execute(
+                    "UPDATE blind_review_assignments SET judged_at = ? WHERE assignment_id = ?",
+                    (event["created_at"], blind_review_assignment_id),
+                )
 
 
 def count_feedback_pending_messages(conn: sqlite3.Connection) -> int:
@@ -1346,7 +1437,7 @@ def get_latest_feedback(conn: sqlite3.Connection, limit: int = 10) -> list[sqlit
             feedback.user_comment, feedback.confidence, feedback.created_at,
             feedback.excluded_from_learning,
             feedback.feedback_origin, feedback.holdout_eligible, feedback.source_id,
-            feedback.screening_id,
+            feedback.screening_id, feedback.blind_review_assignment_id,
             collected_sources.source_name AS origin_source_name,
             source_screenings.taste_version AS reviewed_taste_version,
             source_screenings.overall_prediction AS reviewed_overall_prediction,
@@ -2263,6 +2354,183 @@ def get_learning_eligible_screen_review_feedback_for_screening(
         """,
         (screening_id,),
     ).fetchone()
+
+
+# --- Stage 11: BLIND_REVIEW / clean-holdout collection ------------------------
+#
+# EXTRACTION_FIELDS lists the compact-idea-extraction columns that are
+# SAFE to show before Brad judges a blind-review assignment (see
+# idea_extraction.py -- these are a neutral, factual summary of the
+# SOURCE text only, produced without ever seeing Taste or a screening
+# result). Every column here is deliberately from collected_sources'
+# Level-1 extraction fields, never from source_screenings.
+_BLIND_REVIEW_SAFE_EXTRACTION_FIELDS = (
+    "cs.ticker, cs.company, cs.source_name, cs.canonical_url, cs.external_id, "
+    "cs.source_title, cs.source_date, cs.discovered_at, cs.business_summary, "
+    "cs.core_thesis, cs.why_mispriced, cs.future_earnings_change, cs.upside_case, "
+    "cs.downside_or_key_risks, cs.catalysts, cs.what_must_be_true, "
+    "cs.evidence_of_market_misunderstanding, cs.known_unknowns"
+)
+
+
+def get_blind_review_candidate_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The deterministic, model-score-INDEPENDENT blind-review candidate
+    pool (see cli.py's cmd_blind_review, which applies the remaining
+    ticker/company already-judged and test/smoke filters on top of this).
+
+    Deliberately NEVER joins or filters on source_screenings at all --
+    selection order is purely (discovered_at, source_id), which cannot be
+    influenced by a screening's prediction/confidence/reasons/concerns
+    even if one already exists for the source (see the test proving a
+    PASS->INVESTIGATE_NOW prediction change never affects this query's
+    output). A source_screenings row may exist in the database for a
+    candidate returned here; this query simply never looks at it.
+
+    Excludes, at the SQL level: not-yet-extracted sources; every version
+    of a (source_name, external_id) except the single latest one (a
+    "superseded version" is never a candidate even if some older version
+    of the same document was); any source ever shown in a production
+    digest (digest_shown_sources); any source ever blind-review-assigned
+    before, judged or not (blind_review_assignments -- this is what makes
+    "once shown, never unseen again" structural); and any source whose
+    screening(s) already received a learning-eligible SCREEN_REVIEW
+    judgment (an exact source_id-level check, independent of and in
+    addition to the ticker/company-level already-judged check the caller
+    applies).
+    """
+    return conn.execute(
+        f"""
+        SELECT cs.*
+        FROM collected_sources cs
+        WHERE cs.extraction_status = 'EXTRACTED'
+          AND cs.source_id = (
+              SELECT cs2.source_id FROM collected_sources cs2
+              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+              ORDER BY cs2.discovered_at DESC, cs2.source_id DESC
+              LIMIT 1
+          )
+          AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
+          AND cs.source_id NOT IN (SELECT source_id FROM blind_review_assignments)
+          AND cs.source_id NOT IN (
+              SELECT ss.source_id FROM source_screenings ss
+              JOIN feedback f ON f.screening_id = ss.screening_id
+              WHERE f.feedback_origin = 'SCREEN_REVIEW' AND f.excluded_from_learning = 0
+          )
+        ORDER BY cs.discovered_at ASC, cs.source_id ASC
+        """
+    ).fetchall()
+
+
+def record_blind_review_assignment(
+    conn: sqlite3.Connection, *, source_id: int, assigned_at: str, taste_version_at_assignment: int | None
+) -> int:
+    """Durably records that `source_id` has now been shown to Brad for
+    blind review -- UNIQUE(source_id) means calling this twice for the
+    same source_id raises rather than silently creating a second exposure
+    (cmd_blind_review never calls this for a source already returned by
+    get_blind_review_candidate_sources or already in
+    get_unjudged_blind_review_assignments, so this should never happen in
+    practice, but the constraint is the actual structural guarantee, not
+    that call discipline).
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO blind_review_assignments (source_id, assigned_at, taste_version_at_assignment)
+        VALUES (?, ?, ?)
+        """,
+        (source_id, assigned_at, taste_version_at_assignment),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_unjudged_blind_review_assignments(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Previously-assigned blind-review items Brad has not yet judged,
+    oldest-assigned first, joined to the same safe extraction fields
+    get_blind_review_candidate_sources exposes -- never source_screenings.
+    cmd_blind_review shows these again (reusing their existing BR ref)
+    before ever assigning anything new, which is what makes a rerun unable
+    to give an already-shown item a "fresh unseen" status.
+    """
+    return conn.execute(
+        f"""
+        SELECT bra.*, {_BLIND_REVIEW_SAFE_EXTRACTION_FIELDS}
+        FROM blind_review_assignments bra
+        JOIN collected_sources cs ON cs.source_id = bra.source_id
+        WHERE bra.judged_at IS NULL
+        ORDER BY bra.assignment_id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def get_blind_review_assignment_by_id(conn: sqlite3.Connection, assignment_id: int) -> sqlite3.Row | None:
+    """The EXACT assignment a "BR-<id>" review reference resolves to (see
+    ideascout/blind_review.py) -- joined to the same safe extraction
+    fields, never source_screenings. Returns None for an unknown
+    assignment_id; blind_review.py treats that as an unresolvable review
+    ref and fails the whole message closed rather than guess.
+    """
+    return conn.execute(
+        f"""
+        SELECT bra.*, {_BLIND_REVIEW_SAFE_EXTRACTION_FIELDS}
+        FROM blind_review_assignments bra
+        JOIN collected_sources cs ON cs.source_id = bra.source_id
+        WHERE bra.assignment_id = ?
+        """,
+        (assignment_id,),
+    ).fetchone()
+
+
+def get_learning_eligible_blind_review_feedback_for_assignment(
+    conn: sqlite3.Connection, assignment_id: int
+) -> sqlite3.Row | None:
+    """Is there already a learning-eligible BLIND_REVIEW judgment for this
+    EXACT assignment? Used to fail a second, independent judgment of the
+    same assignment closed (DUPLICATE_BLIND_REVIEW) -- see
+    ideascout/blind_review.py. Mirrors get_learning_eligible_screen_
+    review_feedback_for_screening's exclude-then-allow-a-fresh-review
+    semantics: a row Brad has since excluded via exclude-feedback does not
+    count as "already judged."
+    """
+    return conn.execute(
+        """
+        SELECT * FROM feedback
+        WHERE feedback_origin = 'BLIND_REVIEW' AND blind_review_assignment_id = ? AND excluded_from_learning = 0
+        """,
+        (assignment_id,),
+    ).fetchone()
+
+
+def count_unjudged_blind_review_assignments(conn: sqlite3.Connection) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM blind_review_assignments WHERE judged_at IS NULL"
+    ).fetchone()[0]
+
+
+def get_judged_blind_review_assignments(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Already-judged blind-review items only, newest-judged first, joined
+    to Brad's own feedback row -- used by blind-review-results, which
+    must NEVER show an unjudged assignment (judged_at IS NOT NULL is the
+    only gate). Callers additionally fetch source_screenings themselves
+    (via db.get_latest_source_screening_for_source) to reveal v2's
+    prediction now that Brad has already judged -- this function itself
+    still never touches source_screenings.
+    """
+    return conn.execute(
+        f"""
+        SELECT bra.*, {_BLIND_REVIEW_SAFE_EXTRACTION_FIELDS},
+               f.feedback_id, f.verdict AS brad_verdict, f.user_comment AS brad_comment
+        FROM blind_review_assignments bra
+        JOIN collected_sources cs ON cs.source_id = bra.source_id
+        JOIN feedback f ON f.blind_review_assignment_id = bra.assignment_id
+        WHERE bra.judged_at IS NOT NULL
+        ORDER BY bra.judged_at DESC, bra.assignment_id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
 
 
 def get_extracted_sources_missing_screening(

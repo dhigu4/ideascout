@@ -120,6 +120,23 @@ def make_rule(i: int, confidence: str = "HIGH") -> taste.CandidateRule:
     return taste.CandidateRule(rule=f"Rule {i}", evidence=f"Evidence {i}", reusability=f"Reuse {i}", confidence=confidence)
 
 
+def unlock_latest_taste_version(conn) -> None:
+    """Simulates what a future holdout-evaluation/unlock workflow will do
+    (no such command exists yet -- see db.py's Migration 14 comment and
+    cmd_build_taste's freeze check): directly flips build_unlocked=1 for
+    whichever taste version is currently active. Tests use this only to
+    reach the "past the freeze gate" code paths they're actually testing
+    (a mid-generation failure, a DB-insert failure, an orphan-directory
+    check) -- reaching HOLDOUT_SIZE alone must never be enough on its own.
+    """
+    latest = db.get_latest_taste_version(conn)
+    conn.execute(
+        "UPDATE taste_versions SET build_unlocked = 1 WHERE version_number = ?",
+        (latest["version_number"],),
+    )
+    conn.commit()
+
+
 # --- canonical eligibility query ---------------------------------------------
 
 
@@ -525,7 +542,13 @@ def test_regeneration_blocked_while_holdout_below_20(tmp_path, monkeypatch, caps
     conn.close()
 
 
-def test_regeneration_allowed_once_holdout_reaches_20(tmp_path, monkeypatch):
+def test_regeneration_still_blocked_once_holdout_reaches_20(tmp_path, monkeypatch):
+    """HOLDOUT COMPLETE (20/20) is NOT the same condition as TASTE BUILD
+    UNLOCKED -- reaching 20/20 alone must never let build-taste regenerate
+    a new version. Taste stays protected until an explicit future
+    evaluation/unlock action (which does not exist yet) sets
+    taste_versions.build_unlocked -- see db.py's Migration 14 comment.
+    """
     config = make_config(tmp_path)
     conn = db.connect(config.database_path)
     insert_n_eligible(conn, 15)
@@ -540,12 +563,114 @@ def test_regeneration_allowed_once_holdout_reaches_20(tmp_path, monkeypatch):
     conn.close()
 
     exit_code = cli.cmd_build_taste(config)
+    assert exit_code == 1
+
+    conn = db.connect(config.database_path)
+    latest = db.get_latest_taste_version(conn)
+    conn.close()
+    assert latest["version_label"] == "v1"  # still v1 -- 20/20 alone never unlocks regeneration
+
+
+def test_regeneration_allowed_once_holdout_reaches_20_and_is_explicitly_unlocked(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_n_eligible(conn, 15)
+    conn.close()
+
+    patch_taste(monkeypatch)
+    cli.cmd_build_taste(config)
+
+    conn = db.connect(config.database_path)
+    for i in range(taste.HOLDOUT_SIZE):
+        make_parsed_message(conn, f"msg_holdout_{i}", ticker=f"H{i}")
+    unlock_latest_taste_version(conn)
+    conn.close()
+
+    exit_code = cli.cmd_build_taste(config)
     assert exit_code == 0
 
     conn = db.connect(config.database_path)
     latest = db.get_latest_taste_version(conn)
     conn.close()
     assert latest["version_label"] == "v2"
+
+
+# --- holdout-governance regression (holdout complete != build unlocked) --------
+
+
+def test_holdout_governance_19_of_20_incomplete_frozen_blocked(tmp_path, monkeypatch, capsys):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_n_eligible(conn, 15)
+    conn.close()
+    patch_taste(monkeypatch)
+    cli.cmd_build_taste(config)
+
+    conn = db.connect(config.database_path)
+    for i in range(taste.HOLDOUT_SIZE - 1):  # 19 -- one short
+        make_parsed_message(conn, f"msg_holdout_{i}", ticker=f"H{i}")
+    conn.close()
+
+    capsys.readouterr()
+    cli.cmd_taste_status(config)
+    output = capsys.readouterr().out
+    assert f"Holdout judgments collected: {taste.HOLDOUT_SIZE - 1} / {taste.HOLDOUT_SIZE}" in output
+    assert "Holdout complete: NO" in output
+    assert "Taste frozen: YES" in output
+    assert "Awaiting holdout evaluation" not in output  # not complete yet, so not "awaiting" anything
+
+    exit_code = cli.cmd_build_taste(config)
+    assert exit_code == 1
+
+    conn = db.connect(config.database_path)
+    assert db.get_latest_taste_version(conn)["version_label"] == "v1"
+    conn.close()
+
+
+def test_holdout_governance_20_of_20_complete_still_frozen_and_blocked(tmp_path, monkeypatch, capsys):
+    """The exact regression this fix targets: reaching 20/20 must NOT, on
+    its own, unfreeze Taste or permit regeneration. Also checks that
+    nothing about reaching 20/20 changes the active version, its training
+    count, generates any new taste-version artifacts on disk, or flips
+    build_unlocked.
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_n_eligible(conn, 15)
+    conn.close()
+    patch_taste(monkeypatch)
+    cli.cmd_build_taste(config)
+
+    conn = db.connect(config.database_path)
+    version_before = dict(db.get_latest_taste_version(conn))
+    conn.close()
+
+    conn = db.connect(config.database_path)
+    for i in range(taste.HOLDOUT_SIZE):
+        make_parsed_message(conn, f"msg_holdout_{i}", ticker=f"H{i}")
+    conn.close()
+
+    capsys.readouterr()
+    cli.cmd_taste_status(config)
+    output = capsys.readouterr().out
+    assert f"Holdout judgments collected: {taste.HOLDOUT_SIZE} / {taste.HOLDOUT_SIZE}" in output
+    assert "Holdout complete: YES" in output
+    assert "Taste frozen: YES" in output
+    assert "Awaiting holdout evaluation: YES" in output
+
+    # build-taste STILL refuses.
+    exit_code = cli.cmd_build_taste(config)
+    assert exit_code == 1
+
+    conn = db.connect(config.database_path)
+    version_after = dict(db.get_latest_taste_version(conn))
+    all_versions = conn.execute("SELECT version_label FROM taste_versions").fetchall()
+    conn.close()
+
+    # Version unchanged -- byte-for-byte, including build_unlocked itself.
+    assert version_after == version_before
+    assert [v["version_label"] for v in all_versions] == ["v1"]  # no v2 row ever created
+    assert not (tmp_path / "taste-versions" / "v2").exists()  # no v2 artifacts generated on disk
 
 
 # --- taste-status --------------------------------------------------------------
@@ -829,6 +954,7 @@ def test_failed_regeneration_never_overwrites_a_previously_valid_version(tmp_pat
     conn = db.connect(config.database_path)
     for i in range(taste.HOLDOUT_SIZE):
         make_parsed_message(conn, f"msg_holdout_{i}", ticker=f"H{i}")
+    unlock_latest_taste_version(conn)  # reach the generation-failure path this test is about
     conn.close()
 
     # Now attempt v2, but make candidate-rules generation fail completely.
@@ -966,9 +1092,10 @@ def test_db_insert_failure_preserves_previously_active_version_and_files(tmp_pat
     cli.cmd_build_taste(config)
 
     conn = db.connect(config.database_path)
-    original_row = dict(db.get_latest_taste_version(conn))
     for i in range(taste.HOLDOUT_SIZE):
         make_parsed_message(conn, f"msg_h_{i}", ticker=f"H{i}")
+    unlock_latest_taste_version(conn)  # reach the DB-insert-failure path this test is about
+    original_row = dict(db.get_latest_taste_version(conn))
     conn.close()
 
     original_canonical_idea_taste = (tmp_path / "idea-taste.md").read_text(encoding="utf-8")
@@ -1045,6 +1172,7 @@ def test_successful_build_creates_exactly_one_active_version_even_with_orphan_pr
     conn = db.connect(config.database_path)
     for i in range(taste.HOLDOUT_SIZE):
         make_parsed_message(conn, f"msg_h_{i}", ticker=f"H{i}")
+    unlock_latest_taste_version(conn)  # reach the orphan-directory scenario this test is about
     conn.close()
 
     exit_code = cli.cmd_build_taste(config)

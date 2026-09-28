@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import (
     agentmail_client,
+    blind_review,
     db,
     digest_reply,
     idea_extraction,
@@ -353,6 +354,67 @@ def cmd_parse_mail(config: Config) -> int:
             parsed += 1
             continue
 
+        # Stage 11: an "IdeaScout Blind Review" email is routed through its
+        # own deterministic, no-LLM parser too -- but UNLIKE digest-reply
+        # and screen-review, its feedback IS meant to be a clean holdout
+        # judgment (holdout_eligible=True below), since the whole point of
+        # blind-review is collecting genuinely blind forward judgments for
+        # Taste v2 (see blind_review.py's module docstring). Detection is
+        # subject-only, exactly like screen-review.
+        if blind_review.looks_like_blind_review_subject(row["subject"]):
+            parse_result = blind_review.parse_blind_review(conn, row["body_raw"])
+
+            if not parse_result.ok:
+                message_text = (
+                    f"Blind-review parse failed for message_id={message_id}: {parse_result.reason}"
+                )
+                logger.warning(message_text)
+                db.set_feedback_parse_status(
+                    conn,
+                    message_id,
+                    "NEEDS_REVIEW",
+                    error=f"BLIND_REVIEW_PARSE_FAILED: {parse_result.reason}",
+                )
+                needs_review += 1
+                continue
+
+            try:
+                judged_at = utcnow_iso()
+                db.insert_feedback_events(
+                    conn,
+                    message_id=message_id,
+                    events=[
+                        {
+                            "event_type": "FEEDBACK",
+                            "verdict": block.verdict,
+                            "ticker": block.assignment_row["ticker"],
+                            "company": block.assignment_row["company"],
+                            "novelty": None,
+                            "user_comment": block.comment,
+                            "parsed_json": "{}",
+                            "parser_version": blind_review.PARSER_VERSION,
+                            "model_name": blind_review.MODEL_NAME,
+                            "confidence": None,
+                            "created_at": judged_at,
+                            "feedback_origin": "BLIND_REVIEW",
+                            "holdout_eligible": True,
+                            "source_id": block.assignment_row["source_id"],
+                            "blind_review_assignment_id": block.assignment_row["assignment_id"],
+                        }
+                        for block in parse_result.blocks
+                    ],
+                )
+            except Exception as exc:
+                message_text = f"Failed to save blind-review feedback for message_id={message_id}: {exc}"
+                logger.exception(message_text)
+                db.set_meta(conn, "last_error", f"{utcnow_iso()} {message_text}")
+                errors += 1
+                continue
+
+            db.set_feedback_parse_status(conn, message_id, "PARSED")
+            parsed += 1
+            continue
+
         # Stage 9: a reply to a send-digest email is NEVER handed to the
         # LLM-based direct-feedback parser below -- it is a fundamentally
         # different case (Brad has already seen IdeaScout's own screen
@@ -561,12 +623,14 @@ def cmd_show_feedback(config: Config, limit: int = 10) -> int:
             f"{verdict} | confidence={confidence_text}{excluded_marker}"
         )
         print(f'    "{comment}"')
-        # Stage 9/10: DIGEST_REPLY and SCREEN_REVIEW feedback are both
-        # learning-eligible but never a clean holdout judgment (Brad
-        # already saw IdeaScout's screen result before responding) --
-        # always shown explicitly so neither is ever mistaken for a blind
-        # DIRECT judgment.
-        if row["feedback_origin"] in ("DIGEST_REPLY", "SCREEN_REVIEW"):
+        # Stage 9/10/11: DIGEST_REPLY, SCREEN_REVIEW, and BLIND_REVIEW
+        # feedback are all shown explicitly with their origin so none is
+        # ever mistaken for a plain DIRECT judgment. DIGEST_REPLY/
+        # SCREEN_REVIEW are learning-eligible but never a clean holdout
+        # judgment (Brad already saw IdeaScout's screen result);
+        # BLIND_REVIEW is the opposite -- holdout_eligible=YES is exactly
+        # the point of it, so this line makes that visible too.
+        if row["feedback_origin"] in ("DIGEST_REPLY", "SCREEN_REVIEW", "BLIND_REVIEW"):
             source_label = row["origin_source_name"] or "unknown"
             if row["ticker"]:
                 source_label = f"{source_label}/{row['ticker']}"
@@ -580,6 +644,14 @@ def cmd_show_feedback(config: Config, limit: int = 10) -> int:
                     f"{row['reviewed_overall_prediction']} | "
                     f"Review ref: {screen_review.format_review_ref(row['screening_id'])}"
                 )
+            if row["feedback_origin"] == "BLIND_REVIEW":
+                # Deliberately does NOT print the reveal (Taste v2's
+                # prediction/reasons/concerns) here -- show-feedback is a
+                # general-purpose command Brad might glance at before he's
+                # done submitting other blind judgments; the reveal only
+                # ever happens in blind-review-results, which requires
+                # explicitly asking for it.
+                print(f"    Review ref: {blind_review.format_review_ref(row['blind_review_assignment_id'])}")
 
     return 0
 
@@ -984,8 +1056,15 @@ def cmd_build_taste(config: Config) -> int:
     eligible feedback (see db.get_feedback_eligible_for_learning -- the
     ONE canonical eligibility query; this command never recreates that
     logic). Requires at least taste.MIN_TRAINING_RECORDS eligible records,
-    and refuses to regenerate while the previous version's time-forward
-    holdout has fewer than taste.HOLDOUT_SIZE judgments collected.
+    and refuses to regenerate the previous version unless BOTH: its
+    time-forward holdout has reached taste.HOLDOUT_SIZE judgments
+    collected, AND that version has been explicitly build_unlocked. These
+    are deliberately two separate gates (see db.py's Migration 14
+    comment) -- reaching HOLDOUT_SIZE judgments alone (holdout "complete")
+    is never enough to unfreeze Taste. There is currently no command that
+    ever sets build_unlocked; that belongs to a future holdout-evaluation
+    workflow, so a version whose holdout completes today simply stays
+    frozen until then.
 
     Every version's real, authoritative artifacts are immutable files
     under IdeaScoutLocal\\taste-versions\\vN\\ -- written, renamed into
@@ -1024,14 +1103,29 @@ def cmd_build_taste(config: Config) -> int:
     latest = db.get_latest_taste_version(conn)
     if latest is not None:
         holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
-        if len(holdout) < taste.HOLDOUT_SIZE:
+        holdout_complete = len(holdout) >= taste.HOLDOUT_SIZE
+        # HOLDOUT COMPLETE and TASTE BUILD UNLOCKED are deliberately two
+        # different conditions (see db.py's Migration 14 comment) --
+        # reaching 20/20 is never on its own enough to let this regenerate
+        # a new version. Until a future holdout-evaluation workflow
+        # explicitly sets build_unlocked=1, a version whose holdout
+        # completes simply stays frozen, which is the intended fail-safe.
+        if not (holdout_complete and latest["build_unlocked"]):
             conn.close()
-            print(
-                f"Taste {latest['version_label']} is frozen for time-forward evaluation: "
-                f"{len(holdout)}/{taste.HOLDOUT_SIZE} holdout judgments collected so far. "
-                "Refusing to regenerate until all of them have accumulated -- see "
-                "'python run.py taste-status'."
-            )
+            if not holdout_complete:
+                print(
+                    f"Taste {latest['version_label']} is frozen for time-forward evaluation: "
+                    f"{len(holdout)}/{taste.HOLDOUT_SIZE} holdout judgments collected so far. "
+                    "Refusing to regenerate until all of them have accumulated -- see "
+                    "'python run.py taste-status'."
+                )
+            else:
+                print(
+                    f"Taste {latest['version_label']}'s clean holdout is complete "
+                    f"({len(holdout)}/{taste.HOLDOUT_SIZE}), but it has not yet been evaluated. "
+                    "Refusing to regenerate until Brad explicitly unlocks it -- see "
+                    "'python run.py taste-status'."
+                )
             return 1
 
     try:
@@ -1211,14 +1305,29 @@ def cmd_taste_status(config: Config) -> int:
     holdout = db.get_eligible_feedback_after(conn, latest["checkpoint_feedback_id"])
     digest_reply_count = db.count_feedback_by_origin(conn, "DIGEST_REPLY")
     screen_review_count = db.count_feedback_by_origin(conn, "SCREEN_REVIEW")
+    unjudged_blind_review_count = db.count_unjudged_blind_review_assignments(conn)
     conn.close()
 
-    frozen = len(holdout) < taste.HOLDOUT_SIZE
+    # HOLDOUT COMPLETE (20/20 eligible judgments collected) and TASTE
+    # BUILD UNLOCKED (Brad has explicitly evaluated the completed holdout
+    # and authorized moving past it) are two different conditions -- see
+    # db.py's Migration 14 comment and cmd_build_taste's matching check.
+    # Reaching 20/20 alone never unfreezes anything.
+    holdout_complete = len(holdout) >= taste.HOLDOUT_SIZE
+    frozen = not (holdout_complete and latest["build_unlocked"])
 
     print(f"Taste version: {latest['version_label']}")
     print(f"Training judgments: {latest['training_count']}")
     print(f"Holdout judgments collected: {len(holdout)} / {taste.HOLDOUT_SIZE}")
+    print(f"Holdout complete: {'YES' if holdout_complete else 'NO'}")
     print(f"Taste frozen: {'YES' if frozen else 'NO'}")
+    if holdout_complete and frozen:
+        # Complete, but nothing has unlocked it for regeneration yet --
+        # there is no unlock command yet (a future holdout-evaluation
+        # workflow owns that transition); this line makes the "waiting on
+        # Brad" state explicit rather than silently indistinguishable from
+        # an ordinary in-progress holdout.
+        print("Awaiting holdout evaluation: YES")
     if digest_reply_count:
         # Stage 9: learning-eligible but NEVER counted in "Holdout
         # judgments collected" above -- see db.get_eligible_feedback_after.
@@ -1226,6 +1335,12 @@ def cmd_taste_status(config: Config) -> int:
     if screen_review_count:
         # Stage 10: same structural exclusion, informational only.
         print(f"Screen-review feedback records: {screen_review_count}")
+    if unjudged_blind_review_count:
+        # Stage 11: purely informational -- BLIND_REVIEW judgments, once
+        # given, are already counted in "Holdout judgments collected"
+        # above like any other clean judgment; this line only tracks
+        # items already assigned but not yet answered.
+        print(f"Blind-review assigned/unjudged: {unjudged_blind_review_count}")
 
     # Fail loudly rather than silently trusting a file that may have been
     # edited, truncated, or lost since this version was activated. This
@@ -2471,6 +2586,191 @@ def cmd_show_source_screenings(config: Config, *, limit: int, all_versions: bool
     return 0
 
 
+# --- Stage 11: BLIND_REVIEW / clean-holdout collection -----------------------
+#
+# Nothing in this section EVER reads or displays source_screenings content
+# for an idea Brad has not yet judged -- see cmd_blind_review's docstring
+# for the exact no-leakage guarantee, and cmd_blind_review_results (the
+# ONLY place in this whole section allowed to touch source_screenings) for
+# the reveal that happens strictly after judgment.
+
+_TEST_SMOKE_SOURCE_MARKERS = ("test", "smoke", "sample", "dummy", "placeholder", "fixture")
+
+
+def _looks_like_test_or_smoke_source(row) -> bool:
+    """Defensive-only heuristic excluding an obviously non-production
+    artifact (an accidentally-collected test/smoke document) from the
+    blind-review candidate pool. Checked case-insensitively against
+    ticker/company/source_title/external_id. This is a belt-and-suspenders
+    guard, not a precision filter -- IdeaScout has no existing convention
+    for flagging a *source* row as a smoke-test artifact (only individual
+    feedback rows can be marked excluded_from_learning after the fact, see
+    cmd_exclude_feedback), and a real production ticker/company is
+    essentially never one of these literal words.
+    """
+    haystack = " ".join(
+        str(value).lower()
+        for value in (row["ticker"], row["company"], row["source_title"], row["external_id"])
+        if value
+    )
+    return any(marker in haystack for marker in _TEST_SMOKE_SOURCE_MARKERS)
+
+
+_BLIND_REVIEW_EXTRACTION_FIELDS = (
+    ("Business summary", "business_summary"),
+    ("Core thesis", "core_thesis"),
+    ("Why potentially mispriced (per source)", "why_mispriced"),
+    ("Upside case (per source)", "upside_case"),
+    ("Downside / key risks (per source)", "downside_or_key_risks"),
+    ("Catalysts (per source)", "catalysts"),
+    ("What must be true (per source)", "what_must_be_true"),
+    ("Known unknowns", "known_unknowns"),
+)
+
+
+def _format_blind_review_item(row) -> str:
+    """Renders ONLY factual/extracted idea information -- company, ticker,
+    source, date, the compact Level-1 extraction fields (idea_extraction.py's
+    neutral, source-only summary -- never Taste/screening-derived), and the
+    original source URL. NEVER prints anything from source_screenings
+    (Taste version, prediction, confidence, reasons, concerns, screen
+    dimensions) -- there is no code path here that even reads that table.
+    """
+    lines = [
+        blind_review.format_review_ref(row["assignment_id"]),
+        f"{row['ticker'] or '-'} | {row['company'] or '-'} | {row['source_name']}",
+    ]
+    date = row["source_date"] or row["discovered_at"]
+    if date:
+        lines.append(f"Date: {date}")
+    for label, key in _BLIND_REVIEW_EXTRACTION_FIELDS:
+        value = row[key]
+        if value:
+            lines.append(f"{label}: {value}")
+    lines.append(f"Source URL: {row['canonical_url']}")
+    return "\n".join(lines)
+
+
+def cmd_blind_review(config: Config, *, limit: int) -> int:
+    """Assign (or re-show) up to `limit` ideas for a CLEAN, BLIND judgment
+    -- collecting the genuine forward holdout judgments Taste v2 needs.
+
+    CRITICAL / no-leakage: this function never reads or displays anything
+    from source_screenings, and selection (db.get_blind_review_candidate_
+    sources) never orders or filters on a screening's prediction/
+    confidence/reasons/concerns either -- a screening may already exist
+    for a candidate source; this whole codepath simply never looks at it.
+    Only Level-1 extraction fields plus company/ticker/source/date/URL are
+    ever printed (see _format_blind_review_item).
+
+    Rerunning this command must NEVER give a previously-shown item a
+    "fresh unseen" status: any assignment still unjudged is re-shown FIRST
+    (reusing its existing BR ref/assigned_at), and only the remaining
+    slots (if any) are filled with brand-new assignments. Once an item is
+    assigned, its exposure is durable regardless of whether it is ever
+    re-displayed again -- blind_review_assignments.source_id is UNIQUE, so
+    the exact same source can never be assigned a second time even across
+    unrelated runs or after a judgment excludes/re-includes it.
+    """
+    conn = db.open_production_database(config.database_path)
+
+    unjudged = db.get_unjudged_blind_review_assignments(conn, limit)
+    remaining_slots = limit - len(unjudged)
+
+    newly_assigned = []
+    if remaining_slots > 0:
+        latest_taste = db.get_latest_taste_version(conn)
+        taste_version_at_assignment = latest_taste["version_number"] if latest_taste else None
+        judged_tickers, judged_companies = _judged_identity_sets(conn)
+        assigned_at = utcnow_iso()
+        for candidate in db.get_blind_review_candidate_sources(conn):
+            if len(newly_assigned) >= remaining_slots:
+                break
+            if _is_already_judged_by_brad(candidate, judged_tickers, judged_companies):
+                continue
+            if _looks_like_test_or_smoke_source(candidate):
+                continue
+            assignment_id = db.record_blind_review_assignment(
+                conn,
+                source_id=candidate["source_id"],
+                assigned_at=assigned_at,
+                taste_version_at_assignment=taste_version_at_assignment,
+            )
+            newly_assigned.append(db.get_blind_review_assignment_by_id(conn, assignment_id))
+
+    conn.close()
+
+    all_shown = list(unjudged) + newly_assigned
+    if not all_shown:
+        print("No new blind-review candidates available.")
+        return 0
+
+    print(f"{len(all_shown)} blind-review item(s) -- judge these BLIND, before researching them elsewhere:")
+    print()
+    for item_row in all_shown:
+        print(_format_blind_review_item(item_row))
+        print()
+    print(
+        "To submit judgments, reply to the IdeaScout inbox with subject 'IdeaScout Blind Review', one "
+        "block per idea:"
+    )
+    print()
+    print("  BR-<ref> — LIKE")
+    print("  Your reasoning here.")
+    print()
+    print("Valid ratings: STRONG LIKE, LIKE, MAYBE, PASS, STRONG PASS.")
+    return 0
+
+
+def cmd_blind_review_results(config: Config, *, limit: int) -> int:
+    """Reveal Taste v2's prediction next to Brad's verdict, but ONLY for
+    blind-review assignments Brad has ALREADY judged (judged_at IS NOT
+    NULL is the only gate -- db.get_judged_blind_review_assignments never
+    returns an unjudged row). This is the ONLY function in the whole
+    blind-review workflow allowed to read source_screenings for one of
+    these sources -- cmd_blind_review and the parse-mail routing above
+    never do.
+    """
+    conn = db.open_production_database(config.database_path)
+    rows = db.get_judged_blind_review_assignments(conn, limit)
+
+    if not rows:
+        conn.close()
+        print("No judged blind-review items yet.")
+        return 0
+
+    for row in rows:
+        screening = db.get_latest_source_screening_for_source(conn, row["source_id"])
+        label = row["ticker"] or row["company"] or row["external_id"]
+
+        print(f"{blind_review.format_review_ref(row['assignment_id'])} | {label}")
+        print(f"Brad's verdict: {row['brad_verdict']}")
+        print(f"  \"{row['brad_comment'] or '(no comment)'}\"")
+
+        if screening is None:
+            print("Taste v2 screening: (none on record for this source)")
+        else:
+            print(
+                f"Taste v{screening['taste_version']} prediction: {screening['overall_prediction']} "
+                f"(confidence: {screening['confidence']})"
+            )
+            key_reasons = json.loads(screening["key_reasons_json"])[:2]
+            key_concerns = json.loads(screening["key_concerns_json"])[:2]
+            if key_reasons:
+                print(f"  Reasons: {'; '.join(key_reasons)}")
+            if key_concerns:
+                print(f"  Concerns: {'; '.join(key_concerns)}")
+            matched = blind_review.categorical_mapping_matches(row["brad_verdict"], screening["overall_prediction"])
+            matched_text = "n/a" if matched is None else ("YES" if matched else "NO")
+            print(f"  Categorical mapping matched: {matched_text}")
+
+        print(f"Source: {row['source_name']} | {row['canonical_url']}")
+        print()
+
+    conn.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     arg_parser = argparse.ArgumentParser(prog="run.py", description="IdeaScout")
     subparsers = arg_parser.add_subparsers(dest="command", required=True)
@@ -2609,6 +2909,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Forensic: show every stored version/screening instead of one row per logical document",
     )
+    blind_review_parser = subparsers.add_parser(
+        "blind-review",
+        help="Assign up to N unexposed ideas for a clean, blind judgment (no v2 prediction shown)",
+    )
+    blind_review_parser.add_argument(
+        "--limit", type=int, default=4, help="Maximum number of blind-review items to show (default: 4)"
+    )
+    blind_review_results_parser = subparsers.add_parser(
+        "blind-review-results",
+        help="Reveal Taste v2's prediction next to Brad's verdict, for ALREADY-JUDGED blind reviews only",
+    )
+    blind_review_results_parser.add_argument(
+        "--limit", type=int, default=20, help="Maximum number of judged blind reviews to show (default: 20)"
+    )
     return arg_parser
 
 
@@ -2733,6 +3047,14 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_show_source_screenings(config, limit=args.limit, all_versions=args.all_versions)
+        elif args.command == "blind-review":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_blind_review(config, limit=args.limit)
+        elif args.command == "blind-review-results":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_blind_review_results(config, limit=args.limit)
     except ConfigError as exc:
         print(f"Configuration error: {exc}")
         return 2
