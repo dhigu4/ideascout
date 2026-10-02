@@ -2160,6 +2160,9 @@ def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: 
         print(f"    raw_html_path:     {row['raw_html_path']}")
         print(f"    created_at:        {row['created_at']}")
         print(f"    collection_status: {row['collection_status']}")
+        invalid_reason = json.loads(row["metadata_json"] or "{}").get("invalid_reason")
+        if invalid_reason:
+            print(f"    invalid_reason:    {invalid_reason}")
         try:
             html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
         except OSError as exc:
@@ -2180,6 +2183,205 @@ def cmd_diagnose_source_versions(config: Config, source_name: str, external_id: 
         print("Substantive pitch text is IDENTICAL across all stored versions.")
     else:
         print("Substantive pitch text DIFFERS across stored versions.")
+    return 0
+
+
+# --- Yellowbrick 404/invalid-page audit & repair (production fix) -----------
+#
+# A real Yellowbrick 404 page was captured and wrongly marked COLLECTED
+# (see ideascout/sources/yellowbrick.py's classify_page_validity module
+# comment for the full production story), was extracted, and was screened
+# -- producing a meaningless INSUFFICIENT_INFORMATION result -- before a
+# LATER refetch of the exact same external_id returned a real pitch. This
+# section gives Brad three capabilities: a read-only audit, a dry-run
+# repair preview, and a real repair -- none of which ever call an LLM, and
+# the real repair is the only one that touches the database (after taking
+# an explicit backup first) or launches a browser.
+
+
+def _find_suspect_collected_sources(conn, adapter, source_name: str) -> list[tuple]:
+    """Shared by audit-source-content and repair-source-content: every
+    latest-version row CURRENTLY marked COLLECTED whose saved raw HTML
+    fails the exact same deterministic page-validity gate fetch() applies
+    live (adapter.classify_page_validity) -- never a separate/looser rule.
+    A row already correctly marked INCOMPLETE_CONTENT is not a "suspect"
+    here: it needs no repair, since ordinary collect-source already
+    retries it automatically on its next run. Returns (row, reason) pairs.
+    Pure local file reads -- no browser, no LLM, no DB mutation.
+    """
+    suspects = []
+    for row in db.get_latest_collected_sources_for_source(conn, source_name):
+        if row["collection_status"] != "COLLECTED":
+            continue
+        try:
+            html = Path(row["raw_html_path"]).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  Could not read raw artifact for source_id={row['source_id']}: {exc}")
+            continue
+        validity = adapter.classify_page_validity(html)
+        if not validity.valid:
+            suspects.append((row, validity.reason))
+    return suspects
+
+
+def cmd_audit_source_content(config: Config, source_name: str) -> int:
+    """READ-ONLY: find latest-version Yellowbrick (or any adapter's)
+    sources currently marked COLLECTED that actually fail the deterministic
+    page-validity gate -- e.g. a captured 404 page that slipped through
+    before this gate existed. No LLM calls, no database writes, no
+    network/browser access -- only reads each candidate's already-saved
+    raw_html_path from local disk.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+    if not hasattr(adapter, "classify_page_validity"):
+        print(f"Source {source_name!r} has no page-validity gate to audit against.")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    all_rows = db.get_latest_collected_sources_for_source(conn, source_name)
+    suspects = _find_suspect_collected_sources(conn, adapter, source_name)
+    conn.close()
+
+    if not suspects:
+        print(f"No suspect {source_name} sources found among {len(all_rows)} latest version(s).")
+        return 0
+
+    print(f"{len(suspects)} suspect {source_name} source(s) out of {len(all_rows)} latest version(s):")
+    for row, reason in suspects:
+        print(f"  external_id={row['external_id']} | source_id={row['source_id']} | reason={reason}")
+    return 0
+
+
+def cmd_repair_source_content(config: Config, source_name: str, *, dry_run: bool) -> int:
+    """Repairs latest-version sources found by the same deterministic
+    check audit-source-content uses. --dry-run only prints what WOULD be
+    repaired -- no database writes, no browser, no LLM calls, no pages
+    refetched. A real run backs up the database first (db.create_labeled_
+    backup, the same mechanism every other backup in this project uses),
+    then launches a headless browser and refetches each suspect's EXACT
+    external_id: if it is now valid, the valid content is saved as a new
+    version through the normal insert_collected_source path (left PENDING
+    extraction -- the next ordinary `collect-source` run extracts and
+    screens it exactly like any other new source, so this command itself
+    never needs to call an LLM); if it is still invalid, the EXISTING
+    suspect row is repaired in place (db.mark_collected_source_invalid) --
+    never deleted, and its extraction_status/extracted fields/
+    source_screenings rows are left completely untouched as audit trail.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+    if not hasattr(adapter, "classify_page_validity"):
+        print(f"Source {source_name!r} has no page-validity gate to repair against.")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    suspects = _find_suspect_collected_sources(conn, adapter, source_name)
+
+    if not suspects:
+        conn.close()
+        print(f"No suspect {source_name} sources to repair.")
+        return 0
+
+    print(f"{len(suspects)} suspect {source_name} source(s) to repair:")
+    for row, reason in suspects:
+        print(f"  external_id={row['external_id']} | source_id={row['source_id']} | reason={reason}")
+
+    if dry_run:
+        conn.close()
+        print("[DRY RUN] No database changes made. No LLM calls made. No pages were refetched.")
+        return 0
+
+    backup_path = db.create_labeled_backup(conn, config.database_path, "repair_source_content")
+    print(f"Backup created: {backup_path}")
+
+    recovered = 0
+    still_invalid = 0
+    errors = 0
+    with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=True) as context:
+        page = context.new_page()
+        for row, reason in suspects:
+            discovered = source_base.DiscoveredItem(
+                external_id=row["external_id"],
+                canonical_url=row["canonical_url"],
+                title=None,
+                author=row["author"],
+                published_at=None,
+                added_at=None,
+                ticker=row["ticker"],
+                company=row["company"],
+            )
+            try:
+                fetched = adapter.fetch(page, discovered, discovered_at=utcnow_iso())
+            except source_base.AuthRequiredError:
+                print(
+                    f"  external_id={row['external_id']}: AUTH_REQUIRED -- run "
+                    f"'python run.py source-login {source_name}' first. Skipped."
+                )
+                errors += 1
+                continue
+            except Exception as exc:
+                print(f"  external_id={row['external_id']}: error refetching: {exc}")
+                errors += 1
+                continue
+
+            if fetched.content_hash == row["content_hash"]:
+                # Same content as before -- still invalid, and inserting a
+                # new row would collide with the UNIQUE(source_name,
+                # external_id, content_hash) constraint anyway. Repair the
+                # EXISTING row in place instead of touching its history.
+                db.mark_collected_source_invalid(conn, source_id=row["source_id"], reason=reason)
+                still_invalid += 1
+                print(f"  external_id={row['external_id']}: still invalid ({reason}) -- marked non-extractable.")
+            else:
+                raw_path = raw_storage.save_raw_html(
+                    source_name, fetched.external_id, fetched.content_hash, fetched.raw_html, config.raw_storage_dir
+                )
+                collection_status = "COLLECTED" if fetched.content_complete else "INCOMPLETE_CONTENT"
+                db.insert_collected_source(
+                    conn,
+                    source_name=source_name,
+                    external_id=fetched.external_id,
+                    canonical_url=fetched.canonical_url,
+                    discovered_at=utcnow_iso(),
+                    discovery_title=fetched.title,
+                    source_date=fetched.published_at,
+                    source_title=fetched.title,
+                    author=fetched.author,
+                    ticker=fetched.ticker,
+                    company=fetched.company,
+                    source_type=fetched.source_type,
+                    content_hash=fetched.content_hash,
+                    raw_capture_hash=fetched.raw_capture_hash,
+                    raw_html_path=str(raw_path),
+                    metadata_json=json.dumps(fetched.metadata),
+                    previous_version_source_id=row["source_id"],
+                    created_at=utcnow_iso(),
+                    collection_status=collection_status,
+                )
+                if fetched.content_complete:
+                    recovered += 1
+                    print(f"  external_id={row['external_id']}: now valid -- new version saved as source_id="
+                          f"{db.get_latest_collected_source(conn, source_name, fetched.external_id)['source_id']}.")
+                else:
+                    still_invalid += 1
+                    print(
+                        f"  external_id={row['external_id']}: still invalid after refetch -- new version "
+                        "saved for provenance, not extracted/screened."
+                    )
+            time.sleep(adapter.POLITE_DELAY_SECONDS)
+
+    conn.close()
+    print(f"Repair complete: {recovered} recovered, {still_invalid} still invalid, {errors} error(s).")
+    if recovered:
+        print(
+            f"Run 'python run.py collect-source {source_name}' next to extract and screen the "
+            "newly-recovered source(s)."
+        )
     return 0
 
 
@@ -2257,6 +2459,29 @@ def _is_already_judged_by_brad(candidate, judged_tickers: set[str], judged_compa
     if candidate_company:
         return candidate_company in judged_companies
     return False
+
+
+def _blind_review_identity_sets(conn) -> tuple[set[str], set[str]]:
+    """Normalized (ticker, company) identities that must never be given a
+    SECOND blind-review assignment: every learning-eligible feedback
+    judgment (any origin -- reuses _judged_identity_sets) PLUS every
+    source EVER blind-review-assigned before, judged or not. The second
+    half is the production fix -- without it, two different source_ids
+    for the same company (e.g. two separate pitches on the same ticker)
+    could both be assigned, either in the same batch or across separate
+    `blind-review` runs, weakening the 20-unique-idea holdout. Matching
+    itself is the same ticker-first/company-fallback/no-fuzzy-matching
+    rule digest suppression already uses (_is_already_judged_by_brad).
+    """
+    judged_tickers, judged_companies = _judged_identity_sets(conn)
+    for row in db.get_blind_review_assigned_source_identities(conn):
+        ticker = _normalize_ticker(row["ticker"])
+        if ticker:
+            judged_tickers.add(ticker)
+        company = _normalize_company_name(row["company"])
+        if company:
+            judged_companies.add(company)
+    return judged_tickers, judged_companies
 
 
 def select_digest_candidates(conn, taste_version: int) -> tuple[list, int]:
@@ -2671,6 +2896,15 @@ def cmd_blind_review(config: Config, *, limit: int) -> int:
     re-displayed again -- blind_review_assignments.source_id is UNIQUE, so
     the exact same source can never be assigned a second time even across
     unrelated runs or after a judgment excludes/re-includes it.
+
+    IDENTITY DEDUPE (production fix): two different source_ids that map to
+    the same Brad identity (normalized ticker, or company when ticker is
+    absent) must never both be assigned -- neither within this one
+    invocation, nor across separate invocations, and regardless of whether
+    an earlier assignment for that identity has been judged yet. See
+    _blind_review_identity_sets. Candidates are walked in their existing
+    deterministic order, so when two distinct sources share an identity,
+    the first one encountered is assigned and every later one is skipped.
     """
     conn = db.open_production_database(config.database_path)
 
@@ -2681,7 +2915,7 @@ def cmd_blind_review(config: Config, *, limit: int) -> int:
     if remaining_slots > 0:
         latest_taste = db.get_latest_taste_version(conn)
         taste_version_at_assignment = latest_taste["version_number"] if latest_taste else None
-        judged_tickers, judged_companies = _judged_identity_sets(conn)
+        judged_tickers, judged_companies = _blind_review_identity_sets(conn)
         assigned_at = utcnow_iso()
         for candidate in db.get_blind_review_candidate_sources(conn):
             if len(newly_assigned) >= remaining_slots:
@@ -2697,6 +2931,14 @@ def cmd_blind_review(config: Config, *, limit: int) -> int:
                 taste_version_at_assignment=taste_version_at_assignment,
             )
             newly_assigned.append(db.get_blind_review_assignment_by_id(conn, assignment_id))
+            # Never assign a second candidate with the SAME identity later
+            # in this same batch.
+            candidate_ticker = _normalize_ticker(candidate["ticker"])
+            if candidate_ticker:
+                judged_tickers.add(candidate_ticker)
+            candidate_company = _normalize_company_name(candidate["company"])
+            if candidate_company:
+                judged_companies.add(candidate_company)
 
     conn.close()
 
@@ -2886,6 +3128,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagnose_live_parser.add_argument("source_name", help="e.g. yellowbrick")
     diagnose_live_parser.add_argument("--external-id", required=True, help="e.g. 143618")
+    audit_source_content_parser = subparsers.add_parser(
+        "audit-source-content",
+        help="READ-ONLY: find latest-version sources that fail the deterministic page-validity gate",
+    )
+    audit_source_content_parser.add_argument("source_name", help="e.g. yellowbrick")
+    repair_source_content_parser = subparsers.add_parser(
+        "repair-source-content",
+        help="Refetch/repair latest-version sources found by audit-source-content",
+    )
+    repair_source_content_parser.add_argument("source_name", help="e.g. yellowbrick")
+    repair_source_content_parser.add_argument(
+        "--dry-run", action="store_true", help="Print what would be repaired -- no database changes, no LLM calls, no refetching"
+    )
     subparsers.add_parser(
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
@@ -3033,6 +3288,18 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_diagnose_source_live(config, args.source_name, args.external_id)
+        elif args.command == "audit-source-content":
+            # Read-only, local-file-only -- no browser, no LLM calls, no
+            # ANTHROPIC_API_KEY needed.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_audit_source_content(config, args.source_name)
+        elif args.command == "repair-source-content":
+            # Real (non-dry-run) repair launches a browser but still never
+            # calls an LLM -- does not require ANTHROPIC_API_KEY.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
         elif args.command == "preview-digest":
             config = load_config()
             setup_logging(config.log_path)

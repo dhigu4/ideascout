@@ -638,19 +638,14 @@ MIGRATIONS: list[str] = [
     # prediction only for that assignment's exact source/source-version --
     # never a ticker-based guess.
     #
-    # taste_versions.build_unlocked (added here, not a separate migration,
-    # because this migration had not yet reached production when the gap
-    # below was found): HOLDOUT COMPLETE (20/20 eligible judgments
-    # collected) and TASTE BUILD UNLOCKED are deliberately two different
-    # conditions, not one. Reaching 20/20 on its own must never be enough
-    # to let build-taste regenerate a new version -- Taste v2 stays
-    # protected until Brad has actually evaluated the completed holdout
-    # and explicitly authorized moving past it. build_unlocked defaults to
-    # 0 for every version (including brand-new ones insert_taste_version
-    # creates); there is deliberately no command yet that ever sets it to
-    # 1 -- that belongs to a future holdout-evaluation workflow. Until such
-    # a workflow exists, a version whose holdout completes simply stays
-    # frozen indefinitely, which is the intended fail-safe default.
+    # NOTE: this migration has already shipped to production exactly as
+    # written below. A later change briefly added an ALTER TABLE for
+    # taste_versions.build_unlocked directly into this migration's SQL --
+    # but since production had already recorded Migration 14 as applied
+    # (PRAGMA user_version), that edit silently never ran there, leaving
+    # production's taste_versions without the column cmd_taste_status/
+    # cmd_build_taste both expect. MIGRATIONS entries are immutable once
+    # shipped; see Migration 15 for the correct, additive fix.
     """
     CREATE TABLE blind_review_assignments (
         assignment_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -667,7 +662,24 @@ MIGRATIONS: list[str] = [
     ALTER TABLE feedback ADD COLUMN blind_review_assignment_id INTEGER REFERENCES blind_review_assignments(assignment_id);
 
     CREATE INDEX idx_feedback_blind_review_assignment_id ON feedback(blind_review_assignment_id);
-
+    """,
+    # Migration 15 (Stage 11 follow-up): the build_unlocked column
+    # Migration 14 was supposed to ship with (see the NOTE in Migration
+    # 14's comment above for how it was lost). HOLDOUT COMPLETE (20/20
+    # eligible judgments collected) and TASTE BUILD UNLOCKED are
+    # deliberately two different conditions, not one -- reaching 20/20 on
+    # its own must never be enough to let build-taste regenerate a new
+    # version. Taste stays protected until Brad has actually evaluated the
+    # completed holdout and explicitly authorized moving past it.
+    # build_unlocked defaults to 0 for every version (including brand-new
+    # ones insert_taste_version creates, and including every existing
+    # production taste_versions row this migration backfills); there is
+    # deliberately no command yet that ever sets it to 1 -- that belongs to
+    # a future holdout-evaluation workflow. Until such a workflow exists, a
+    # version whose holdout completes simply stays frozen indefinitely,
+    # which is the intended fail-safe default. Purely additive -- no
+    # existing row or column is touched.
+    """
     ALTER TABLE taste_versions ADD COLUMN build_unlocked INTEGER NOT NULL DEFAULT 0;
     """,
 ]
@@ -784,6 +796,20 @@ def maybe_create_routine_backup(conn: sqlite3.Connection, database_path: Path) -
     _write_sentinel(database_path, state)
     _prune_routine_backups(database_path)
     return backup_path
+
+
+def create_labeled_backup(conn: sqlite3.Connection, database_path: Path, label: str) -> Path:
+    """Public, on-demand wrapper around the existing backup mechanism
+    (_create_backup -- the same SQLite online-backup-API function
+    maybe_create_routine_backup and the pre-migration backup already use),
+    for a caller that needs a guaranteed backup taken RIGHT NOW regardless
+    of whether today's once-a-day routine backup has already run. Used by
+    repair-source-content before it mutates production collected_sources
+    rows. Not rate-limited and not pruned -- a repair backup is kept
+    indefinitely, like a pre-migration backup, since it is exactly the
+    kind of backup most likely to matter for recovery.
+    """
+    return _create_backup(conn, database_path, label)
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -2186,6 +2212,60 @@ def get_collected_source_versions(conn: sqlite3.Connection, source_name: str, ex
     ).fetchall()
 
 
+def get_latest_collected_sources_for_source(conn: sqlite3.Connection, source_name: str) -> list[sqlite3.Row]:
+    """Every (source_name, external_id)'s single latest stored version,
+    regardless of collection_status or extraction_status -- the candidate
+    pool for audit-source-content/repair-source-content (see cli.py), which
+    need to find rows CURRENTLY marked COLLECTED despite failing the
+    deterministic page-validity gate (ideascout/sources/yellowbrick.py's
+    classify_page_validity). A row already correctly marked
+    INCOMPLETE_CONTENT needs no repair -- it is already retried
+    automatically by the next ordinary collect-source run.
+    """
+    return conn.execute(
+        """
+        SELECT cs.*
+        FROM collected_sources cs
+        WHERE cs.source_name = ?
+          AND cs.source_id = (
+              SELECT cs2.source_id FROM collected_sources cs2
+              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+              ORDER BY cs2.source_id DESC
+              LIMIT 1
+          )
+        ORDER BY cs.source_id
+        """,
+        (source_name,),
+    ).fetchall()
+
+
+def mark_collected_source_invalid(conn: sqlite3.Connection, *, source_id: int, reason: str) -> None:
+    """Repairs a row that was wrongly marked COLLECTED despite failing the
+    deterministic page-validity gate -- used ONLY by repair-source-content
+    (cli.py), and only when a refetch of a suspect row comes back with the
+    SAME still-invalid content (a genuinely recovered, different-content
+    refetch instead goes through the normal insert_collected_source path
+    as a new version). Flips collection_status to 'INCOMPLETE_CONTENT' --
+    the existing "not ready for extraction/screening, retried later"
+    mechanism -- and records the deterministic reason in metadata_json.
+
+    Never touches extraction_status, any of the extracted fields, or any
+    existing source_screenings row for this source_id: those are kept
+    exactly as historical provenance/audit trail, per the repair task's
+    explicit "do not delete" requirement. Downstream eligibility
+    (get_blind_review_candidate_sources, get_unshown_screened_sources_for_
+    taste_version, get_extracted_sources_missing_screening) all
+    additionally require collection_status = 'COLLECTED', so this one
+    UPDATE is what removes the row from every production selection path
+    going forward.
+    """
+    conn.execute(
+        "UPDATE collected_sources SET collection_status = 'INCOMPLETE_CONTENT', metadata_json = ? WHERE source_id = ?",
+        (json.dumps({"invalid_reason": reason}), source_id),
+    )
+    conn.commit()
+
+
 def count_collected_sources_by_extraction_status(conn: sqlite3.Connection, source_name: str, extraction_status: str) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM collected_sources WHERE source_name = ? AND extraction_status = ?",
@@ -2397,12 +2477,22 @@ def get_blind_review_candidate_sources(conn: sqlite3.Connection) -> list[sqlite3
     judgment (an exact source_id-level check, independent of and in
     addition to the ticker/company-level already-judged check the caller
     applies).
+
+    collection_status = 'COLLECTED' (production fix): extraction_status=
+    'EXTRACTED' alone is not enough -- a historically bad capture (e.g. a
+    Yellowbrick 404 page wrongly let through before classify_page_validity
+    existed) can already be EXTRACTED. repair-source-content flips such a
+    row's collection_status to 'INCOMPLETE_CONTENT' without touching
+    extraction_status (the bad extraction is kept only as audit trail), so
+    this filter is what keeps the latest source's CURRENT validity --  not
+    merely its historical extraction state -- authoritative for selection.
     """
     return conn.execute(
         f"""
         SELECT cs.*
         FROM collected_sources cs
         WHERE cs.extraction_status = 'EXTRACTED'
+          AND cs.collection_status = 'COLLECTED'
           AND cs.source_id = (
               SELECT cs2.source_id FROM collected_sources cs2
               WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
@@ -2417,6 +2507,29 @@ def get_blind_review_candidate_sources(conn: sqlite3.Connection) -> list[sqlite3
               WHERE f.feedback_origin = 'SCREEN_REVIEW' AND f.excluded_from_learning = 0
           )
         ORDER BY cs.discovered_at ASC, cs.source_id ASC
+        """
+    ).fetchall()
+
+
+def get_blind_review_assigned_source_identities(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """ticker/company for every source that has EVER been blind-review
+    assigned, judged or not -- used (in addition to the source_id-level
+    exclusion already built into get_blind_review_candidate_sources) to
+    stop a NEW assignment from duplicating the same Brad identity
+    (ticker, or company when ticker is absent) that an earlier assignment
+    -- in this batch or a previous one -- already carries. This is the
+    fix for a real production gap: two DIFFERENT source_ids for the same
+    company (e.g. two separate pitches on the same ticker) could
+    previously both be assigned in one blind-review batch, weakening the
+    20-unique-idea holdout. Identity matching itself (ticker first,
+    company fallback only if ticker absent, no fuzzy matching) is applied
+    by the caller using the same normalization suppression already uses.
+    """
+    return conn.execute(
+        """
+        SELECT cs.ticker, cs.company
+        FROM blind_review_assignments bra
+        JOIN collected_sources cs ON cs.source_id = bra.source_id
         """
     ).fetchall()
 
@@ -2541,11 +2654,20 @@ def get_extracted_sources_missing_screening(
     attempts to screen on each run, so a taste/rules change or a
     previously-unavailable taste naturally gets picked up later without
     any manual requeue.
+
+    collection_status = 'COLLECTED' (production fix): a row can reach
+    extraction_status='EXTRACTED' with collection_status later flipped to
+    'INCOMPLETE_CONTENT' by repair-source-content, when a historically bad
+    (e.g. 404) capture that was wrongly marked COLLECTED turns out, on
+    refetch, to still be invalid -- see ideascout/sources/yellowbrick.py's
+    classify_page_validity. That repair deliberately never touches
+    extraction_status (the bad extraction row is kept as audit trail, never
+    deleted), so this filter is what stops it from ever being screened.
     """
     return conn.execute(
         """
         SELECT * FROM collected_sources
-        WHERE source_name = ? AND extraction_status = 'EXTRACTED'
+        WHERE source_name = ? AND extraction_status = 'EXTRACTED' AND collection_status = 'COLLECTED'
           AND source_id NOT IN (
               SELECT source_id FROM source_screenings
               WHERE taste_version = ? AND screen_rules_sha256 = ?
@@ -2697,6 +2819,15 @@ def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, tas
     first. This is the entire candidate pool before the INVESTIGATE_NOW-
     first, cap-at-5 selection (see cli.py's select_digest_candidates,
     shared by preview-digest and send-digest).
+
+    cs.collection_status = 'COLLECTED' (production fix): a non-PASS
+    screening can exist for a source that was historically miscaptured
+    (e.g. a Yellowbrick 404 page) and later repaired -- repair-source-
+    content flips collection_status to 'INCOMPLETE_CONTENT' without
+    deleting that old screening (kept as audit trail). Without this
+    filter, such a historically-bad screening could still surface in a
+    production digest; this is what keeps digest selection scoped to the
+    latest source's CURRENT validity, not its historical screening state.
     """
     return conn.execute(
         """
@@ -2705,6 +2836,7 @@ def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, tas
         JOIN source_screenings ss ON ss.source_id = cs.source_id
         WHERE ss.taste_version = :taste_version
           AND ss.overall_prediction != 'PASS'
+          AND cs.collection_status = 'COLLECTED'
           AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
           AND cs.source_id = (
               SELECT cs2.source_id FROM collected_sources cs2

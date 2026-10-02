@@ -133,6 +133,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
@@ -234,6 +235,93 @@ MAX_DIAGNOSTIC_HREFS = 20
 # pages during a real (non-dry-run) collection run. Tests monkeypatch this
 # to 0 so the suite doesn't actually sleep.
 POLITE_DELAY_SECONDS = 1.0
+
+# PAGE-VALIDITY GATE (production fix): a real production capture of
+# yellowbrick/144271 stored Yellowbrick's own 404 page ("Page not found" /
+# generic "Yellowbrick Investing" title, ~144 chars of canonical text) as
+# if it were a genuine pitch -- content_complete was True (no full-summary
+# switch exists on a 404 page, and "no switch" was, correctly, never
+# treated as incomplete on its own), so the 404 page went straight through
+# extraction and screening, producing a meaningless INSUFFICIENT_INFORMATION
+# screen. A LATER refetch of the exact same external_id (144271) returned a
+# real pitch (Instone Real Estate Group SE) -- proving the 404 was
+# transient, not permanent, which is why it must be classified as
+# retriable, never permanently discarded.
+#
+# classify_page_validity() runs BEFORE the full-summary-switch logic and is
+# completely independent of it: page validity is a prerequisite question
+# ("is there a pitch here at all?"), answered before "is it the short or
+# the expanded version of that pitch?" -- which is what _content_is_complete
+# still answers exactly as before. A genuinely short, valid pitch with no
+# full-summary switch must remain valid; this gate never second-guesses
+# that case.
+_NOT_FOUND_PHRASES = (
+    "page not found",
+    "the page you are looking for does not exist",
+)
+# The generic shell Yellowbrick renders for ITS OWN error/placeholder
+# pages (confirmed from the real 404 capture) -- never a real pitch's
+# title, which always names the specific stock/company being pitched.
+_GENERIC_SHELL_TITLE = "yellowbrick investing"
+# Deliberately NOT the sole signal for anything (task requirement: "do not
+# rely only on text length"). ABSOLUTE_MIN is a sanity floor no genuine
+# pitch -- however short -- could ever fall under; it catches a blank/
+# near-blank shell page regardless of its title. GENERIC_SHELL_MIN is only
+# ever consulted TOGETHER WITH the generic-title signal, so a real pitch
+# that merely happens to be short is never misclassified just because of
+# its length.
+_PAGE_VALIDITY_ABSOLUTE_MIN_CHARS = 50
+_PAGE_VALIDITY_GENERIC_SHELL_MIN_CHARS = 300
+
+# Short, bounded re-settlement wait (task section 2, step 1) before the
+# FIRST re-check of an apparently-invalid page -- covers client-side
+# routing/hydration that hasn't finished when domcontentloaded fired.
+# Never a retry loop, never indefinite.
+PAGE_VALIDITY_SETTLE_WAIT_MS = 1500
+
+
+@dataclass(frozen=True)
+class PageValidityResult:
+    valid: bool
+    reason: str | None = None
+
+
+def classify_page_validity(html: str) -> PageValidityResult:
+    """Deterministic (no LLM, no length-only heuristic) classification of
+    whether `html` contains substantive pitch content at all, BEFORE any
+    question of whether that content is the short or fully-expanded
+    version. Returns PageValidityResult(valid=False, reason=...) for:
+
+    - an explicit Yellowbrick "Page not found" / "the page you are looking
+      for does not exist" page (reason "PAGE_NOT_FOUND");
+    - a generic Yellowbrick shell page (title exactly "Yellowbrick
+      Investing") that also lacks anything resembling substantive pitch
+      length (reason "NO_PITCH_CONTENT") -- the title check and the length
+      check are both required together, so a genuinely short real pitch
+      (which always has its own specific title) is never caught by this;
+    - any page whose canonical text falls under an absolute sanity floor,
+      regardless of title (reason "NO_PITCH_CONTENT") -- a blank/near-
+      blank shell with no identifiable content at all.
+
+    Used both live (fetch()'s transient-404 retry logic) and offline
+    (audit-source-content/repair-source-content, against a previously
+    saved raw_html_path) -- both call sites get byte-identical behavior
+    since this is pure text classification with no browser interaction.
+    """
+    canonical_text = build_canonical_source_text(html)
+    normalized_text = canonical_text.lower()
+
+    if any(phrase in normalized_text for phrase in _NOT_FOUND_PHRASES):
+        return PageValidityResult(False, "PAGE_NOT_FOUND")
+
+    if len(canonical_text) < _PAGE_VALIDITY_ABSOLUTE_MIN_CHARS:
+        return PageValidityResult(False, "NO_PITCH_CONTENT")
+
+    title = (extract_title(html) or "").strip().lower()
+    if title == _GENERIC_SHELL_TITLE and len(canonical_text) < _PAGE_VALIDITY_GENERIC_SHELL_MIN_CHARS:
+        return PageValidityResult(False, "NO_PITCH_CONTENT")
+
+    return PageValidityResult(True, None)
 
 _HREF_PATTERN = re.compile(r'href="([^"]*)"', re.IGNORECASE)
 
@@ -810,7 +898,12 @@ def _content_is_complete(html: str) -> bool:
 
 
 def parse_pitch_page(
-    html: str, discovered: base.DiscoveredItem, *, discovered_at: str, content_complete: bool = True
+    html: str,
+    discovered: base.DiscoveredItem,
+    *,
+    discovered_at: str,
+    content_complete: bool = True,
+    invalid_reason: str | None = None,
 ) -> base.SourceItem:
     """Pure parsing, no network/browser involved. Falls back to whatever
     the (cheaper) discovery step already found when the pitch page itself
@@ -826,6 +919,14 @@ def parse_pitch_page(
     be treated as a content change. content_complete is decided by the
     caller (fetch(), from a live page-state check) and passed straight
     through -- this function never re-derives it.
+
+    invalid_reason (production fix): when fetch()'s page-validity gate
+    (classify_page_validity) still finds this page invalid after its
+    bounded wait/reload retry, the caller passes the deterministic reason
+    code (e.g. "PAGE_NOT_FOUND") through here, where it is stored as
+    metadata={"invalid_reason": ...} -- a free-text JSON column that
+    already existed, so this needed no schema change. Left as {} (today's
+    exact behavior) for every valid page.
     """
     text = html_to_text(html)
     title = extract_title(html) or discovered.title
@@ -850,7 +951,7 @@ def parse_pitch_page(
         content_hash=content_hash,
         raw_capture_hash=raw_capture_hash,
         content_complete=content_complete,
-        metadata={},
+        metadata={"invalid_reason": invalid_reason} if invalid_reason else {},
     )
 
 
@@ -909,6 +1010,42 @@ def fetch(page, discovered: base.DiscoveredItem, *, discovered_at: str) -> base.
         raise base.AuthRequiredError(
             f"Yellowbrick session appears blocked or logged out while fetching "
             f"{discovered.canonical_url} (current URL: {getattr(page, 'url', None) or 'unknown'})."
+        )
+
+    # PAGE-VALIDITY GATE (production fix): an explicit 404/invalid page
+    # must never reach extraction/screening, but a 404 can be transient
+    # (confirmed: yellowbrick/144271 was captured as Yellowbrick's own
+    # 404 page, then a later fetch of the EXACT SAME external_id returned
+    # a real pitch) -- so a single bad read is never treated as permanent
+    # here. Exactly the three bounded steps task section 2 asks for, never
+    # a loop: (1) a short settle wait + re-check, then (2) if still
+    # invalid, ONE reload + re-check. If the page is valid on the very
+    # first read, none of this runs at all -- zero added latency for the
+    # overwhelmingly common case.
+    validity = classify_page_validity(html)
+    if not validity.valid:
+        page.wait_for_timeout(PAGE_VALIDITY_SETTLE_WAIT_MS)
+        html = page.content()
+        validity = classify_page_validity(html)
+    if not validity.valid:
+        page.reload(wait_until="domcontentloaded")
+        html = page.content()
+        validity = classify_page_validity(html)
+
+    if not validity.valid:
+        # Still invalid after the bounded retry: save raw provenance (the
+        # caller still persists this SourceItem) but never expand/treat it
+        # as complete, and never hand it to extraction/screening --
+        # content_complete=False routes it through the existing
+        # INCOMPLETE_CONTENT mechanism, which already means exactly "save
+        # for provenance, skip extraction/screening, retry automatically
+        # on a future collection run."
+        return parse_pitch_page(
+            html,
+            discovered,
+            discovered_at=discovered_at,
+            content_complete=False,
+            invalid_reason=validity.reason,
         )
 
     html = _expand_full_summary_if_present(page, html)

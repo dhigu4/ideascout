@@ -23,12 +23,23 @@ class FakePage:
         expanded_html_by_url: dict[str, str] | None = None,
         show_full_summary_elements: list[dict] | None = None,
         role_elements: dict[str, list[dict]] | None = None,
+        content_sequence_by_url: dict[str, list[str]] | None = None,
     ):
         self.html_by_url = html_by_url
         self.default_html = default_html
         self.urls_visited: list[str] = []
         self._current_url = None
         self.wait_for_selector_calls: list[tuple] = []
+        # --- page-validity retry simulation (transient 404 recovery) ------
+        # content_sequence_by_url[url] is a list consumed one call at a
+        # time by content() for that URL (e.g. ["404 html", "404 html",
+        # "valid pitch html"] models: first load 404, still 404 after the
+        # settle wait, valid after the one bounded reload). Once exhausted,
+        # the LAST entry keeps being returned. A URL with no entry falls
+        # through to the existing html_by_url/expansion logic unchanged.
+        self.content_sequence_by_url: dict[str, list[str]] = content_sequence_by_url or {}
+        self._content_call_count: dict[str, int] = {}
+        self.reload_calls: list[str | None] = []
         # Set True in a test to simulate the selector never appearing
         # (Playwright's real wait_for_selector raises TimeoutError) --
         # default False means "found immediately", so existing tests that
@@ -75,11 +86,19 @@ class FakePage:
         self.urls_visited.append(url)
         self._current_url = url
 
+    def reload(self, wait_until=None):
+        self.reload_calls.append(self._current_url)
+
     @property
     def url(self) -> str | None:
         return self._current_url
 
     def content(self) -> str:
+        sequence = self.content_sequence_by_url.get(self._current_url)
+        if sequence:
+            index = self._content_call_count.get(self._current_url, 0)
+            self._content_call_count[self._current_url] = index + 1
+            return sequence[min(index, len(sequence) - 1)]
         if self._current_url in self._expanded_urls and self._current_url in self.expanded_html_by_url:
             return self.expanded_html_by_url[self._current_url]
         return self.html_by_url.get(self._current_url, self.default_html)
