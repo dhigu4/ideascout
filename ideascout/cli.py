@@ -1879,10 +1879,69 @@ def cmd_collect_source(
                 logger.exception(f"Error fetching {item.canonical_url}: {exc}")
                 continue
 
-            if existing is not None and existing["content_hash"] == fetched.content_hash:
-                stats["already_known"] += 1
+            # IDEMPOTENCY FIX (production fix): resolve against the EXACT
+            # UNIQUE(source_name, external_id, content_hash) key, not
+            # merely "does this match the LATEST row's hash" -- an
+            # INCOMPLETE_CONTENT row's completeness can change even when
+            # its semantic content_hash does not (a full-summary switch's
+            # checked state is an HTML ATTRIBUTE, never part of the
+            # canonical TEXT content_hash is computed from), and
+            # content_hash can flip back and forth across repeated
+            # attempts. A real production run crashed here: the fetched
+            # hash matched an EARLIER, non-latest row for this external_id
+            # (which the old "== existing's hash" check could never see),
+            # and a plain INSERT collided with it. This lookup prevents
+            # that structurally -- never by catching the resulting
+            # IntegrityError.
+            existing_same_hash = db.get_collected_source_by_content_hash(
+                conn, source_name, fetched.external_id, fetched.content_hash
+            )
+
+            if existing_same_hash is not None:
+                if existing_same_hash["collection_status"] == "COLLECTED":
+                    # CASE D: already collected with this exact semantic
+                    # content -- unchanged, idempotent, exactly today's
+                    # "already known" outcome (no sleep here either,
+                    # preserving that exact prior behavior).
+                    stats["already_known"] += 1
+                    continue
+
+                # existing_same_hash is INCOMPLETE_CONTENT. Never insert a
+                # second row for this exact hash -- update the EXISTING
+                # row in place instead. Raw provenance is untouched: see
+                # db.update_collected_source_status_and_metadata's
+                # docstring.
+                db.update_collected_source_status_and_metadata(
+                    conn,
+                    source_id=existing_same_hash["source_id"],
+                    collection_status="COLLECTED" if fetched.content_complete else "INCOMPLETE_CONTENT",
+                    metadata_json=json.dumps(fetched.metadata),
+                )
+                if fetched.content_complete:
+                    # CASE B: validity/completeness changed even though the
+                    # semantic content hash did not -- promoted in place,
+                    # now eligible for the normal extraction sweep below.
+                    stats["changed"] += 1
+                    print(
+                        f"RECOVERED: {fetched.external_id} is now valid/complete (source_id="
+                        f"{existing_same_hash['source_id']}) -- promoted from INCOMPLETE_CONTENT to COLLECTED."
+                    )
+                else:
+                    # CASE A: still incomplete, identical semantic content
+                    # -- no new row, remains retryable indefinitely, zero
+                    # extraction/screening calls.
+                    stats["incomplete"] += 1
+                    print(
+                        f"INCOMPLETE_CONTENT: {fetched.external_id} was saved for provenance but the page still "
+                        f"signals more substantive content exists (e.g. an un-expanded 'Show full summary' control). "
+                        f"Skipping extraction/screening for this version -- it will be retried on the next collection run."
+                    )
+                time.sleep(adapter.POLITE_DELAY_SECONDS)
                 continue
 
+            # CASE C (and the ordinary new/changed path): no row exists
+            # anywhere for this exact (source_name, external_id,
+            # content_hash) -- a normal new version, safe to insert.
             raw_path = raw_storage.save_raw_html(
                 source_name, fetched.external_id, fetched.content_hash, fetched.raw_html, config.raw_storage_dir
             )

@@ -2003,6 +2003,61 @@ def get_latest_collected_source(conn: sqlite3.Connection, source_name: str, exte
     ).fetchone()
 
 
+def get_collected_source_by_content_hash(
+    conn: sqlite3.Connection, source_name: str, external_id: str, content_hash: str
+) -> sqlite3.Row | None:
+    """Exact lookup by the full UNIQUE(source_name, external_id,
+    content_hash) key -- NOT merely "does this match the latest version's
+    hash" (that is get_latest_collected_source's own content_hash field).
+
+    Production fix: a real collect-source run crashed with a UNIQUE
+    constraint IntegrityError when retrying a known INCOMPLETE_CONTENT
+    source. Root cause -- an INCOMPLETE_CONTENT row's completeness can
+    change even when its semantic content_hash does not (e.g. a full-
+    summary switch's checked state lives in an HTML ATTRIBUTE, which
+    build_canonical_source_text never looks at, so two fetches can hash
+    identically while _content_is_complete disagrees), and content_hash
+    can also flip back and forth across repeated attempts. cmd_collect_
+    source's old check only ever compared the newly fetched hash against
+    the LATEST row's hash -- if the fetched hash instead matched an
+    EARLIER, non-latest row for the same external_id, that comparison
+    missed it and a plain INSERT collided with that earlier row. Calling
+    this function BEFORE inserting (cmd_collect_source) replaces that
+    narrower check with a lookup against the true, exact uniqueness key,
+    so the duplicate insert is prevented structurally rather than caught
+    as an exception afterward. Returns at most one row, since the
+    constraint already guarantees uniqueness.
+    """
+    return conn.execute(
+        "SELECT * FROM collected_sources WHERE source_name = ? AND external_id = ? AND content_hash = ?",
+        (source_name, external_id, content_hash),
+    ).fetchone()
+
+
+def update_collected_source_status_and_metadata(
+    conn: sqlite3.Connection, *, source_id: int, collection_status: str, metadata_json: str
+) -> None:
+    """Updates ONLY collection_status and metadata_json on an EXISTING
+    row -- used by cmd_collect_source's idempotent same-content-hash retry
+    path (see get_collected_source_by_content_hash) to either promote an
+    INCOMPLETE_CONTENT row to COLLECTED in place (page validity/
+    completeness changed even though the semantic content_hash did not),
+    or refresh its incomplete-content metadata while it remains
+    INCOMPLETE_CONTENT -- NEVER by inserting a second row for the same
+    (source_name, external_id, content_hash). Never touches
+    raw_html_path/raw_capture_hash/discovered_at/created_at or any
+    extraction/screening field: content_hash is unchanged, so the
+    deterministic, content-addressed raw capture this row already points
+    at (see raw_storage.save_raw_html) is still the correct one -- nothing
+    here re-saves or overwrites any raw provenance.
+    """
+    conn.execute(
+        "UPDATE collected_sources SET collection_status = ?, metadata_json = ? WHERE source_id = ?",
+        (collection_status, metadata_json, source_id),
+    )
+    conn.commit()
+
+
 def insert_collected_source(
     conn: sqlite3.Connection,
     *,
