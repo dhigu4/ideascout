@@ -581,3 +581,249 @@ def test_blind_review_results_works_at_20_of_20_holdout(tmp_path, monkeypatch):
     assert exit_code == 0
     assert "BR-1" in output
     assert output.count("Brad's verdict: LIKE") == 20
+
+
+# --- Stage 11 fix: identity dedupe within/across blind-review batches -----------
+#
+# Production found two DIFFERENT source_ids for the same company (CPRT)
+# both assigned as BLIND_REVIEW in one batch, weakening the 20-unique-idea
+# holdout. Selection must apply the same ticker-first/company-fallback/
+# no-fuzzy-matching identity rule digest suppression already uses, both
+# within a single invocation and across separate ones -- regardless of
+# whether an earlier assignment for that identity has been judged yet.
+
+
+def test_same_ticker_in_one_batch_produces_only_one_assignment(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    first_id = insert_extracted_source(
+        conn, external_id="1", ticker="CPRT", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    second_id = insert_extracted_source(
+        conn, external_id="2", ticker="CPRT", company="Copart Inc Duplicate Pitch",
+        discovered_at="2026-01-01T00:01:00+00:00",
+    )
+    conn.close()
+
+    exit_code = cli.cmd_blind_review(config, limit=4)
+    assert exit_code == 0
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert len(assigned) == 1
+    # Existing deterministic ordering (oldest first) -- the first one
+    # encountered wins, the later duplicate is skipped.
+    assert assigned == {first_id}
+    assert second_id not in assigned
+
+
+def test_company_fallback_duplicate_suppressed_when_ticker_absent(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    # insert_extracted_source's own `ticker=None` default means "use a
+    # generated placeholder," not "genuinely absent" -- pass "" (a real,
+    # falsy, non-None value) to actually exercise the ticker-absent,
+    # company-fallback identity path this test is about.
+    first_id = insert_extracted_source(
+        conn, external_id="1", ticker="", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    second_id = insert_extracted_source(
+        conn, external_id="2", ticker="", company="Copart Inc", discovered_at="2026-01-01T00:01:00+00:00"
+    )
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert assigned == {first_id}
+    assert second_id not in assigned
+
+
+def test_ticker_comparison_uses_existing_normalization_rules(tmp_path):
+    """$-prefixed / lowercase / whitespace variants of the same ticker must
+    be recognized as the same identity -- exactly the normalization
+    digest suppression already applies (_normalize_ticker).
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    first_id = insert_extracted_source(
+        conn, external_id="1", ticker="cprt", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    second_id = insert_extracted_source(
+        conn, external_id="2", ticker="$CPRT", company="Copart Inc Two", discovered_at="2026-01-01T00:01:00+00:00"
+    )
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert assigned == {first_id}
+    assert second_id not in assigned
+
+
+def test_already_assigned_but_unjudged_identity_blocks_a_second_source(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_extracted_source(
+        conn, external_id="1", ticker="CPRT", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    conn.close()
+    cli.cmd_blind_review(config, limit=1)  # assigns source 1, still unjudged
+
+    conn = db.connect(config.database_path)
+    second_id = insert_extracted_source(
+        conn, external_id="2", ticker="CPRT", company="Copart Inc Two", discovered_at="2026-01-02T00:00:00+00:00"
+    )
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert second_id not in assigned
+    assert len(assigned) == 1
+
+
+def test_already_assigned_and_judged_identity_blocks_a_second_source(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_extracted_source(
+        conn, external_id="1", ticker="CPRT", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    conn.close()
+    cli.cmd_blind_review(config, limit=1)
+
+    conn = db.connect(config.database_path)
+    assignment_id = conn.execute("SELECT assignment_id FROM blind_review_assignments").fetchone()["assignment_id"]
+    ref = blind_review.format_review_ref(assignment_id)
+    db.insert_message(
+        conn, message_id="msg_judge", inbox_id="inbox_abc", thread_id="thread_judge",
+        received_at="2026-01-02T00:00:00+00:00", sender="brad@example.com",
+        recipients="ideas@yourdomain.agentmail.to", subject="IdeaScout Blind Review",
+        body_raw=f"{ref} - LIKE\ngood", body_format="text", size_bytes=10,
+        stored_at="2026-01-02T00:00:05+00:00", sender_authenticated="AUTHENTICATED",
+    )
+    conn.close()
+    cli.cmd_parse_mail(config)
+
+    conn = db.connect(config.database_path)
+    second_id = insert_extracted_source(
+        conn, external_id="2", ticker="CPRT", company="Copart Inc Two", discovered_at="2026-01-03T00:00:00+00:00"
+    )
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert second_id not in assigned
+    assert len(assigned) == 1
+
+
+def test_identity_dedupe_independent_of_screening_prediction(tmp_path):
+    """The identity-dedupe fix must not reintroduce any dependence on
+    source_screenings -- changing a prediction must not change which of
+    two same-identity candidates gets picked.
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    first_id = insert_extracted_source(
+        conn, external_id="1", ticker="CPRT", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    insert_extracted_source(
+        conn, external_id="2", ticker="CPRT", company="Copart Inc Two", discovered_at="2026-01-01T00:01:00+00:00"
+    )
+    insert_screening(conn, source_id=first_id, overall_prediction="PASS", content_hash="hash-1-v1")
+    conn.close()
+
+    conn = db.connect(config.database_path)
+    conn.execute("UPDATE source_screenings SET overall_prediction = 'INVESTIGATE_NOW' WHERE source_id = ?", (first_id,))
+    conn.commit()
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    assert assigned == {first_id}  # still the deterministically-first one, prediction change had no effect
+
+
+def test_selection_remains_deterministic_across_repeated_runs_with_duplicates_present(tmp_path):
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_extracted_source(
+        conn, external_id="1", ticker="CPRT", company="Copart Inc", discovered_at="2026-01-01T00:00:00+00:00"
+    )
+    insert_extracted_source(
+        conn, external_id="2", ticker="CPRT", company="Copart Inc Two", discovered_at="2026-01-01T00:01:00+00:00"
+    )
+    insert_extracted_source(
+        conn, external_id="3", ticker="ABC", company="Abc Corp", discovered_at="2026-01-01T00:02:00+00:00"
+    )
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+    conn = db.connect(config.database_path)
+    first_run = sorted(row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments"))
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+    conn = db.connect(config.database_path)
+    second_run = sorted(row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments"))
+    conn.close()
+
+    assert first_run == second_run
+    assert len(first_run) == 2  # CPRT (one of two) + ABC
+
+
+def test_direct_digest_reply_screen_review_blind_review_unaffected_by_identity_dedupe(tmp_path):
+    """The identity-dedupe fix only changes blind-review's OWN candidate
+    exclusion; it must not alter existing DIRECT/DIGEST_REPLY/
+    SCREEN_REVIEW suppression or normal BLIND_REVIEW judgment creation.
+    """
+    config = make_config(tmp_path)
+    conn = db.connect(config.database_path)
+    insert_direct_id = insert_extracted_source(conn, external_id="1", ticker="XYZ", company="Xyz Corp")
+    db.insert_message(
+        conn, message_id="msg_direct", inbox_id="inbox_abc", thread_id="thread_direct",
+        received_at="2026-01-01T00:00:00+00:00", sender="brad@example.com",
+        recipients="ideas@yourdomain.agentmail.to", subject="An idea",
+        body_raw="LIKE, XYZ", body_format="text", size_bytes=1, stored_at="2026-01-01T00:00:05+00:00",
+        sender_authenticated="AUTHENTICATED",
+    )
+    conn.close()
+    conn = db.connect(config.database_path)
+    db.insert_feedback(
+        conn, message_id="msg_direct", event_type="FEEDBACK", verdict="LIKE", ticker="XYZ",
+        company=None, novelty="UNKNOWN", user_comment="direct judgment", parsed_json="{}",
+        parser_version="v1", model_name="claude-haiku-4-5", confidence=0.9,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    db.set_feedback_parse_status(conn, "msg_direct", "PARSED")
+
+    fresh_id = insert_extracted_source(conn, external_id="2", ticker="ABC", company="Abc Corp")
+    conn.close()
+
+    cli.cmd_blind_review(config, limit=4)
+
+    conn = db.connect(config.database_path)
+    assigned = {row["source_id"] for row in conn.execute("SELECT source_id FROM blind_review_assignments")}
+    conn.close()
+
+    # The DIRECT-judged ticker (XYZ) is still excluded exactly as before.
+    assert insert_direct_id not in assigned
+    assert fresh_id in assigned
