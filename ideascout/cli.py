@@ -22,6 +22,7 @@ from . import (
     blind_review,
     db,
     digest_reply,
+    holdout_audit,
     idea_extraction,
     notifier,
     parser,
@@ -3284,6 +3285,25 @@ def _source_screening_label(row) -> str:
     return " | ".join(parts)
 
 
+def cmd_audit_holdout_integrity(config: Config) -> int:
+    """READ-ONLY: audit the active Taste version's holdout for duplicates and
+    validity problems, then print a manual remediation plan if it is not
+    clean. SELECT-only: changes no rows, creates no assignments, never
+    unlocks or evaluates a taste version, and never calls an LLM.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet -- no holdout to audit.")
+        return 0
+    audit = holdout_audit.audit_holdout(conn, latest_taste)
+    conn.close()
+    for line in holdout_audit.render_lines(audit):
+        print(line)
+    return 0
+
+
 def cmd_audit_screening_narratives(config: Config, source_name: str | None = None) -> int:
     """READ-ONLY: list each CURRENT WATCH/INVESTIGATE_NOW screening whose
     EFFECTIVE narrative (original model output plus any successful repair)
@@ -3746,6 +3766,10 @@ def build_parser() -> argparse.ArgumentParser:
     repair_source_content_parser.add_argument(
         "--dry-run", action="store_true", help="Print what would be repaired -- no database changes, no LLM calls, no refetching"
     )
+    subparsers.add_parser(
+        "audit-holdout-integrity",
+        help="READ-ONLY: check whether the active Taste holdout has 20 unique, valid judgments",
+    )
     audit_narratives_parser = subparsers.add_parser(
         "audit-screening-narratives",
         help="READ-ONLY: list current WATCH/INVESTIGATE_NOW screenings with an incomplete narrative",
@@ -3924,6 +3948,11 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
+        elif args.command == "audit-holdout-integrity":
+            # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_audit_holdout_integrity(config)
         elif args.command == "audit-screening-narratives":
             # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
             config = load_config()
