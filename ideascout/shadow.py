@@ -82,6 +82,34 @@ class ShadowPrediction(BaseModel):
     confidence: Literal["HIGH", "MEDIUM", "LOW"]
 
 
+class NarrativeRepair(BaseModel):
+    """The ONLY thing the narrative repair call may return. Deliberately has
+    no classification, confidence, or dimension fields at all, so a repair
+    response cannot change them even if the model tried to -- anything else
+    it returns is simply ignored (pydantic drops unknown fields).
+    """
+
+    key_reasons: List[str] = Field(default_factory=list)
+    key_concerns: List[str] = Field(default_factory=list)
+    critical_questions: List[str] = Field(default_factory=list)
+
+
+REPAIR_MAX_OUTPUT_TOKENS = 700
+
+_REPAIR_INSTRUCTIONS = """\
+A previous screening of this same idea was classified {overall_prediction} \
+(confidence {confidence}), but its narrative was missing. Your ONLY task now \
+is to supply the missing narrative fields listed below, grounded in the \
+idea summary and the taste profile and rules above. Do NOT revisit or \
+change the classification, confidence, or any dimension -- those are already \
+decided and are shown for context only. Return an empty list for every field \
+you were not asked to fill. Never invent facts; if the material truly does \
+not support a field, return an empty list for it.
+
+Missing fields to fill: {missing_fields}
+"""
+
+
 def build_client(api_key: str):
     import anthropic
 
@@ -95,6 +123,53 @@ def format_idea_record_for_screening(idea_record) -> str:
     """
     lines = [f"{label}: {idea_record[column] or '(not stated)'}" for label, column in _IDEA_RECORD_FIELDS]
     return "\n".join(lines)
+
+
+def repair_narrative(
+    client,
+    model_name: str,
+    *,
+    idea_taste_body: str,
+    screen_rules_body: str,
+    idea_record,
+    prediction,
+    missing_fields: list[str],
+    logger=None,
+) -> NarrativeRepair:
+    """Exactly ONE narrow call (max_attempts=1 -- no internal retry either)
+    to fill only the narrative fields a WATCH/INVESTIGATE_NOW screening is
+    missing. Same taste profile, same permanent rules, same compact idea
+    record; the already-returned classification is passed as read-only
+    context. Callers merge only the requested, still-missing fields (see
+    screening_narrative.merge_narrative) -- nothing else is ever read from
+    the response.
+    """
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        idea_taste_body=idea_taste_body, screen_rules_body=screen_rules_body
+    )
+    context = (
+        f"Existing screening (read-only, do not change): overall={prediction.overall_prediction}, "
+        f"confidence={prediction.confidence}, mispricing={prediction.mispricing}, "
+        f"variant_perception={prediction.variant_perception}, upside={prediction.upside}, "
+        f"business_quality={prediction.business_quality}, downside={prediction.downside}."
+    )
+    instructions = _REPAIR_INSTRUCTIONS.format(
+        overall_prediction=prediction.overall_prediction,
+        confidence=prediction.confidence,
+        missing_fields=", ".join(missing_fields),
+    )
+    user_content = "New idea to screen:\n\n" + format_idea_record_for_screening(idea_record) + "\n\n" + context + "\n\n" + instructions
+    return structured_llm.generate_structured(
+        client,
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        output_model=NarrativeRepair,
+        max_output_tokens=REPAIR_MAX_OUTPUT_TOKENS,
+        max_attempts=1,
+        label="screening narrative repair",
+        logger=logger,
+    )
 
 
 def screen_idea(

@@ -682,6 +682,36 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE taste_versions ADD COLUMN build_unlocked INTEGER NOT NULL DEFAULT 0;
     """,
+    # Migration 16 (screening narrative repair): an additive, append-only
+    # record of each bounded attempt to fill a WATCH/INVESTIGATE_NOW
+    # screening's missing narrative (see ideascout/screening_narrative.py and
+    # shadow.repair_narrative). Why a new table rather than an update to
+    # source_screenings: that table is deliberately immutable (no update
+    # function exists, and UNIQUE(source_id, taste_version, screen_rules_sha256)
+    # forbids a second screening row for the same taste+rules), so the
+    # original model output -- including its empty narrative -- must stay
+    # untouched as provenance. The repair is therefore a separate row keyed
+    # by screening_id; the effective narrative is computed at read time by
+    # merging it in, and only into fields that were originally missing. No
+    # UNIQUE on screening_id: an explicit operator rescreen-source may make a
+    # new, logged attempt. Purely additive -- no existing row or column changes.
+    """
+    CREATE TABLE source_screening_narrative_repairs (
+        repair_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        screening_id             INTEGER NOT NULL REFERENCES source_screenings(screening_id),
+        attempted_at             TEXT NOT NULL,
+        model_name               TEXT NOT NULL,
+        status                   TEXT NOT NULL,
+        missing_fields_json      TEXT NOT NULL,
+        key_reasons_json         TEXT NOT NULL,
+        key_concerns_json        TEXT NOT NULL,
+        critical_questions_json  TEXT NOT NULL,
+        error                    TEXT
+    );
+
+    CREATE INDEX idx_screening_narrative_repairs_screening_id
+        ON source_screening_narrative_repairs(screening_id);
+    """,
 ]
 
 
@@ -2360,6 +2390,62 @@ def get_newest_source_date(conn: sqlite3.Connection, source_name: str) -> str | 
     return row["newest"] if row else None
 
 
+def insert_screening_narrative_repair(
+    conn: sqlite3.Connection,
+    *,
+    screening_id: int,
+    attempted_at: str,
+    model_name: str,
+    status: str,
+    missing_fields: list[str],
+    key_reasons: list[str],
+    key_concerns: list[str],
+    critical_questions: list[str],
+    error: str | None = None,
+) -> int:
+    """Append one narrative-repair attempt for an existing screening. Status
+    is REPAIRED (the attempt produced substantive text for the missing
+    fields), STILL_INCOMPLETE (it ran but the fields are still empty), or
+    FAILED (the call itself errored). Never updates an existing repair row.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO source_screening_narrative_repairs (
+            screening_id, attempted_at, model_name, status, missing_fields_json,
+            key_reasons_json, key_concerns_json, critical_questions_json, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            screening_id,
+            attempted_at,
+            model_name,
+            status,
+            json.dumps(missing_fields),
+            json.dumps(key_reasons),
+            json.dumps(key_concerns),
+            json.dumps(critical_questions),
+            error,
+        ),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_latest_repaired_narrative(conn: sqlite3.Connection, screening_id: int) -> sqlite3.Row | None:
+    """The most recent SUCCESSFUL (status='REPAIRED') narrative repair for one
+    screening, or None. Failed/still-incomplete attempts are kept as audit
+    trail but never feed the effective narrative.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM source_screening_narrative_repairs
+        WHERE screening_id = ? AND status = 'REPAIRED'
+        ORDER BY repair_id DESC LIMIT 1
+        """,
+        (screening_id,),
+    ).fetchone()
+
+
 def get_source_screening(
     conn: sqlite3.Connection, *, source_id: int, taste_version: int, screen_rules_sha256: str
 ) -> sqlite3.Row | None:
@@ -2861,6 +2947,21 @@ def count_feedback_by_origin(conn: sqlite3.Connection, feedback_origin: str) -> 
     ).fetchone()[0]
 
 
+# THE ONE definition of "the current version of a logical document" (alias
+# `cs` = the candidate collected_sources row): the row with the greatest
+# source_id among every version of its (source_name, external_id),
+# regardless of collection_status. Digest, default display, and the audit all
+# apply this same clause; a document's newest version is decided BEFORE its
+# collection_status is considered, so an older COLLECTED version can never
+# stand in for a newer INCOMPLETE_CONTENT one.
+_LATEST_VERSION_CLAUSE = """cs.source_id = (
+              SELECT cs2.source_id FROM collected_sources cs2
+              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+              ORDER BY cs2.source_id DESC
+              LIMIT 1
+          )"""
+
+
 def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, taste_version: int) -> list[sqlite3.Row]:
     """Sources with a non-PASS screening for this taste_version that have
     never been shown in a digest yet -- one row per LOGICAL document
@@ -2893,12 +2994,7 @@ def get_unshown_screened_sources_for_taste_version(conn: sqlite3.Connection, tas
           AND ss.overall_prediction != 'PASS'
           AND cs.collection_status = 'COLLECTED'
           AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
-          AND cs.source_id = (
-              SELECT cs2.source_id FROM collected_sources cs2
-              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
-              ORDER BY cs2.source_id DESC
-              LIMIT 1
-          )
+          AND """ + _LATEST_VERSION_CLAUSE + """
           AND ss.screening_id = (
               SELECT MAX(s2.screening_id) FROM source_screenings s2
               WHERE s2.source_id = cs.source_id AND s2.taste_version = :taste_version
@@ -2935,31 +3031,62 @@ def get_recent_source_screenings(conn: sqlite3.Connection, limit: int) -> list[s
 
 
 def get_recent_source_screenings_deduplicated(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """Like get_recent_source_screenings, but one row per LOGICAL document
-    (source_name, external_id) -- not per stored version. For a document
-    with more than one version (a genuine content change, or a historical
-    duplicate retained from before the Stage 5.4 idempotency fix), this
-    picks that document's single newest screening across ALL of its
-    versions (by created_at, then screening_id as a tiebreak), so a
-    retained old duplicate version never causes the same document to be
-    shown twice. --limit is applied to this already-deduplicated result,
-    not before deduplication.
+    """Default (current) screening view: one row per LOGICAL document, and
+    only for documents whose NEWEST source version is COLLECTED.
+
+    Newest-version rule (the same _LATEST_VERSION_CLAUSE digest selection
+    uses): the document's newest collected_sources row is determined FIRST,
+    regardless of collection_status. Only if that newest row is COLLECTED
+    does its screening participate; the document's screening is that newest
+    row's latest screening. If the newest version is INCOMPLETE_CONTENT (or
+    otherwise non-COLLECTED), the whole document is suppressed -- it never
+    falls back to an older COLLECTED version. Historical rows are not
+    deleted or mutated; get_recent_source_screenings (--all-versions) still
+    returns everything unfiltered.
     """
     return conn.execute(
         """
         SELECT cs.*, ss.*
         FROM source_screenings ss
         JOIN collected_sources cs ON cs.source_id = ss.source_id
-        WHERE ss.screening_id = (
-            SELECT ss2.screening_id
-            FROM source_screenings ss2
-            JOIN collected_sources cs2 ON cs2.source_id = ss2.source_id
-            WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
-            ORDER BY ss2.created_at DESC, ss2.screening_id DESC
-            LIMIT 1
-        )
+        WHERE cs.collection_status = 'COLLECTED'
+          AND """ + _LATEST_VERSION_CLAUSE + """
+          AND ss.screening_id = (
+            SELECT MAX(s2.screening_id) FROM source_screenings s2
+            WHERE s2.source_id = cs.source_id
+          )
         ORDER BY ss.created_at DESC, ss.screening_id DESC
         LIMIT :limit
         """,
         {"limit": limit},
+    ).fetchall()
+
+
+def get_current_screenings_for_audit(
+    conn: sqlite3.Connection, taste_version: int, source_name: str | None = None
+) -> list[sqlite3.Row]:
+    """Read-only: each logical document's CURRENT screening for one taste
+    version, under exactly the same newest-version rule as digest selection
+    and the default display (_LATEST_VERSION_CLAUSE). Only a COLLECTED newest
+    version contributes; its latest screening for this taste version is the
+    one returned. Used by audit-screening-narratives, which then judges the
+    effective narrative of each row. Never writes anything.
+    """
+    scope = "AND cs.source_name = :source_name" if source_name is not None else ""
+    return conn.execute(
+        """
+        SELECT cs.*, ss.*
+        FROM source_screenings ss
+        JOIN collected_sources cs ON cs.source_id = ss.source_id
+        WHERE ss.taste_version = :taste_version
+          AND cs.collection_status = 'COLLECTED'
+          AND """ + _LATEST_VERSION_CLAUSE + """
+          AND ss.screening_id = (
+            SELECT MAX(s2.screening_id) FROM source_screenings s2
+            WHERE s2.source_id = cs.source_id AND s2.taste_version = :taste_version
+          )
+          """ + scope + """
+        ORDER BY cs.source_name, cs.external_id
+        """,
+        {"taste_version": taste_version, "source_name": source_name},
     ).fetchall()

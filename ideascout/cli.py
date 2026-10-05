@@ -12,6 +12,7 @@ import json
 import re
 import sys
 import time
+from types import SimpleNamespace
 from datetime import date, datetime, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -25,6 +26,7 @@ from . import (
     notifier,
     parser,
     screen_review,
+    screening_narrative,
     shadow,
     source_isolation,
     structured_llm,
@@ -1743,6 +1745,111 @@ def _read_source_raw_text(adapter, row) -> str:
     return adapter.html_to_text(html)
 
 
+_NARRATIVE_JSON_COLUMNS = {
+    "key_reasons": "key_reasons_json",
+    "key_concerns": "key_concerns_json",
+    "critical_questions": "critical_questions_json",
+}
+
+
+def _stored_narrative(screening_row) -> dict[str, list[str]]:
+    return {field: json.loads(screening_row[column]) for field, column in _NARRATIVE_JSON_COLUMNS.items()}
+
+
+def _effective_narrative(conn, screening_row) -> dict[str, list[str]]:
+    """The screening's narrative as it should be read: the original model
+    output, with any successful one-shot repair merged in only where the
+    original was missing (screening_narrative.merge_narrative). Read-only.
+    """
+    repair = db.get_latest_repaired_narrative(conn, screening_row["screening_id"])
+    repair_lists = None
+    if repair is not None:
+        repair_lists = {
+            field: json.loads(repair[column]) for field, column in _NARRATIVE_JSON_COLUMNS.items()
+        }
+    return screening_narrative.merge_narrative(_stored_narrative(screening_row), repair_lists)
+
+
+def _repair_screening_narrative_once(
+    conn,
+    *,
+    client,
+    config: Config,
+    idea_taste_content: str,
+    screen_rules_content: str,
+    source_row,
+    screening_id: int,
+    classification,
+    original_narrative: dict[str, list[str]],
+    missing_fields: list[str],
+    logger,
+) -> str:
+    """Exactly ONE bounded narrative repair call for a WATCH/INVESTIGATE_NOW
+    screening whose narrative is missing. Never a second attempt, and never
+    a re-run of the full screen. The attempt is recorded append-only (even
+    on failure), and the original screening row is never touched. Returns
+    REPAIRED, STILL_INCOMPLETE, or FAILED.
+    """
+    attempted_at = utcnow_iso()
+    try:
+        repair = shadow.repair_narrative(
+            client,
+            config.taste_model_name,
+            idea_taste_body=idea_taste_content,
+            screen_rules_body=screen_rules_content,
+            idea_record=source_row,
+            prediction=classification,
+            missing_fields=missing_fields,
+            logger=logger,
+        )
+    except structured_llm.StructuredGenerationError as exc:
+        logger.exception(f"Narrative repair failed for screening_id={screening_id}: {exc}")
+        db.insert_screening_narrative_repair(
+            conn,
+            screening_id=screening_id,
+            attempted_at=attempted_at,
+            model_name=config.taste_model_name,
+            status="FAILED",
+            missing_fields=missing_fields,
+            key_reasons=[],
+            key_concerns=[],
+            critical_questions=[],
+            error=str(exc),
+        )
+        return "FAILED"
+
+    returned = {
+        "key_reasons": screening_narrative.substantive_items(repair.key_reasons),
+        "key_concerns": screening_narrative.substantive_items(repair.key_concerns),
+        "critical_questions": screening_narrative.substantive_items(repair.critical_questions),
+    }
+    # Only the fields that were actually missing may be filled from this
+    # attempt; anything else the response contained is discarded.
+    contributed = {
+        field: (returned[field] if field in missing_fields else []) for field in screening_narrative.NARRATIVE_FIELDS
+    }
+    merged = screening_narrative.merge_narrative(original_narrative, contributed)
+    still_missing = screening_narrative.narrative_gaps(
+        classification.overall_prediction,
+        merged["key_reasons"],
+        merged["key_concerns"],
+        merged["critical_questions"],
+    )
+    status = "STILL_INCOMPLETE" if still_missing else "REPAIRED"
+    db.insert_screening_narrative_repair(
+        conn,
+        screening_id=screening_id,
+        attempted_at=attempted_at,
+        model_name=config.taste_model_name,
+        status=status,
+        missing_fields=missing_fields,
+        key_reasons=contributed["key_reasons"],
+        key_concerns=contributed["key_concerns"],
+        critical_questions=contributed["critical_questions"],
+    )
+    return status
+
+
 def cmd_source_login(config: Config, source_name: str) -> int:
     """Manual, one-time (per session-expiry) authentication for a
     website-source adapter. Opens a VISIBLE Chrome window using a
@@ -2025,6 +2132,7 @@ def cmd_collect_source(
     # if taste/rules aren't ready yet -- raw capture and extraction never
     # depend on screening being possible.
     screened_now = 0
+    narrative_repairs: dict[str, int] = {}
     screening_note = None
     if config.anthropic_api_key:
         try:
@@ -2052,7 +2160,7 @@ def cmd_collect_source(
                 except structured_llm.StructuredGenerationError as exc:
                     logger.exception(str(exc))
                     continue
-                db.insert_source_screening(
+                screening_id = db.insert_source_screening(
                     conn,
                     source_id=row["source_id"],
                     created_at=utcnow_iso(),
@@ -2074,6 +2182,32 @@ def cmd_collect_source(
                     confidence=prediction.confidence,
                 )
                 screened_now += 1
+                original_narrative = {
+                    "key_reasons": list(prediction.key_reasons),
+                    "key_concerns": list(prediction.key_concerns),
+                    "critical_questions": list(prediction.critical_questions),
+                }
+                gaps = screening_narrative.narrative_gaps(
+                    prediction.overall_prediction,
+                    original_narrative["key_reasons"],
+                    original_narrative["key_concerns"],
+                    original_narrative["critical_questions"],
+                )
+                if gaps:
+                    outcome = _repair_screening_narrative_once(
+                        conn,
+                        client=shadow_client,
+                        config=config,
+                        idea_taste_content=idea_taste_content,
+                        screen_rules_content=screen_rules_content,
+                        source_row=row,
+                        screening_id=screening_id,
+                        classification=prediction,
+                        original_narrative=original_narrative,
+                        missing_fields=gaps,
+                        logger=logger,
+                    )
+                    narrative_repairs[outcome] = narrative_repairs.get(outcome, 0) + 1
 
     db.set_meta(conn, f"source:{source_name}:last_collected_at", utcnow_iso())
     db.set_meta(conn, f"source:{source_name}:last_collection_errors", str(stats["errors"]))
@@ -2091,6 +2225,11 @@ def cmd_collect_source(
         print(f"Screening skipped this run: {screening_note}")
     else:
         print(f"Ideas screened this run: {screened_now}")
+    if narrative_repairs:
+        print(
+            "Screening narrative repairs this run: "
+            + ", ".join(f"{status}={count}" for status, count in sorted(narrative_repairs.items()))
+        )
     return 0
 
 
@@ -2444,6 +2583,153 @@ def cmd_repair_source_content(config: Config, source_name: str, *, dry_run: bool
     return 0
 
 
+def cmd_rescreen_source(config: Config, source_name: str, external_id: str) -> int:
+    """Targeted repair for ONE exact stored source -- never recollects, never
+    touches a browser, never affects any other source. Operates only on the
+    latest stored version of that external_id, and only if it is currently
+    COLLECTED and EXTRACTED.
+
+    - No screening yet under the current taste/rules: screens it once (the
+      same call collect-source makes), then runs the one-shot narrative
+      repair if a WATCH/INVESTIGATE_NOW came back without narrative.
+    - Screening exists and its effective narrative is already complete (or
+      it is PASS/INSUFFICIENT_INFORMATION): nothing is called, nothing is
+      written.
+    - Screening exists but its narrative is missing: exactly one narrative
+      repair call. The full screen is NOT re-run.
+
+    Screening rows are never edited or deleted; every attempt is appended.
+    """
+    adapter = SOURCE_ADAPTERS.get(source_name)
+    if adapter is None:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    logger = get_logger()
+    conn = db.open_production_database(config.database_path)
+    row = db.get_latest_collected_source(conn, source_name, external_id)
+    if row is None:
+        conn.close()
+        print(f"No stored {source_name} source with external_id={external_id}. Nothing changed.")
+        return 1
+    if row["collection_status"] != "COLLECTED" or row["extraction_status"] != "EXTRACTED":
+        status = f"collection_status={row['collection_status']}, extraction_status={row['extraction_status']}"
+        conn.close()
+        print(
+            f"{source_name}/{external_id} is not a usable screened source ({status}). "
+            "Nothing changed. Run collect-source once it is valid and extracted."
+        )
+        return 1
+
+    try:
+        latest_taste, idea_taste_content, screen_rules_content, screen_rules_sha256 = (
+            _load_frozen_taste_and_rules(conn, config)
+        )
+    except TasteOrRulesUnavailableError as exc:
+        conn.close()
+        print(f"Cannot rescreen: {exc}")
+        return 1
+
+    existing = db.get_source_screening(
+        conn,
+        source_id=row["source_id"],
+        taste_version=latest_taste["version_number"],
+        screen_rules_sha256=screen_rules_sha256,
+    )
+    client = shadow.build_client(config.anthropic_api_key)
+
+    if existing is None:
+        try:
+            prediction = shadow.screen_idea(
+                client,
+                config.taste_model_name,
+                idea_taste_body=idea_taste_content,
+                screen_rules_body=screen_rules_content,
+                idea_record=row,
+                logger=logger,
+            )
+        except structured_llm.StructuredGenerationError as exc:
+            conn.close()
+            print(f"Screening failed for {source_name}/{external_id}: {exc}. Nothing changed.")
+            return 1
+        screening_id = db.insert_source_screening(
+            conn,
+            source_id=row["source_id"],
+            created_at=utcnow_iso(),
+            taste_version=latest_taste["version_number"],
+            taste_sha256=latest_taste["idea_taste_sha256"],
+            screen_rules_path=str(config.screen_rules_path),
+            screen_rules_sha256=screen_rules_sha256,
+            content_hash=row["content_hash"],
+            model_name=config.taste_model_name,
+            overall_prediction=prediction.overall_prediction,
+            mispricing=prediction.mispricing,
+            variant_perception=prediction.variant_perception,
+            upside=prediction.upside,
+            business_quality=prediction.business_quality,
+            downside=prediction.downside,
+            key_reasons_json=json.dumps(prediction.key_reasons),
+            key_concerns_json=json.dumps(prediction.key_concerns),
+            critical_questions_json=json.dumps(prediction.critical_questions),
+            confidence=prediction.confidence,
+        )
+        print(f"Screened {source_name}/{external_id} as {prediction.overall_prediction} (new screening).")
+        classification = prediction
+        original_narrative = {
+            "key_reasons": list(prediction.key_reasons),
+            "key_concerns": list(prediction.key_concerns),
+            "critical_questions": list(prediction.critical_questions),
+        }
+    else:
+        screening_id = existing["screening_id"]
+        original_narrative = _stored_narrative(existing)
+        classification = SimpleNamespace(
+            overall_prediction=existing["overall_prediction"],
+            confidence=existing["confidence"],
+            mispricing=existing["mispricing"],
+            variant_perception=existing["variant_perception"],
+            upside=existing["upside"],
+            business_quality=existing["business_quality"],
+            downside=existing["downside"],
+        )
+
+    effective = _effective_narrative(conn, existing) if existing is not None else original_narrative
+    gaps = screening_narrative.narrative_gaps(
+        classification.overall_prediction,
+        effective["key_reasons"],
+        effective["key_concerns"],
+        effective["critical_questions"],
+    )
+    if not gaps:
+        conn.close()
+        print(
+            f"{source_name}/{external_id} narrative is already complete "
+            f"({classification.overall_prediction}). No repair attempted; no LLM call made."
+        )
+        return 0
+
+    outcome = _repair_screening_narrative_once(
+        conn,
+        client=client,
+        config=config,
+        idea_taste_content=idea_taste_content,
+        screen_rules_content=screen_rules_content,
+        source_row=row,
+        screening_id=screening_id,
+        classification=classification,
+        original_narrative=original_narrative,
+        missing_fields=gaps,
+        logger=logger,
+    )
+    conn.close()
+    print(f"Narrative repair for {source_name}/{external_id}: {outcome} (missing were: {', '.join(gaps)}).")
+    if outcome == "REPAIRED":
+        print("The narrative is now complete and the screening is digest-eligible.")
+    else:
+        print("The screening remains digest-ineligible. Provenance is kept; you may rescreen again later.")
+    return 0
+
+
 DIGEST_MAX_IDEAS = 5
 
 _LEADING_DOLLAR_PATTERN = re.compile(r"^\$")
@@ -2543,39 +2829,78 @@ def _blind_review_identity_sets(conn) -> tuple[set[str], set[str]]:
     return judged_tickers, judged_companies
 
 
-def select_digest_candidates(conn, taste_version: int) -> tuple[list, int]:
+class _NarrativeView:
+    """Read-only view over a digest candidate row whose three narrative
+    columns reflect the EFFECTIVE narrative (original model output plus any
+    successful repair). Every other column delegates unchanged to the
+    underlying sqlite3.Row, so downstream rendering needs no changes.
+    """
+
+    def __init__(self, row, narrative: dict[str, list[str]]):
+        self._row = row
+        self._overrides = {
+            column: json.dumps(narrative[field]) for field, column in _NARRATIVE_JSON_COLUMNS.items()
+        }
+
+    def __getitem__(self, key):
+        if key in self._overrides:
+            return self._overrides[key]
+        return self._row[key]
+
+
+def select_digest_candidates_detailed(conn, taste_version: int) -> tuple[list, int, int]:
     """THE ONE candidate-selection function preview-digest AND send-digest
     both use -- do not reimplement this elsewhere. Returns (selected,
-    already_judged_suppressed_count).
+    already_judged_suppressed_count, incomplete_narrative_suppressed_count).
 
     The underlying query (db.get_unshown_screened_sources_for_taste_
-    version) already applies latest-version-only, non-PASS, and not-yet-
-    shown filtering at the SQL level. On top of that, a candidate whose
-    ticker or (ticker-absent fallback) company name matches a genuinely
-    learning-eligible feedback judgment is suppressed here -- Brad has
-    already judged it via email, so a website-source digest must not
-    present it as if it were a new discovery, even from a materially
-    changed later source version (see module docstring / task notes;
-    explicit re-surfacing logic is intentionally not built yet). A
-    suppressed candidate is simply excluded, never marked shown.
-    Remaining candidates: INVESTIGATE_NOW first, then WATCH, capped at
-    DIGEST_MAX_IDEAS. No LLM calls, no DB writes anywhere in this
-    function.
+    version) already applies latest-version-only, COLLECTED-only, non-PASS,
+    and not-yet-shown filtering at the SQL level. On top of that:
+      - a candidate whose ticker or (ticker-absent fallback) company name
+        matches a genuinely learning-eligible feedback judgment is
+        suppressed -- Brad has already judged it via email;
+      - a WATCH/INVESTIGATE_NOW candidate whose EFFECTIVE narrative is still
+        missing a substantive reason, concern, or question is suppressed
+        (screening_narrative.narrative_gaps). It is never converted to PASS,
+        never given fallback prose, and its screening row is untouched.
+    Suppressed candidates are simply excluded, never marked shown. Remaining
+    candidates: INVESTIGATE_NOW first, then WATCH, capped at DIGEST_MAX_IDEAS.
+    No LLM calls and no DB writes anywhere in this function.
     """
     candidates = db.get_unshown_screened_sources_for_taste_version(conn, taste_version)
     judged_tickers, judged_companies = _judged_identity_sets(conn)
 
     eligible = []
-    suppressed_count = 0
+    judged_suppressed = 0
+    narrative_suppressed = 0
     for candidate in candidates:
         if _is_already_judged_by_brad(candidate, judged_tickers, judged_companies):
-            suppressed_count += 1
-        else:
-            eligible.append(candidate)
+            judged_suppressed += 1
+            continue
+        narrative = _effective_narrative(conn, candidate)
+        gaps = screening_narrative.narrative_gaps(
+            candidate["overall_prediction"],
+            narrative["key_reasons"],
+            narrative["key_concerns"],
+            narrative["critical_questions"],
+        )
+        if gaps:
+            narrative_suppressed += 1
+            continue
+        eligible.append(_NarrativeView(candidate, narrative))
 
     investigate_now = [c for c in eligible if c["overall_prediction"] == "INVESTIGATE_NOW"]
     watch = [c for c in eligible if c["overall_prediction"] == "WATCH"]
-    return (investigate_now + watch)[:DIGEST_MAX_IDEAS], suppressed_count
+    return (investigate_now + watch)[:DIGEST_MAX_IDEAS], judged_suppressed, narrative_suppressed
+
+
+def select_digest_candidates(conn, taste_version: int) -> tuple[list, int]:
+    """Compatibility wrapper: (selected, already_judged_suppressed_count).
+    Callers that need the narrative-suppression count use
+    select_digest_candidates_detailed directly.
+    """
+    selected, judged_suppressed, _ = select_digest_candidates_detailed(conn, taste_version)
+    return selected, judged_suppressed
 
 
 def cmd_preview_digest(config: Config) -> int:
@@ -2593,9 +2918,12 @@ def cmd_preview_digest(config: Config) -> int:
         print("No taste model has been generated yet.")
         return 0
 
-    selected, suppressed_count = select_digest_candidates(conn, latest_taste["version_number"])
+    selected, suppressed_count, narrative_suppressed = select_digest_candidates_detailed(
+        conn, latest_taste["version_number"]
+    )
     if suppressed_count:
         print(f"Already-judged ideas suppressed: {suppressed_count}")
+    print(f"Incomplete screening narratives suppressed: {narrative_suppressed}")
 
     if not selected:
         print("No new ideas to show right now.")
@@ -2674,8 +3002,11 @@ def cmd_send_digest(config: Config, *, dry_run: bool) -> int:
         print("No taste model has been generated yet.")
         return 0
 
-    selected, suppressed_count = select_digest_candidates(conn, latest_taste["version_number"])
+    selected, suppressed_count, narrative_suppressed = select_digest_candidates_detailed(
+        conn, latest_taste["version_number"]
+    )
     print(f"Already-judged ideas suppressed: {suppressed_count}")
+    print(f"Incomplete screening narratives suppressed: {narrative_suppressed}")
     print(f"Candidates selected: {len(selected)}")
 
     if not selected:
@@ -2801,6 +3132,57 @@ def _source_screening_label(row) -> str:
     return " | ".join(parts)
 
 
+def cmd_audit_screening_narratives(config: Config, source_name: str | None = None) -> int:
+    """READ-ONLY: list each CURRENT WATCH/INVESTIGATE_NOW screening whose
+    EFFECTIVE narrative (original model output plus any successful repair)
+    is still missing a required field. Uses the same newest-version rule as
+    digest selection and the default display, so historical invalid source
+    versions never appear and an older COLLECTED version never stands in for
+    a newer one. PASS and INSUFFICIENT_INFORMATION are never reported. No LLM
+    calls and no database writes -- only SELECTs.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model has been generated yet -- nothing to audit.")
+        return 0
+
+    rows = db.get_current_screenings_for_audit(conn, latest_taste["version_number"], source_name)
+    findings = []
+    for row in rows:
+        if row["overall_prediction"] not in screening_narrative.NARRATIVE_REQUIRED_PREDICTIONS:
+            continue
+        narrative = _effective_narrative(conn, row)
+        gaps = screening_narrative.narrative_gaps(
+            row["overall_prediction"],
+            narrative["key_reasons"],
+            narrative["key_concerns"],
+            narrative["critical_questions"],
+        )
+        if gaps:
+            findings.append((row, gaps))
+    conn.close()
+
+    scope = f" for {source_name}" if source_name else ""
+    if not findings:
+        print(f"No incomplete current WATCH/INVESTIGATE_NOW narratives{scope} (taste {latest_taste['version_label']}).")
+        return 0
+
+    print(f"{len(findings)} incomplete current WATCH/INVESTIGATE_NOW narrative(s){scope}:")
+    for row, gaps in findings:
+        print(
+            f"{row['source_name']} | {row['ticker'] or '-'} | {row['company'] or '-'} | "
+            f"{row['overall_prediction']} | external_id={row['external_id']}"
+        )
+        print(
+            f"  source_id={row['source_id']} | screening_id={row['screening_id']} "
+            f"({screen_review.format_review_ref(row['screening_id'])})"
+        )
+        print(f"  Missing: {', '.join(gaps)}")
+    return 0
+
+
 def cmd_show_source_screenings(config: Config, *, limit: int, all_versions: bool = False) -> int:
     """READ-ONLY audit view of recent website-source screening decisions,
     newest first -- lets Brad inspect them without raw SQLite queries.
@@ -2826,19 +3208,31 @@ def cmd_show_source_screenings(config: Config, *, limit: int, all_versions: bool
         rows = db.get_recent_source_screenings(conn, limit)
     else:
         rows = db.get_recent_source_screenings_deduplicated(conn, limit)
+    narratives = [_effective_narrative(conn, row) for row in rows]
     conn.close()
 
     if not rows:
         print("No source screenings recorded yet.")
         return 0
 
-    for row in rows:
-        key_reasons = json.loads(row["key_reasons_json"])[:2]
-        key_concerns = json.loads(row["key_concerns_json"])[:2]
-        critical_questions = json.loads(row["critical_questions_json"])[:2]
+    for row, narrative in zip(rows, narratives):
+        key_reasons = narrative["key_reasons"][:2]
+        key_concerns = narrative["key_concerns"][:2]
+        critical_questions = narrative["critical_questions"][:2]
+        gaps = screening_narrative.narrative_gaps(
+            row["overall_prediction"],
+            narrative["key_reasons"],
+            narrative["key_concerns"],
+            narrative["critical_questions"],
+        )
 
         print(f"{_source_screening_label(row)} | {row['overall_prediction']}")
         print(f"Review ref: {screen_review.format_review_ref(row['screening_id'])}")
+        if gaps:
+            print(
+                f"Narrative: INCOMPLETE (missing {', '.join(gaps)}) -- not eligible for the digest. "
+                "Record kept as provenance."
+            )
         print(
             f"Mispricing: {row['mispricing']} | Variant: {row['variant_perception']} | "
             f"Upside: {row['upside']}"
@@ -3200,6 +3594,19 @@ def build_parser() -> argparse.ArgumentParser:
     repair_source_content_parser.add_argument(
         "--dry-run", action="store_true", help="Print what would be repaired -- no database changes, no LLM calls, no refetching"
     )
+    audit_narratives_parser = subparsers.add_parser(
+        "audit-screening-narratives",
+        help="READ-ONLY: list current WATCH/INVESTIGATE_NOW screenings with an incomplete narrative",
+    )
+    audit_narratives_parser.add_argument(
+        "source_name", nargs="?", default=None, help="Optional, e.g. yellowbrick (default: all sources)"
+    )
+    rescreen_source_parser = subparsers.add_parser(
+        "rescreen-source",
+        help="Targeted repair of ONE stored source's screening narrative (no recollection, no browser)",
+    )
+    rescreen_source_parser.add_argument("source_name", help="e.g. yellowbrick")
+    rescreen_source_parser.add_argument("--external-id", required=True, help="e.g. 144273")
     subparsers.add_parser(
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
@@ -3359,6 +3766,17 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
+        elif args.command == "audit-screening-narratives":
+            # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_audit_screening_narratives(config, args.source_name)
+        elif args.command == "rescreen-source":
+            # Needs ANTHROPIC_API_KEY (at most one screening or repair call),
+            # never AgentMail and never a browser.
+            config = load_config(require_source=True)
+            setup_logging(config.log_path)
+            return cmd_rescreen_source(config, args.source_name, args.external_id)
         elif args.command == "preview-digest":
             config = load_config()
             setup_logging(config.log_path)

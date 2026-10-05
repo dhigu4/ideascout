@@ -159,8 +159,9 @@ def test_preview_digest_prefers_investigate_now_before_watch_under_cap(tmp_path,
             screen_rules_path=str(config.screen_rules_path), screen_rules_sha256="rules_hash",
             content_hash=f"hash{i}", model_name="fake-model", overall_prediction=overall,
             mispricing="Plausible", variant_perception="Plausible", upside="Potentially sufficient",
-            business_quality="Plausible", downside="Acceptable", key_reasons_json="[]",
-            key_concerns_json="[]", critical_questions_json="[]", confidence="MEDIUM",
+            business_quality="Plausible", downside="Acceptable",
+            key_reasons_json='["Substantive reason."]', key_concerns_json='["Substantive concern."]',
+            critical_questions_json='["Substantive question?"]', confidence="MEDIUM",
         )
         source_ids.append(source_id)
     conn.close()
@@ -202,8 +203,9 @@ def test_preview_digest_never_shows_more_than_five(tmp_path, monkeypatch, capsys
             screen_rules_path=str(config.screen_rules_path), screen_rules_sha256="rules_hash",
             content_hash=f"hash{i}", model_name="fake-model", overall_prediction="INVESTIGATE_NOW",
             mispricing="Plausible", variant_perception="Plausible", upside="Potentially sufficient",
-            business_quality="Plausible", downside="Acceptable", key_reasons_json="[]",
-            key_concerns_json="[]", critical_questions_json="[]", confidence="MEDIUM",
+            business_quality="Plausible", downside="Acceptable",
+            key_reasons_json='["Substantive reason."]', key_concerns_json='["Substantive concern."]',
+            critical_questions_json='["Substantive question?"]', confidence="MEDIUM",
         )
     conn.close()
 
