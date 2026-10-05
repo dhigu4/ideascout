@@ -1933,6 +1933,10 @@ def cmd_collect_source(
 
     logger = get_logger()
     discover_limit = EXTERNAL_ID_DISCOVERY_LIMIT if external_id is not None else limit
+    # An explicitly requested, previously-known id fetched directly (see below)
+    # is always re-observed once: the pre-fetch "looks unchanged" shortcut is
+    # for ordinary listing sweeps and must not hide a targeted re-check.
+    targeted_direct = False
 
     with source_browser.persistent_chrome_context(source_name, config.browser_profiles_dir, headless=True) as context:
         page = context.new_page()
@@ -1945,11 +1949,28 @@ def cmd_collect_source(
         if external_id is not None:
             discovered_items = [item for item in discovered_items if item.external_id == external_id]
             if not discovered_items:
+                # An explicitly requested, previously-known document may have
+                # fallen out of the recent listing. If the adapter can fetch an
+                # exact id directly, re-observe it through the normal pipeline
+                # using its stored metadata. An unknown id still fails safely.
+                known = None
+                if hasattr(adapter, "direct_discovered_item"):
+                    lookup = db.open_production_database(config.database_path)
+                    known = db.get_latest_collected_source(lookup, source_name, external_id)
+                    lookup.close()
+                if known is None:
+                    print(
+                        f"NOT_FOUND: no item with external_id={external_id!r} was discovered for source "
+                        f"{source_name!r}, and it is not a previously-known document. "
+                        "No database changes made. No LLM calls made."
+                    )
+                    return 1
+                discovered_items = [adapter.direct_discovered_item(external_id, stored=known)]
+                targeted_direct = True
                 print(
-                    f"NOT_FOUND: no item with external_id={external_id!r} was discovered for source "
-                    f"{source_name!r}. No database changes made. No LLM calls made."
+                    f"DIRECT: external_id={external_id} is not in the current discovery listing but is "
+                    "already known -- fetching its exact page directly."
                 )
-                return 1
 
         if dry_run:
             print(f"[DRY RUN] Discovered: {len(discovered_items)}")
@@ -1968,7 +1989,8 @@ def cmd_collect_source(
             # title looks unchanged -- otherwise a thin summary-only
             # capture would never be retried.
             looks_unchanged = (
-                existing is not None
+                not targeted_direct
+                and existing is not None
                 and existing["collection_status"] == "COLLECTED"
                 and (item.title is None or existing["discovery_title"] == item.title)
             )

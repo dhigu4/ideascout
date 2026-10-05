@@ -1003,6 +1003,28 @@ def discover(page, *, limit: int) -> list[base.DiscoveredItem]:
     return items
 
 
+# Direct targeted fetch: a pitch's canonical URL is a deterministic function
+# of its numeric id, so a previously-known external_id can be fetched exactly
+# even after it has fallen out of the recent feed listing. Adapters that cannot
+# do this simply do not define direct_discovered_item.
+def direct_discovered_item(external_id: str, *, stored) -> base.DiscoveredItem:
+    """The DiscoveredItem for one exact, previously-known pitch, rebuilt from
+    its stored row -- the canonical URL is the stored one when present, else
+    derived from the id. Only metadata already stored is reused; nothing is
+    invented for fields the store does not have.
+    """
+    return base.DiscoveredItem(
+        external_id=external_id,
+        canonical_url=stored["canonical_url"] or _absolute_url(f"/sp/{external_id}"),
+        title=stored["discovery_title"],
+        author=stored["author"],
+        published_at=None,
+        added_at=None,
+        ticker=stored["ticker"],
+        company=stored["company"],
+    )
+
+
 def fetch(page, discovered: base.DiscoveredItem, *, discovered_at: str) -> base.SourceItem:
     page.goto(discovered.canonical_url, wait_until="domcontentloaded")
     html = page.content()
