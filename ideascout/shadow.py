@@ -19,9 +19,9 @@ prediction once Brad's own eligible feedback for that idea already exists.
 
 from __future__ import annotations
 
-from typing import List, Literal
+from typing import Annotated, List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, create_model
 
 from . import structured_llm
 
@@ -82,19 +82,53 @@ class ShadowPrediction(BaseModel):
     confidence: Literal["HIGH", "MEDIUM", "LOW"]
 
 
+REPAIR_MAX_ITEMS_PER_FIELD = 2
+REPAIR_MAX_ITEM_CHARS = 300
+# Worst case compliant payload is 3 fields x 2 items x 300 chars, roughly
+# 450 tokens of JSON. The budget is a ceiling only (output tokens are billed
+# as generated), so it sits well above that rather than at it.
+REPAIR_MAX_OUTPUT_TOKENS = 1024
+
+_RepairItem = Annotated[str, StringConstraints(max_length=REPAIR_MAX_ITEM_CHARS)]
+
+
 class NarrativeRepair(BaseModel):
     """The ONLY thing the narrative repair call may return. Deliberately has
     no classification, confidence, or dimension fields at all, so a repair
     response cannot change them even if the model tried to -- anything else
     it returns is simply ignored (pydantic drops unknown fields).
+
+    Length limits are enforced here, not by the provider: the structured-output
+    transform only passes maxItems/maxLength to the model as description text.
+    An over-long response fails validation and is recorded as VALIDATION_ERROR.
     """
 
-    key_reasons: List[str] = Field(default_factory=list)
-    key_concerns: List[str] = Field(default_factory=list)
-    critical_questions: List[str] = Field(default_factory=list)
+    key_reasons: List[_RepairItem] = Field(
+        default_factory=list,
+        max_length=REPAIR_MAX_ITEMS_PER_FIELD,
+        description="1 or 2 concise reasons this idea may deserve attention.",
+    )
+    key_concerns: List[_RepairItem] = Field(
+        default_factory=list,
+        max_length=REPAIR_MAX_ITEMS_PER_FIELD,
+        description="1 or 2 concise, specific risks or weaknesses.",
+    )
+    critical_questions: List[_RepairItem] = Field(
+        default_factory=list,
+        max_length=REPAIR_MAX_ITEMS_PER_FIELD,
+        description="1 or 2 concise, specific questions that must be answered.",
+    )
 
 
-REPAIR_MAX_OUTPUT_TOKENS = 700
+def _repair_output_model(missing_fields: list[str]) -> type[BaseModel]:
+    """A schema containing ONLY the requested fields, so the model is never
+    asked to generate narrative that will be discarded anyway.
+    """
+    return create_model(
+        "NarrativeRepairRequested",
+        **{name: (NarrativeRepair.model_fields[name].annotation, NarrativeRepair.model_fields[name]) for name in missing_fields},
+    )
+
 
 _REPAIR_INSTRUCTIONS = """\
 A previous screening of this same idea was classified {overall_prediction} \
@@ -102,9 +136,15 @@ A previous screening of this same idea was classified {overall_prediction} \
 is to supply the missing narrative fields listed below, grounded in the \
 idea summary and the taste profile and rules above. Do NOT revisit or \
 change the classification, confidence, or any dimension -- those are already \
-decided and are shown for context only. Return an empty list for every field \
-you were not asked to fill. Never invent facts; if the material truly does \
-not support a field, return an empty list for it.
+decided and are shown for context only.
+
+Strict output limits, per missing field:
+- Return 1 or 2 items. Never more.
+- Each item is one short, specific sentence of at most 250 characters.
+- Do not restate the classification, confidence, dimension ratings, company \
+description, the full thesis, or the screening rationale. Write only the items.
+- Never invent facts. If the material truly does not support a field, return \
+an empty list for it.
 
 Missing fields to fill: {missing_fields}
 """
@@ -159,17 +199,18 @@ def repair_narrative(
         missing_fields=", ".join(missing_fields),
     )
     user_content = "New idea to screen:\n\n" + format_idea_record_for_screening(idea_record) + "\n\n" + context + "\n\n" + instructions
-    return structured_llm.generate_structured(
+    requested = structured_llm.generate_structured(
         client,
         model_name=model_name,
         system_prompt=system_prompt,
         user_content=user_content,
-        output_model=NarrativeRepair,
+        output_model=_repair_output_model(missing_fields),
         max_output_tokens=REPAIR_MAX_OUTPUT_TOKENS,
         max_attempts=1,
         label="screening narrative repair",
         logger=logger,
     )
+    return NarrativeRepair(**requested.model_dump())
 
 
 def screen_idea(
