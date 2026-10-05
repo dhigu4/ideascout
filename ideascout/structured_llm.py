@@ -56,10 +56,30 @@ TRUNCATION_RETRY_REMINDER_SUFFIX = (
 TRUNCATION_RETRY_TOKEN_MULTIPLIER = 1.5
 
 
+PROVIDER_ERROR = "PROVIDER_ERROR"
+RESPONSE_PARSE_ERROR = "RESPONSE_PARSE_ERROR"
+VALIDATION_ERROR = "VALIDATION_ERROR"
+EMPTY_RESPONSE = "EMPTY_RESPONSE"
+UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+
 class StructuredGenerationError(RuntimeError):
     """Raised when a structured-output LLM call fails outright, or returns
     unusable output after every retry attempt has been exhausted.
+
+    `code` is a stable failure category (PROVIDER_ERROR, RESPONSE_PARSE_ERROR,
+    VALIDATION_ERROR, EMPTY_RESPONSE, UNKNOWN_ERROR). `detail` is a short,
+    SANITIZED explanation built only from safe facts -- an exception class
+    name, an HTTP status, a truncation flag, or pydantic field names and error
+    types. It never carries provider message text, prompts, keys, or payloads.
+    The message string is unchanged from before, so existing callers and logs
+    behave exactly as they did.
     """
+
+    def __init__(self, message: str, *, code: str = UNKNOWN_ERROR, detail: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
 
 
 class _RetryableGenerationError(RuntimeError):
@@ -68,6 +88,31 @@ class _RetryableGenerationError(RuntimeError):
     generate_structured catches this itself and either retries or raises
     StructuredGenerationError once attempts are exhausted.
     """
+
+    def __init__(self, message: str, *, code: str, detail: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
+
+
+def _provider_detail(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    name = type(exc).__name__
+    return f"{name} HTTP {status}" if isinstance(status, int) else name
+
+
+def _classify_validation_error(exc: pydantic.ValidationError) -> tuple[str, str]:
+    """Category plus a field-level summary built only from locations and error
+    types -- never the input values pydantic would otherwise quote back.
+    """
+    errors = exc.errors()
+    if any(error.get("type") == "json_invalid" for error in errors):
+        return RESPONSE_PARSE_ERROR, "malformed JSON"
+    parts = []
+    for error in errors[:3]:
+        location = ".".join(str(part) for part in error.get("loc", ())) or "root"
+        parts.append(f"{location}: {error.get('type')}")
+    return VALIDATION_ERROR, "; ".join(parts)
 
 
 def _is_schema_complexity_error(exc: Exception) -> bool:
@@ -128,6 +173,8 @@ def generate_structured(
     """
     output_config = output_config_for(output_model)
     last_error: Exception | None = None
+    last_code = UNKNOWN_ERROR
+    last_detail: str | None = None
     previous_attempt_truncated = False
 
     for attempt in range(1, max_attempts + 1):
@@ -156,31 +203,50 @@ def generate_structured(
                     f"complex. This is a schema/configuration problem with the output_model passed "
                     f"in, not a retryable content issue -- simplify it (a single flat object of "
                     f"required scalar fields, no Optional/unions, no nested models, no arrays) "
-                    f"rather than retrying this request: {exc}"
+                    f"rather than retrying this request: {exc}",
+                    code=PROVIDER_ERROR,
+                    detail="schema rejected by provider",
                 ) from exc
-            raise StructuredGenerationError(f"LLM call failed while {label}: {exc}") from exc
+            raise StructuredGenerationError(
+                f"LLM call failed while {label}: {exc}", code=PROVIDER_ERROR, detail=_provider_detail(exc)
+            ) from exc
 
         try:
             if response.stop_reason == "max_tokens":
                 previous_attempt_truncated = True
                 raise _RetryableGenerationError(
                     f"{label}: response truncated at output limit (attempt {attempt}/{max_attempts}, "
-                    f"max_tokens={attempt_max_tokens})"
+                    f"max_tokens={attempt_max_tokens})",
+                    code=RESPONSE_PARSE_ERROR,
+                    detail="truncated at output limit",
                 )
             previous_attempt_truncated = False
 
             text = next((block.text for block in response.content if getattr(block, "type", None) == "text"), "")
+            if not text.strip():
+                raise _RetryableGenerationError(
+                    f"{label}: response contained no text (attempt {attempt}/{max_attempts})",
+                    code=EMPTY_RESPONSE,
+                    detail="response contained no text",
+                )
             try:
                 return output_model.model_validate_json(text)
             except pydantic.ValidationError as exc:
+                code, detail = _classify_validation_error(exc)
                 raise _RetryableGenerationError(
-                    f"{label}: response was malformed/incomplete JSON (attempt {attempt}/{max_attempts}): {exc}"
+                    f"{label}: response was malformed/incomplete JSON (attempt {attempt}/{max_attempts}): {exc}",
+                    code=code,
+                    detail=detail,
                 ) from exc
         except _RetryableGenerationError as exc:
             last_error = exc
+            last_code = exc.code
+            last_detail = exc.detail
             will_retry = attempt < max_attempts
             if logger is not None:
                 logger.warning(f"{exc}{'; retrying' if will_retry else '; no attempts left'}")
             continue
 
-    raise StructuredGenerationError(f"Failed {label} after {max_attempts} attempts: {last_error}")
+    raise StructuredGenerationError(
+        f"Failed {label} after {max_attempts} attempts: {last_error}", code=last_code, detail=last_detail
+    )

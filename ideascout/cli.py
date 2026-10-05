@@ -1803,7 +1803,12 @@ def _repair_screening_narrative_once(
             logger=logger,
         )
     except structured_llm.StructuredGenerationError as exc:
-        logger.exception(f"Narrative repair failed for screening_id={screening_id}: {exc}")
+        # Persist only the sanitized category and detail -- never str(exc),
+        # which can carry provider text. The full message still goes to the log.
+        logger.error(
+            f"Narrative repair failed for screening_id={screening_id}: "
+            f"{_sanitized_repair_error(exc.code, exc.detail)}"
+        )
         db.insert_screening_narrative_repair(
             conn,
             screening_id=screening_id,
@@ -1814,9 +1819,9 @@ def _repair_screening_narrative_once(
             key_reasons=[],
             key_concerns=[],
             critical_questions=[],
-            error=str(exc),
+            error=_sanitized_repair_error(exc.code, exc.detail),
         )
-        return "FAILED"
+        return "FAILED", exc.code
 
     returned = {
         "key_reasons": screening_narrative.substantive_items(repair.key_reasons),
@@ -1846,8 +1851,23 @@ def _repair_screening_narrative_once(
         key_reasons=contributed["key_reasons"],
         key_concerns=contributed["key_concerns"],
         critical_questions=contributed["critical_questions"],
+        error=(
+            _sanitized_repair_error(
+                "STILL_INCOMPLETE", "fields still empty after repair: " + ", ".join(still_missing)
+            )
+            if still_missing
+            else None
+        ),
     )
-    return status
+    return status, ("STILL_INCOMPLETE" if still_missing else None)
+
+
+def _sanitized_repair_error(code: str, detail: str | None) -> str:
+    """'<CODE>: <detail>', capped in length. Built only from the sanitized
+    category and detail, so it never carries provider text, prompts, or keys.
+    """
+    text = f"{code}: {detail}" if detail else code
+    return text[:200]
 
 
 def cmd_source_login(config: Config, source_name: str) -> int:
@@ -2224,7 +2244,7 @@ def cmd_collect_source(
                     original_narrative["critical_questions"],
                 )
                 if gaps:
-                    outcome = _repair_screening_narrative_once(
+                    outcome, _reason_code = _repair_screening_narrative_once(
                         conn,
                         client=shadow_client,
                         config=config,
@@ -2632,6 +2652,87 @@ def cmd_repair_source_content(config: Config, source_name: str, *, dry_run: bool
     return 0
 
 
+def cmd_show_narrative_repairs(config: Config, source_name: str, external_id: str) -> int:
+    """READ-ONLY diagnostic: every narrative-repair attempt recorded for one
+    document's current screening -- what was missing before each attempt, what
+    (if anything) came back, the sanitized failure category, and whether the
+    effective narrative is complete now. Only SELECTs; no LLM call; no writes.
+    """
+    if source_name not in SOURCE_ADAPTERS:
+        print(f"Unknown source: {source_name!r}. Known sources: {', '.join(SOURCE_ADAPTERS)}")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    row = db.get_latest_collected_source(conn, source_name, external_id)
+    if row is None:
+        conn.close()
+        print(f"No stored {source_name} source with external_id={external_id}.")
+        return 1
+    screening = db.get_latest_source_screening_for_source(conn, row["source_id"])
+    if screening is None:
+        conn.close()
+        print(f"{source_name}/{external_id} has no screening recorded, so there are no narrative repairs.")
+        return 0
+
+    attempts = db.list_screening_narrative_repairs(conn, screening["screening_id"])
+    effective = _effective_narrative(conn, screening)
+    conn.close()
+
+    gaps = screening_narrative.narrative_gaps(
+        screening["overall_prediction"],
+        effective["key_reasons"],
+        effective["key_concerns"],
+        effective["critical_questions"],
+    )
+    print(
+        f"{source_name}/{external_id} | source_id={row['source_id']} | "
+        f"screening_id={screening['screening_id']} ({screen_review.format_review_ref(screening['screening_id'])}) | "
+        f"{screening['overall_prediction']}"
+    )
+    if gaps:
+        print(f"Effective narrative: INCOMPLETE (missing: {', '.join(gaps)}) -- digest-ineligible")
+    else:
+        print("Effective narrative: COMPLETE")
+    if not attempts:
+        print("No narrative repair attempts recorded for this screening.")
+        return 0
+
+    print(f"Repair attempts: {len(attempts)}")
+    for number, attempt in enumerate(attempts, start=1):
+        missing = json.loads(attempt["missing_fields_json"])
+        returned = [
+            field
+            for field, column in _NARRATIVE_JSON_COLUMNS.items()
+            if json.loads(attempt[column])
+        ]
+        print(
+            f"  attempt {number} | {attempt['attempted_at']} | {attempt['status']} | "
+            f"model={attempt['model_name']}"
+        )
+        print(f"    missing before attempt: {', '.join(missing) or 'none'}")
+        print(f"    fields returned: {', '.join(returned) or 'none'}")
+        print(f"    reason: {_displayable_repair_reason(attempt['error'])}")
+    return 0
+
+
+_REPAIR_REASON_CODES = (
+    "PROVIDER_ERROR", "RESPONSE_PARSE_ERROR", "VALIDATION_ERROR",
+    "EMPTY_RESPONSE", "UNKNOWN_ERROR", "STILL_INCOMPLETE",
+)
+
+
+def _displayable_repair_reason(error: str | None) -> str:
+    """Only rows written with a sanitized category are printed. Older FAILED
+    rows stored raw exception text, which may contain provider output, so
+    they are reported as legacy and their text is never shown.
+    """
+    if error is None:
+        return "-"
+    if error.startswith(_REPAIR_REASON_CODES):
+        return error
+    return "legacy row written before sanitized diagnostics (detail not shown)"
+
+
 def cmd_rescreen_source(config: Config, source_name: str, external_id: str) -> int:
     """Targeted repair for ONE exact stored source -- never recollects, never
     touches a browser, never affects any other source. Operates only on the
@@ -2757,7 +2858,7 @@ def cmd_rescreen_source(config: Config, source_name: str, external_id: str) -> i
         )
         return 0
 
-    outcome = _repair_screening_narrative_once(
+    outcome, reason_code = _repair_screening_narrative_once(
         conn,
         client=client,
         config=config,
@@ -2771,6 +2872,8 @@ def cmd_rescreen_source(config: Config, source_name: str, external_id: str) -> i
         logger=logger,
     )
     conn.close()
+    if outcome == "FAILED":
+        print(f"Narrative repair: FAILED ({reason_code})")
     print(f"Narrative repair for {source_name}/{external_id}: {outcome} (missing were: {', '.join(gaps)}).")
     if outcome == "REPAIRED":
         print("The narrative is now complete and the screening is digest-eligible.")
@@ -3656,6 +3759,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rescreen_source_parser.add_argument("source_name", help="e.g. yellowbrick")
     rescreen_source_parser.add_argument("--external-id", required=True, help="e.g. 144273")
+    show_repairs_parser = subparsers.add_parser(
+        "show-narrative-repairs",
+        help="READ-ONLY: every narrative-repair attempt for one stored source, with failure category",
+    )
+    show_repairs_parser.add_argument("source_name", help="e.g. yellowbrick")
+    show_repairs_parser.add_argument("--external-id", required=True, help="e.g. 144273")
     subparsers.add_parser(
         "preview-digest",
         help="LOCAL PREVIEW ONLY: show up to 5 new worth-attention ideas from all sources",
@@ -3820,6 +3929,11 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_audit_screening_narratives(config, args.source_name)
+        elif args.command == "show-narrative-repairs":
+            # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_show_narrative_repairs(config, args.source_name, args.external_id)
         elif args.command == "rescreen-source":
             # Needs ANTHROPIC_API_KEY (at most one screening or repair call),
             # never AgentMail and never a browser.

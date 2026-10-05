@@ -2502,6 +2502,14 @@ def insert_screening_narrative_repair(
     return cursor.lastrowid
 
 
+def list_screening_narrative_repairs(conn: sqlite3.Connection, screening_id: int) -> list[sqlite3.Row]:
+    """Every narrative-repair attempt for one screening, oldest first. Read-only."""
+    return conn.execute(
+        "SELECT * FROM source_screening_narrative_repairs WHERE screening_id = ? ORDER BY repair_id",
+        (screening_id,),
+    ).fetchall()
+
+
 def get_latest_repaired_narrative(conn: sqlite3.Connection, screening_id: int) -> sqlite3.Row | None:
     """The most recent SUCCESSFUL (status='REPAIRED') narrative repair for one
     screening, or None. Failed/still-incomplete attempts are kept as audit
