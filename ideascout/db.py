@@ -712,6 +712,35 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_screening_narrative_repairs_screening_id
         ON source_screening_narrative_repairs(screening_id);
     """,
+    # Migration 17 (current-source pointer): which semantic version of each
+    # logical document was MOST RECENTLY OBSERVED live. Previously "current"
+    # meant max(source_id), which breaks on recovery: if a document goes
+    # A (valid) -> B (invalid) -> A again, the re-observed A reuses its
+    # existing row (UNIQUE(source_name, external_id, content_hash) forbids a
+    # duplicate, and inserting one would only be a workaround), so the newest
+    # row stayed B forever. This pointer table, one row per logical document,
+    # records the current semantic version directly. Every new insert and every
+    # successful re-observation moves it; collected_sources itself is never
+    # changed, and the UNIQUE constraint is untouched. The backfill points each
+    # existing document at its max(source_id) row, which is exactly what
+    # "current" meant before, so no current view changes on upgrade.
+    """
+    CREATE TABLE collected_source_current (
+        source_name   TEXT NOT NULL,
+        external_id   TEXT NOT NULL,
+        source_id     INTEGER NOT NULL REFERENCES collected_sources(source_id),
+        observed_at   TEXT NOT NULL,
+        PRIMARY KEY (source_name, external_id)
+    );
+
+    INSERT INTO collected_source_current (source_name, external_id, source_id, observed_at)
+    SELECT cs.source_name, cs.external_id, cs.source_id, cs.created_at
+    FROM collected_sources cs
+    WHERE cs.source_id = (
+        SELECT MAX(cs2.source_id) FROM collected_sources cs2
+        WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
+    );
+    """,
 ]
 
 
@@ -2018,16 +2047,16 @@ def get_eligible_feedback_for_message(conn: sqlite3.Connection, message_id: str)
 
 
 def get_latest_collected_source(conn: sqlite3.Connection, source_name: str, external_id: str) -> sqlite3.Row | None:
-    """The most recent known VERSION of one (source_name, external_id) --
-    i.e. what a collector should compare newly discovered metadata
-    against to decide whether anything has changed. None if this
-    external_id has never been collected at all.
+    """The CURRENT semantic version of one (source_name, external_id) -- the
+    one most recently observed live (collected_source_current), not merely
+    the highest source_id. None if this external_id has never been collected.
+    This is what collectors compare against and link a new version to.
     """
     return conn.execute(
         """
-        SELECT * FROM collected_sources
-        WHERE source_name = ? AND external_id = ?
-        ORDER BY source_id DESC LIMIT 1
+        SELECT cs.* FROM collected_source_current cur
+        JOIN collected_sources cs ON cs.source_id = cur.source_id
+        WHERE cur.source_name = ? AND cur.external_id = ?
         """,
         (source_name, external_id),
     ).fetchone()
@@ -2171,8 +2200,55 @@ def insert_collected_source(
             "collection_status": collection_status,
         },
     )
+    _set_current_source(
+        conn,
+        source_name=source_name,
+        external_id=external_id,
+        source_id=cursor.lastrowid,
+        observed_at=created_at,
+    )
     conn.commit()
     return cursor.lastrowid
+
+
+def _set_current_source(
+    conn: sqlite3.Connection, *, source_name: str, external_id: str, source_id: int, observed_at: str
+) -> None:
+    """Point the document's current pointer at `source_id` (no commit -- the
+    caller commits). Used on every insert and on every re-observation of an
+    existing semantic version.
+    """
+    conn.execute(
+        """
+        INSERT INTO collected_source_current (source_name, external_id, source_id, observed_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(source_name, external_id) DO UPDATE SET
+            source_id = excluded.source_id,
+            observed_at = excluded.observed_at
+        """,
+        (source_name, external_id, source_id, observed_at),
+    )
+
+
+def mark_collected_source_observed(conn: sqlite3.Connection, *, source_id: int, observed_at: str) -> None:
+    """Record that a live fetch just observed the semantic version `source_id`
+    again. Moves the document's current pointer to it, so a recovered version
+    becomes current without any new row being inserted (no duplicate semantic
+    content, no UNIQUE constraint weakened, no provenance deleted).
+    """
+    row = conn.execute(
+        "SELECT source_name, external_id FROM collected_sources WHERE source_id = ?", (source_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no collected source with source_id={source_id}")
+    _set_current_source(
+        conn,
+        source_name=row["source_name"],
+        external_id=row["external_id"],
+        source_id=source_id,
+        observed_at=observed_at,
+    )
+    conn.commit()
 
 
 def update_collected_source_extracted(
@@ -2256,8 +2332,8 @@ def get_pending_extraction_sources(conn: sqlite3.Connection, source_name: str) -
     retried on the next collection run instead.
     """
     return conn.execute(
-        "SELECT * FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' "
-        "AND collection_status = 'COLLECTED' ORDER BY source_id",
+        "SELECT cs.* FROM collected_sources cs WHERE cs.source_name = ? AND cs.extraction_status = 'PENDING' "
+        "AND cs.collection_status = 'COLLECTED' AND " + _LATEST_VERSION_CLAUSE + " ORDER BY cs.source_id",
         (source_name,),
     ).fetchall()
 
@@ -2312,12 +2388,7 @@ def get_latest_collected_sources_for_source(conn: sqlite3.Connection, source_nam
         SELECT cs.*
         FROM collected_sources cs
         WHERE cs.source_name = ?
-          AND cs.source_id = (
-              SELECT cs2.source_id FROM collected_sources cs2
-              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
-              ORDER BY cs2.source_id DESC
-              LIMIT 1
-          )
+          AND """ + _LATEST_VERSION_CLAUSE + """
         ORDER BY cs.source_id
         """,
         (source_name,),
@@ -2369,8 +2440,8 @@ def count_pending_extraction_sources(conn: sqlite3.Connection, source_name: str)
     pending work and must never be counted here.
     """
     return conn.execute(
-        "SELECT COUNT(*) FROM collected_sources WHERE source_name = ? AND extraction_status = 'PENDING' "
-        "AND collection_status = 'COLLECTED'",
+        "SELECT COUNT(*) FROM collected_sources cs WHERE cs.source_name = ? AND cs.extraction_status = 'PENDING' "
+        "AND cs.collection_status = 'COLLECTED' AND " + _LATEST_VERSION_CLAUSE,
         (source_name,),
     ).fetchone()[0]
 
@@ -2634,12 +2705,7 @@ def get_blind_review_candidate_sources(conn: sqlite3.Connection) -> list[sqlite3
         FROM collected_sources cs
         WHERE cs.extraction_status = 'EXTRACTED'
           AND cs.collection_status = 'COLLECTED'
-          AND cs.source_id = (
-              SELECT cs2.source_id FROM collected_sources cs2
-              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
-              ORDER BY cs2.discovered_at DESC, cs2.source_id DESC
-              LIMIT 1
-          )
+          AND """ + _LATEST_VERSION_CLAUSE + """
           AND cs.source_id NOT IN (SELECT source_id FROM digest_shown_sources)
           AND cs.source_id NOT IN (SELECT source_id FROM blind_review_assignments)
           AND cs.source_id NOT IN (
@@ -2807,9 +2873,10 @@ def get_extracted_sources_missing_screening(
     """
     return conn.execute(
         """
-        SELECT * FROM collected_sources
-        WHERE source_name = ? AND extraction_status = 'EXTRACTED' AND collection_status = 'COLLECTED'
-          AND source_id NOT IN (
+        SELECT cs.* FROM collected_sources cs
+        WHERE cs.source_name = ? AND cs.extraction_status = 'EXTRACTED' AND cs.collection_status = 'COLLECTED'
+          AND """ + _LATEST_VERSION_CLAUSE + """
+          AND cs.source_id NOT IN (
               SELECT source_id FROM source_screenings
               WHERE taste_version = ? AND screen_rules_sha256 = ?
           )
@@ -2947,18 +3014,18 @@ def count_feedback_by_origin(conn: sqlite3.Connection, feedback_origin: str) -> 
     ).fetchone()[0]
 
 
-# THE ONE definition of "the current version of a logical document" (alias
-# `cs` = the candidate collected_sources row): the row with the greatest
-# source_id among every version of its (source_name, external_id),
-# regardless of collection_status. Digest, default display, and the audit all
-# apply this same clause; a document's newest version is decided BEFORE its
-# collection_status is considered, so an older COLLECTED version can never
-# stand in for a newer INCOMPLETE_CONTENT one.
+# THE ONE definition of "the current source version" of a logical document
+# (alias `cs` = the candidate collected_sources row): the semantic version the
+# document's current pointer names -- the one MOST RECENTLY OBSERVED live (see
+# Migration 17). It is decided before collection_status is considered, so an
+# older COLLECTED version can never stand in for a newer INCOMPLETE_CONTENT
+# one, and a version re-observed as valid becomes current again without any
+# new row. Every reader of "current" -- default display, digest selection,
+# audit, collect-source's comparisons, extraction/screening and blind-review
+# eligibility, and repair -- uses this one clause or get_latest_collected_source.
 _LATEST_VERSION_CLAUSE = """cs.source_id = (
-              SELECT cs2.source_id FROM collected_sources cs2
-              WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
-              ORDER BY cs2.source_id DESC
-              LIMIT 1
+              SELECT cur.source_id FROM collected_source_current cur
+              WHERE cur.source_name = cs.source_name AND cur.external_id = cs.external_id
           )"""
 
 

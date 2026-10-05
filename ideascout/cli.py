@@ -2005,6 +2005,14 @@ def cmd_collect_source(
             )
 
             if existing_same_hash is not None:
+                # Every successful live observation of a stored semantic
+                # version moves that document's current pointer to it, so a
+                # version that was superseded and is now seen valid again
+                # becomes current (no new row, no duplicate content).
+                observed_at = utcnow_iso()
+                db.mark_collected_source_observed(
+                    conn, source_id=existing_same_hash["source_id"], observed_at=observed_at
+                )
                 if existing_same_hash["collection_status"] == "COLLECTED":
                     # CASE D: already collected with this exact semantic
                     # content -- unchanged, idempotent, exactly today's
@@ -2527,14 +2535,33 @@ def cmd_repair_source_content(config: Config, source_name: str, *, dry_run: bool
                 errors += 1
                 continue
 
-            if fetched.content_hash == row["content_hash"]:
-                # Same content as before -- still invalid, and inserting a
-                # new row would collide with the UNIQUE(source_name,
-                # external_id, content_hash) constraint anyway. Repair the
-                # EXISTING row in place instead of touching its history.
+            stored_same_hash = db.get_collected_source_by_content_hash(
+                conn, source_name, fetched.external_id, fetched.content_hash
+            )
+            if stored_same_hash is not None and stored_same_hash["source_id"] == row["source_id"]:
+                # The suspect row itself: still the same (invalid) content, so
+                # it is repaired in place -- it is never "valid again" merely
+                # because it was once wrongly stored as COLLECTED.
                 db.mark_collected_source_invalid(conn, source_id=row["source_id"], reason=reason)
                 still_invalid += 1
                 print(f"  external_id={row['external_id']}: still invalid ({reason}) -- marked non-extractable.")
+            elif stored_same_hash is not None and stored_same_hash["collection_status"] != "COLLECTED":
+                # The refetched content is an already-stored INCOMPLETE version
+                # (same semantic hash): observe it, never insert a duplicate.
+                db.mark_collected_source_observed(
+                    conn, source_id=stored_same_hash["source_id"], observed_at=utcnow_iso()
+                )
+                still_invalid += 1
+                print(f"  external_id={row['external_id']}: still invalid ({reason}) -- observed, not extractable.")
+            elif stored_same_hash is not None:
+                # The refetched content matches a stored COLLECTED version: that
+                # version is valid again and becomes current, with no new row.
+                db.mark_collected_source_observed(
+                    conn, source_id=stored_same_hash["source_id"], observed_at=utcnow_iso()
+                )
+                recovered += 1
+                print(f"  external_id={row['external_id']}: valid again -- stored version source_id="
+                      f"{stored_same_hash['source_id']} is now current.")
             else:
                 raw_path = raw_storage.save_raw_html(
                     source_name, fetched.external_id, fetched.content_hash, fetched.raw_html, config.raw_storage_dir
