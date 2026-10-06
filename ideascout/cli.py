@@ -24,6 +24,7 @@ from . import (
     digest_reply,
     holdout_audit,
     idea_extraction,
+    taste_evaluation,
     notifier,
     parser,
     screen_review,
@@ -3454,6 +3455,44 @@ def cmd_repair_holdout_duplicate(
     return 0
 
 
+def cmd_evaluate_taste(config: Config, *, version: int) -> int:
+    """READ-ONLY formal evaluation of a frozen Taste version against its clean
+    blind holdout. Refuses unless the holdout gate passes (see
+    taste_evaluation.check_gate). Never sets build_unlocked, never records an
+    approval, never creates a taste version, and never changes feedback or
+    screenings. No LLM calls.
+    """
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model exists. Evaluation refused.")
+        return 1
+    gate = taste_evaluation.check_gate(conn, latest_taste, version)
+    conn.close()
+
+    if not gate.passed:
+        print(f"EVALUATION REFUSED: the holdout gate did not pass for Taste v{version}. Nothing was evaluated.")
+        for name, ok, detail in gate.checks:
+            print(f"  [{'ok' if ok else 'FAIL'}] {name} ({detail})")
+        return 1
+
+    try:
+        rules_text = config.screen_rules_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"EVALUATION REFUSED: cannot read the screening rules file: {exc}")
+        return 1
+    for line in taste_evaluation.render_report(
+        version_label=latest_taste["version_label"],
+        checkpoint_feedback_id=latest_taste["checkpoint_feedback_id"],
+        rules_sha256=taste.compute_content_sha256(rules_text),
+        gate=gate,
+        rules_text=rules_text,
+    ):
+        print(line)
+    return 0
+
+
 def cmd_audit_screening_narratives(config: Config, source_name: str | None = None) -> int:
     """READ-ONLY: list each CURRENT WATCH/INVESTIGATE_NOW screening whose
     EFFECTIVE narrative (original model output plus any successful repair)
@@ -3916,6 +3955,11 @@ def build_parser() -> argparse.ArgumentParser:
     repair_source_content_parser.add_argument(
         "--dry-run", action="store_true", help="Print what would be repaired -- no database changes, no LLM calls, no refetching"
     )
+    evaluate_parser = subparsers.add_parser(
+        "evaluate-taste",
+        help="READ-ONLY: evaluate a frozen Taste version against its clean blind holdout (refuses if not clean)",
+    )
+    evaluate_parser.add_argument("--version", type=int, required=True, help="Taste version number, e.g. 2")
     repair_duplicate_parser = subparsers.add_parser(
         "repair-holdout-duplicate",
         help="Manually exclude ONE confirmed duplicate holdout judgment (validated, backed up, reason recorded)",
@@ -4111,6 +4155,11 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
+        elif args.command == "evaluate-taste":
+            # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_evaluate_taste(config, version=args.version)
         elif args.command == "repair-holdout-duplicate":
             config = load_config()
             setup_logging(config.log_path)
