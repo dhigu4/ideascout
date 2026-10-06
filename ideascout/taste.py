@@ -25,6 +25,8 @@ from typing import List, Literal
 import pydantic
 from pydantic import BaseModel, Field
 
+from . import authority
+
 # Also referenced by cli.py; kept here so the numbers only exist in one place.
 MIN_TRAINING_RECORDS = 15
 HOLDOUT_SIZE = 20
@@ -62,7 +64,7 @@ IDEA_TASTE_SECTION_HEADERS = [
     "Areas Still Uncertain",
 ]
 
-IDEA_TASTE_SYSTEM_PROMPT = """\
+_IDEA_TASTE_PROMPT_BODY = """\
 You are building a compact, honest summary of one investor's ("Brad's") \
 idea-selection taste, based ONLY on his own real feedback on real ideas \
 that were shown to him. This will eventually be reused inside future \
@@ -142,7 +144,7 @@ include a title, a version line, or any preamble -- those are added \
 separately.\
 """
 
-CANDIDATE_RULES_SYSTEM_PROMPT = """\
+_CANDIDATE_RULES_PROMPT_BODY = """\
 You are proposing a small number of CANDIDATE durable investment-screening \
 rules, based only on the same real feedback judgments from Brad described \
 below. These are proposals for a human (Brad) to review -- they are never \
@@ -173,6 +175,18 @@ Do not invent reasoning Brad did not express. Do not draw on any \
 knowledge of the underlying investment ideas themselves -- only on Brad's \
 own reaction to them as given below.\
 """
+
+
+IDEA_TASTE_SYSTEM_PROMPT = authority.TASTE_AUTHORITY_BLOCK + "\n" + _IDEA_TASTE_PROMPT_BODY
+CANDIDATE_RULES_SYSTEM_PROMPT = authority.CANDIDATE_RULES_AUTHORITY_BLOCK + "\n" + _CANDIDATE_RULES_PROMPT_BODY
+
+
+def _permanent_rules_block(permanent_rules_text: str) -> str:
+    return (
+        "=== PERMANENT SCREENING RULES (IDEA_SCREEN_RULES.md -- authoritative) ===\n"
+        f"{permanent_rules_text}\n"
+        "=== END PERMANENT SCREENING RULES ===\n\n"
+    )
 
 
 class CandidateRule(BaseModel):
@@ -292,7 +306,9 @@ def _log(logger, message: str) -> None:
         logger.warning(message)
 
 
-def generate_idea_taste_body(client, model_name: str, records: list[dict], logger=None) -> str:
+def generate_idea_taste_body(
+    client, model_name: str, records: list[dict], *, permanent_rules_text: str, logger=None
+) -> str:
     """Returns just the eight-section markdown body -- the caller
     (cli.py) prepends the deterministic title/version/date/count header so
     that metadata is always exactly correct, never left to the model.
@@ -305,7 +321,8 @@ def generate_idea_taste_body(client, model_name: str, records: list[dict], logge
     """
     corpus = format_training_corpus(records)
     base_user_content = (
-        f"Here are {len(records)} of Brad's real, eligible judgments, oldest first:\n\n{corpus}"
+        _permanent_rules_block(permanent_rules_text)
+        + f"Here are {len(records)} of Brad's real, eligible judgments, oldest first:\n\n{corpus}"
     )
 
     last_error: Exception | None = None
@@ -347,7 +364,7 @@ def generate_idea_taste_body(client, model_name: str, records: list[dict], logge
 
 
 def generate_candidate_rules(
-    client, model_name: str, records: list[dict], logger=None
+    client, model_name: str, records: list[dict], *, permanent_rules_text: str, logger=None
 ) -> list[CandidateRule]:
     """Returns at most MAX_CANDIDATE_RULES CandidateRule objects.
 
@@ -367,7 +384,8 @@ def generate_candidate_rules(
     """
     corpus = format_training_corpus(records)
     base_user_content = (
-        f"Here are {len(records)} of Brad's real, eligible judgments, oldest first:\n\n{corpus}"
+        _permanent_rules_block(permanent_rules_text)
+        + f"Here are {len(records)} of Brad's real, eligible judgments, oldest first:\n\n{corpus}"
     )
     output_config = _candidate_rules_output_config()
 

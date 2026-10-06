@@ -23,12 +23,12 @@ from typing import Annotated, List, Literal
 
 from pydantic import BaseModel, Field, StringConstraints, create_model
 
-from . import structured_llm
+from . import authority, structured_llm
 
 MAX_OUTPUT_TOKENS = 2048
 MAX_ATTEMPTS = 3
 
-SYSTEM_PROMPT_TEMPLATE = """\
+LEGACY_SYSTEM_PROMPT_TEMPLATE = """\
 You are testing whether a documented investment taste profile and a fixed \
 set of screening rules can predict a specific investor's ("Brad's") \
 reaction to a new idea, before he has reviewed it himself. You will be \
@@ -49,6 +49,30 @@ specified in the schema -- never invent a numeric score, and never claim \
 more precision than the material supports. If the source material doesn't \
 give you enough to judge a dimension, say Unknown (or, for the overall \
 prediction, INSUFFICIENT_INFORMATION) rather than guessing.
+"""
+
+SYSTEM_PROMPT_TEMPLATE = """\
+You are testing whether a documented investment taste profile and a fixed \
+set of screening rules can predict a specific investor's ("Brad's") \
+reaction to a new idea, before he has reviewed it himself. You will be \
+given his firm's permanent screening rules, his taste profile, and a \
+compact, neutral summary of one new idea. You have NOT been given, and \
+must not guess at, Brad's actual verdict on this specific idea -- this is \
+a blind prediction.
+
+=== FAR VIEW'S PERMANENT SCREENING RULES (IDEA_SCREEN_RULES.md) -- AUTHORITATIVE ===
+{screen_rules_body}
+
+=== BRAD'S TASTE PROFILE (idea-taste.md) -- INFERRED, SECONDARY ===
+{idea_taste_body}
+
+{authority_block}
+Apply the permanent screening rules first, then the taste profile as a \
+secondary guide, to the idea you are given below. Rate each dimension using \
+ONLY the exact categorical labels specified in the schema -- never invent a \
+numeric score, and never claim more precision than the material supports. If \
+the source material doesn't give you enough to judge a dimension, say Unknown \
+(or, for the overall prediction, INSUFFICIENT_INFORMATION) rather than guessing.
 """
 
 _IDEA_RECORD_FIELDS = (
@@ -185,7 +209,9 @@ def repair_narrative(
     the response.
     """
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        idea_taste_body=idea_taste_body, screen_rules_body=screen_rules_body
+        idea_taste_body=idea_taste_body,
+        screen_rules_body=screen_rules_body,
+        authority_block=authority.SCREENING_AUTHORITY_BLOCK,
     )
     context = (
         f"Existing screening (read-only, do not change): overall={prediction.overall_prediction}, "
@@ -223,7 +249,9 @@ def screen_idea(
     logger=None,
 ) -> ShadowPrediction:
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        idea_taste_body=idea_taste_body, screen_rules_body=screen_rules_body
+        idea_taste_body=idea_taste_body,
+        screen_rules_body=screen_rules_body,
+        authority_block=authority.SCREENING_AUTHORITY_BLOCK,
     )
     user_content = "New idea to screen:\n\n" + format_idea_record_for_screening(idea_record)
     return structured_llm.generate_structured(

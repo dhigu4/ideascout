@@ -10,11 +10,16 @@ the additional autouse safety net).
 
 from __future__ import annotations
 
+import dataclasses
+
 import json
 from pathlib import Path
 
 from ideascout import cli, db, parser, taste
 from ideascout.config import Config
+
+
+RULES_TEXT = "1. Upside\n   Plausible path to greater than 100%+ upside.\n"
 
 
 def make_config(tmp_path) -> Config:
@@ -26,6 +31,8 @@ def make_config(tmp_path) -> Config:
         anthropic_api_key="fake-anthropic-key",
     )
     db.connect(config.database_path).close()
+    config = dataclasses.replace(config, screen_rules_path=tmp_path / "IDEA_SCREEN_RULES.md")
+    config.screen_rules_path.write_text(RULES_TEXT, encoding="utf-8")
     return config
 
 
@@ -109,10 +116,10 @@ def patch_taste(monkeypatch, body: str = "## Strong Positive Signals\nFake.\n", 
     rules = rules if rules is not None else []
     monkeypatch.setattr(taste, "build_client", lambda api_key: object())
     monkeypatch.setattr(
-        taste, "generate_idea_taste_body", lambda client, model, records, logger=None: body
+        taste, "generate_idea_taste_body", lambda client, model, records, permanent_rules_text=None, logger=None: body
     )
     monkeypatch.setattr(
-        taste, "generate_candidate_rules", lambda client, model, records, logger=None: rules
+        taste, "generate_candidate_rules", lambda client, model, records, permanent_rules_text=None, logger=None: rules
     )
 
 
@@ -350,7 +357,7 @@ def test_max_five_candidate_rules_enforced_by_generate_candidate_rules():
     class FakeClient:
         messages = FakeMessages()
 
-    rules = taste.generate_candidate_rules(FakeClient(), "fake-model", [])
+    rules = taste.generate_candidate_rules(FakeClient(), "fake-model", [], permanent_rules_text=RULES_TEXT)
     assert len(rules) == taste.MAX_CANDIDATE_RULES == 5
 
 
@@ -836,7 +843,7 @@ def test_successful_idea_taste_not_repeated_when_only_candidate_rules_needs_retr
 
     idea_taste_calls = []
 
-    def fake_idea_taste_body(client, model, records, logger=None):
+    def fake_idea_taste_body(client, model, records, permanent_rules_text=None, logger=None):
         idea_taste_calls.append(1)
         return "## Strong Positive Signals\nFake.\n"
 
@@ -871,7 +878,7 @@ def test_failed_build_creates_no_taste_versions_row(tmp_path, monkeypatch):
     monkeypatch.setattr(
         taste,
         "generate_candidate_rules",
-        lambda client, model, records, logger=None: (_ for _ in ()).throw(
+        lambda client, model, records, permanent_rules_text=None, logger=None: (_ for _ in ()).throw(
             taste.TasteGenerationError("simulated exhausted retries")
         ),
     )
@@ -898,7 +905,7 @@ def test_failed_build_creates_no_holdout_checkpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(
         taste,
         "generate_candidate_rules",
-        lambda client, model, records, logger=None: (_ for _ in ()).throw(
+        lambda client, model, records, permanent_rules_text=None, logger=None: (_ for _ in ()).throw(
             taste.TasteGenerationError("simulated exhausted retries")
         ),
     )
@@ -922,7 +929,7 @@ def test_failed_build_leaves_no_misleading_output_files_on_first_attempt(tmp_pat
     monkeypatch.setattr(
         taste,
         "generate_candidate_rules",
-        lambda client, model, records, logger=None: (_ for _ in ()).throw(
+        lambda client, model, records, permanent_rules_text=None, logger=None: (_ for _ in ()).throw(
             taste.TasteGenerationError("simulated exhausted retries")
         ),
     )
@@ -962,7 +969,7 @@ def test_failed_regeneration_never_overwrites_a_previously_valid_version(tmp_pat
     monkeypatch.setattr(
         taste,
         "generate_candidate_rules",
-        lambda client, model, records, logger=None: (_ for _ in ()).throw(
+        lambda client, model, records, permanent_rules_text=None, logger=None: (_ for _ in ()).throw(
             taste.TasteGenerationError("simulated exhausted retries")
         ),
     )
@@ -993,7 +1000,7 @@ def test_successful_retry_creates_exactly_one_taste_v1(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(taste, "build_client", lambda api_key: fake_client)
     monkeypatch.setattr(
-        taste, "generate_idea_taste_body", lambda client, model, records, logger=None: "## Strong Positive Signals\nx\n"
+        taste, "generate_idea_taste_body", lambda client, model, records, permanent_rules_text=None, logger=None: "## Strong Positive Signals\nx\n"
     )
 
     exit_code = cli.cmd_build_taste(config)
@@ -1021,7 +1028,7 @@ def test_training_ids_identical_across_internal_retries(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(taste, "build_client", lambda api_key: fake_client)
     monkeypatch.setattr(
-        taste, "generate_idea_taste_body", lambda client, model, records, logger=None: "## Strong Positive Signals\nx\n"
+        taste, "generate_idea_taste_body", lambda client, model, records, permanent_rules_text=None, logger=None: "## Strong Positive Signals\nx\n"
     )
 
     exit_code = cli.cmd_build_taste(config)

@@ -698,7 +698,7 @@ def test_collect_source_screening_skipped_cleanly_when_no_taste_yet(tmp_path, mo
 def test_collect_source_screening_skipped_cleanly_when_rules_file_missing(tmp_path, monkeypatch, capsys):
     config = make_config(tmp_path)
     build_taste_v1(config, monkeypatch)
-    # screen_rules_path deliberately never written.
+    config.screen_rules_path.unlink()
 
     patch_browser(monkeypatch, make_page())
     patch_extraction_and_screening(monkeypatch)

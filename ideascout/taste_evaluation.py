@@ -17,7 +17,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import blind_review, db, holdout_audit, screen_review, taste
+from . import blind_review, db, holdout_audit, screen_review, screening_prompt, taste
 
 INVESTIGATE_NOW = "INVESTIGATE_NOW"
 WATCH = "WATCH"
@@ -80,6 +80,7 @@ class EvalRow:
     actual: str
     screening: sqlite3.Row
     judged_at: str
+    prompt_version: int = screening_prompt.LEGACY_SCREENING_PROMPT_VERSION
 
     @property
     def is_actual_positive(self) -> bool:
@@ -131,16 +132,19 @@ class GateResult:
         return all(ok for _, ok, _ in self.checks)
 
 
-def _screening_before_judgment(conn, source_id: int, taste_version: int, judged_at: str):
+def _screenings_before_judgment(conn, source_id: int, taste_version: int, judged_at: str) -> list:
+    """Every screening of this source under this taste version created at or
+    before the judgment, across ALL prompt versions, newest first. Screenings
+    created after the judgment are never used as its prediction.
+    """
     return conn.execute(
         """
         SELECT * FROM source_screenings
         WHERE source_id = ? AND taste_version = ? AND created_at <= ?
         ORDER BY created_at DESC, screening_id DESC
-        LIMIT 1
         """,
         (source_id, taste_version, judged_at),
-    ).fetchone()
+    ).fetchall()
 
 
 def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_version: int) -> GateResult:
@@ -195,13 +199,21 @@ def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_ve
     missing: list[str] = []
     for member in audit.official:
         label = normalize_label(member.verdict)
-        screening = _screening_before_judgment(conn, member.source_id, version, member.feedback_created_at)
+        candidates = _screenings_before_judgment(conn, member.source_id, version, member.feedback_created_at)
         if label not in BRAD_LABEL_TO_CLASS:
             missing.append(f"{member.ref}: unrecognized label {member.verdict!r}")
             continue
-        if screening is None:
+        if not candidates:
             missing.append(f"{member.ref}: no Taste v{version} screening created before the judgment")
             continue
+        prompt_versions = sorted({c["screening_prompt_version"] for c in candidates})
+        if len(prompt_versions) > 1:
+            missing.append(
+                f"{member.ref}: {len(candidates)} screenings before the judgment use mixed prompt versions "
+                f"{prompt_versions}; the prediction is ambiguous"
+            )
+            continue
+        screening = candidates[0]
         prediction = screening["overall_prediction"]
         if prediction not in (INVESTIGATE_NOW, WATCH, PASS, INSUFFICIENT):
             missing.append(f"{member.ref}: unrecognized prediction {prediction!r}")
@@ -218,6 +230,7 @@ def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_ve
             actual=BRAD_LABEL_TO_CLASS.get(label, ""),
             screening=screening,
             judged_at=member.feedback_created_at,
+            prompt_version=screening["screening_prompt_version"],
         ))
     checks.append((
         f"Taste v{version} prediction existed before each judgment",
@@ -225,7 +238,22 @@ def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_ve
         "all present" if not missing else "; ".join(missing),
     ))
     rows.sort(key=lambda r: r.feedback_id)
+    versions = sorted({r.prompt_version for r in rows})
+    if versions:
+        mix = ", ".join(
+            f"v{v} x{sum(1 for r in rows if r.prompt_version == v)}" for v in versions
+        )
+        checks.append((
+            "Single screening prompt version across the holdout",
+            len(versions) == 1,
+            f"mixed: {mix}" if len(versions) > 1 else f"all v{versions[0]}",
+        ))
     return GateResult(checks=checks, audit=audit, rows=rows)
+
+
+def holdout_prompt_version(rows: list[EvalRow]) -> int | None:
+    versions = {r.prompt_version for r in rows}
+    return versions.pop() if len(versions) == 1 else None
 
 
 # --- metrics ------------------------------------------------------------------------------
@@ -400,7 +428,8 @@ def _reasoning_lines(row: EvalRow) -> list[str]:
 def _row_line(row: EvalRow) -> str:
     return (
         f"  {row.ref} | feedback {row.feedback_id} | {row.company or '-'} ({row.ticker or '-'}) | "
-        f"source {row.source} | {row.sr_ref} | model {row.prediction} | Brad {row.label} -> {row.actual} | "
+        f"source {row.source} | {row.sr_ref} (prompt v{row.prompt_version}) | model {row.prediction} | "
+        f"Brad {row.label} -> {row.actual} | "
         f"{row.kind}"
     )
 
@@ -418,6 +447,12 @@ def render_report(
     out: list[str] = []
     out.append(f"TASTE EVALUATION -- {version_label} (checkpoint feedback_id {checkpoint_feedback_id})")
     out.append(f"Screening rules sha256 at evaluation: {rules_sha256}")
+    prompt = holdout_prompt_version(rows)
+    if prompt is not None:
+        out.append(
+            f"Screening prompt version used by every holdout prediction: v{prompt} "
+            f"({screening_prompt.SCREENING_PROMPT_DESCRIPTIONS.get(prompt, 'unknown prompt')})"
+        )
     out.append("")
     out.append("HOLDOUT GATE: PASSED")
     for name, ok, detail in gate.checks:

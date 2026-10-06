@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import (
     agentmail_client,
+    authority,
     blind_review,
     db,
     digest_reply,
@@ -1055,6 +1056,27 @@ def cmd_approve_review(config: Config, message_id: str) -> int:
     return 0
 
 
+def _save_rejected_candidate(config: Config, generated_at: str, body: str, rules) -> Path:
+    """Keep a rejected candidate for Brad's review. It is written to its own
+    directory, never to taste-versions/, and no taste_versions row is created,
+    so it can never become active.
+    """
+    directory = config.database_path.parent / "taste-rejected"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{generated_at.replace(':', '-')}-rejected-candidate.md"
+    rule_lines = "\n\n".join(
+        f"- {candidate.rule}\n  evidence: {candidate.evidence}\n  reusability: {candidate.reusability}"
+        for candidate in rules
+    )
+    path.write_text(
+        "REJECTED CANDIDATE -- NOT ACTIVE. It failed the authority check: the permanent screening "
+        "rules outrank the inferred taste.\n\n"
+        f"## idea-taste.md candidate\n\n{body}\n\n## candidate-permanent-rules.md candidate\n\n{rule_lines}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def cmd_build_taste(config: Config) -> int:
     """Generate a new Far View Idea Taste version from Brad's accumulated
     eligible feedback (see db.get_feedback_eligible_for_learning -- the
@@ -1132,6 +1154,16 @@ def cmd_build_taste(config: Config) -> int:
                 )
             return 1
 
+    # The permanent rules are the top of the authority order (see
+    # ideascout/authority.py), so the builder always receives them. Without a
+    # readable rules file there is no authority to build against.
+    try:
+        permanent_rules_text = config.screen_rules_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        conn.close()
+        print(f"build-taste REFUSED: cannot read the permanent screening rules ({exc}). Nothing was generated.")
+        return 1
+
     try:
         client = taste.build_client(config.anthropic_api_key)
     except Exception as exc:
@@ -1147,8 +1179,12 @@ def cmd_build_taste(config: Config) -> int:
     # disk or the database -- a failure here (even after some internal
     # retries inside taste.py) leaves no trace anywhere.
     try:
-        body = taste.generate_idea_taste_body(client, config.taste_model_name, records, logger=logger)
-        rules = taste.generate_candidate_rules(client, config.taste_model_name, records, logger=logger)
+        body = taste.generate_idea_taste_body(
+            client, config.taste_model_name, records, permanent_rules_text=permanent_rules_text, logger=logger
+        )
+        rules = taste.generate_candidate_rules(
+            client, config.taste_model_name, records, permanent_rules_text=permanent_rules_text, logger=logger
+        )
     except taste.TasteGenerationError as exc:
         logger.exception(str(exc))
         conn.close()
@@ -1159,6 +1195,25 @@ def cmd_build_taste(config: Config) -> int:
     version_label = f"v{version_number}"
     generated_date = date.today().isoformat()
     generated_at = utcnow_iso()
+
+    conflicts = [("idea-taste.md", finding) for finding in authority.find_hard_threshold_conflicts(body)]
+    for index, candidate in enumerate(rules, start=1):
+        candidate_text = "\n".join((candidate.rule, candidate.evidence, candidate.reusability))
+        conflicts += [
+            (f"candidate rule {index}", finding) for finding in authority.find_hard_threshold_conflicts(candidate_text)
+        ]
+    if conflicts:
+        rejected_path = _save_rejected_candidate(config, generated_at, body, rules)
+        conn.close()
+        print(
+            "build-taste REFUSED: the generated taste turns a numeric preference into a hard threshold "
+            "that conflicts with the permanent screening rules (the permanent rules win)."
+        )
+        for label, finding in conflicts:
+            print(f"  - {label}, line {finding.line_number}: {finding.reason}: \"{finding.excerpt}\"")
+        print(f"Nothing was activated. The rejected candidate was saved for review at: {rejected_path}")
+        print("Re-run build-taste after the generation no longer states a hard threshold.")
+        return 1
 
     idea_taste_content = taste.render_idea_taste_document(
         version_label=version_label,
@@ -2782,7 +2837,7 @@ def cmd_rescreen_source(config: Config, source_name: str, external_id: str) -> i
         print(f"Cannot rescreen: {exc}")
         return 1
 
-    existing = db.get_source_screening(
+    existing = db.get_latest_screening_for_taste_and_rules(
         conn,
         source_id=row["source_id"],
         taste_version=latest_taste["version_number"],

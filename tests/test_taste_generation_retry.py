@@ -79,6 +79,8 @@ def valid_batch_json(n: int = 1) -> str:
     )
 
 
+RULES_TEXT = "1. Upside\n   Plausible path to greater than 100%+ upside.\n"
+
 SAMPLE_RECORDS = [
     {
         "feedback_id": 1,
@@ -101,7 +103,7 @@ def test_candidate_rules_max_tokens_stop_reason_is_treated_as_retryable_truncati
     client = FakeClient([FakeResponse("max_tokens", "")] * taste.MAX_GENERATION_ATTEMPTS)
 
     with pytest.raises(taste.TasteGenerationError) as exc_info:
-        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert "truncat" in str(exc_info.value).lower()
     assert len(client.messages.calls) == taste.MAX_GENERATION_ATTEMPTS
@@ -116,7 +118,7 @@ def test_candidate_rules_truncated_mid_string_with_normal_stop_reason_is_retried
     client = FakeClient([FakeResponse("end_turn", truncated)] * taste.MAX_GENERATION_ATTEMPTS)
 
     with pytest.raises(taste.TasteGenerationError):
-        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert len(client.messages.calls) == taste.MAX_GENERATION_ATTEMPTS
 
@@ -126,7 +128,7 @@ def test_candidate_rules_logs_a_clear_truncation_reason_and_retries(caplog):
     client = FakeClient([FakeResponse("max_tokens", ""), FakeResponse("end_turn", valid_batch_json(1))])
 
     with caplog.at_level(logging.WARNING, logger="test-taste-retry-truncation"):
-        rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, logger=logger)
+        rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT, logger=logger)
 
     assert len(rules) == 1
     messages = [record.message for record in caplog.records]
@@ -144,7 +146,7 @@ def test_candidate_rules_first_attempt_malformed_second_succeeds():
     ]
     client = FakeClient(responses)
 
-    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert len(rules) == 2
     assert len(client.messages.calls) == 2
@@ -154,7 +156,7 @@ def test_candidate_rules_all_retry_attempts_fail_raises_clearly():
     client = FakeClient([FakeResponse("end_turn", "not json at all")] * taste.MAX_GENERATION_ATTEMPTS)
 
     with pytest.raises(taste.TasteGenerationError) as exc_info:
-        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert len(client.messages.calls) == taste.MAX_GENERATION_ATTEMPTS
     assert str(taste.MAX_GENERATION_ATTEMPTS) in str(exc_info.value)
@@ -168,7 +170,7 @@ def test_candidate_rules_never_repairs_malformed_json_with_string_hacks():
     responses = [FakeResponse("end_turn", almost_valid), FakeResponse("end_turn", valid_batch_json(1))]
     client = FakeClient(responses)
 
-    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert len(rules) == 1  # only the genuinely valid second response was used
     assert len(client.messages.calls) == 2
@@ -181,7 +183,7 @@ def test_retry_prompt_adds_concise_reminder_without_changing_training_corpus():
     responses = [FakeResponse("max_tokens", ""), FakeResponse("end_turn", valid_batch_json(1))]
     client = FakeClient(responses)
 
-    taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+    taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     first_content = client.messages.calls[0]["messages"][0]["content"]
     second_content = client.messages.calls[1]["messages"][0]["content"]
@@ -201,7 +203,7 @@ def test_candidate_rules_uses_same_max_five_cap_after_a_retry():
     ]
     client = FakeClient(responses)
 
-    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+    rules = taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
     assert len(rules) == taste.MAX_CANDIDATE_RULES == 5
 
 
@@ -215,7 +217,7 @@ def test_idea_taste_body_truncated_is_retried_and_succeeds():
     ]
     client = FakeClient(responses)
 
-    body = taste.generate_idea_taste_body(client, "fake-model", SAMPLE_RECORDS)
+    body = taste.generate_idea_taste_body(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert "A real signal." in body
     assert len(client.messages.calls) == 2
@@ -225,7 +227,7 @@ def test_idea_taste_body_all_retries_truncated_fails_clearly():
     client = FakeClient([FakeResponse("max_tokens", "")] * taste.MAX_GENERATION_ATTEMPTS)
 
     with pytest.raises(taste.TasteGenerationError) as exc_info:
-        taste.generate_idea_taste_body(client, "fake-model", SAMPLE_RECORDS)
+        taste.generate_idea_taste_body(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert "truncat" in str(exc_info.value).lower()
     assert len(client.messages.calls) == taste.MAX_GENERATION_ATTEMPTS
@@ -238,6 +240,6 @@ def test_candidate_rules_genuine_api_error_is_not_retried():
     client = FakeClient([RuntimeError("simulated network failure")])
 
     with pytest.raises(taste.TasteGenerationError):
-        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS)
+        taste.generate_candidate_rules(client, "fake-model", SAMPLE_RECORDS, permanent_rules_text=RULES_TEXT)
 
     assert len(client.messages.calls) == 1  # not retried -- a real API failure, not truncation/malformed JSON

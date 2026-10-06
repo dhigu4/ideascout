@@ -703,6 +703,7 @@ def test_shadow_score_fails_clearly_when_screen_rules_file_missing(tmp_path, mon
     insert_n_eligible(conn, 15)
     conn.close()
     build_taste_v1(config, monkeypatch)
+    config.screen_rules_path.unlink(missing_ok=True)
 
     exit_code = cli.cmd_shadow_score(config)
     assert exit_code == 1

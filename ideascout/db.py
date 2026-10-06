@@ -9,6 +9,8 @@ easy to see the entire data model at a glance and easy to change later.
 from __future__ import annotations
 
 import json
+
+from . import screening_prompt
 import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -741,6 +743,68 @@ MIGRATIONS: list[str] = [
         WHERE cs2.source_name = cs.source_name AND cs2.external_id = cs.external_id
     );
     """,
+    # Migration 18 (screening prompt provenance): every screening records which
+    # prompt produced it, and that version is part of its identity. SQLite cannot
+    # change a UNIQUE constraint in place, so the table is rebuilt with the same
+    # screening_id values (SR references stay stable) and every existing row is
+    # copied unchanged. Every row that exists now was produced by the legacy
+    # peer-authority prompt, version 1 (see screening_prompt.py). _migrate turns
+    # foreign-key enforcement off around this script because feedback and
+    # source_screening_narrative_repairs reference the table by name.
+    """
+    CREATE TABLE source_screenings_new (
+        screening_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id                INTEGER NOT NULL REFERENCES collected_sources(source_id),
+        created_at               TEXT NOT NULL,
+
+        taste_version            INTEGER NOT NULL,
+        taste_sha256             TEXT NOT NULL,
+
+        screen_rules_path        TEXT NOT NULL,
+        screen_rules_sha256      TEXT NOT NULL,
+
+        content_hash             TEXT NOT NULL,
+        model_name               TEXT NOT NULL,
+
+        overall_prediction       TEXT NOT NULL,
+        mispricing               TEXT NOT NULL,
+        variant_perception       TEXT NOT NULL,
+        upside                   TEXT NOT NULL,
+        business_quality         TEXT NOT NULL,
+        downside                 TEXT NOT NULL,
+
+        key_reasons_json         TEXT NOT NULL,
+        key_concerns_json        TEXT NOT NULL,
+        critical_questions_json  TEXT NOT NULL,
+        confidence               TEXT NOT NULL,
+
+        screening_prompt_version INTEGER NOT NULL,
+
+        UNIQUE(source_id, taste_version, screen_rules_sha256, screening_prompt_version)
+    );
+
+    INSERT INTO source_screenings_new (
+        screening_id, source_id, created_at, taste_version, taste_sha256,
+        screen_rules_path, screen_rules_sha256, content_hash, model_name,
+        overall_prediction, mispricing, variant_perception, upside,
+        business_quality, downside,
+        key_reasons_json, key_concerns_json, critical_questions_json, confidence,
+        screening_prompt_version
+    )
+    SELECT
+        screening_id, source_id, created_at, taste_version, taste_sha256,
+        screen_rules_path, screen_rules_sha256, content_hash, model_name,
+        overall_prediction, mispricing, variant_perception, upside,
+        business_quality, downside,
+        key_reasons_json, key_concerns_json, critical_questions_json, confidence,
+        1
+    FROM source_screenings
+    ORDER BY screening_id;
+
+    DROP TABLE source_screenings;
+    ALTER TABLE source_screenings_new RENAME TO source_screenings;
+    CREATE INDEX idx_source_screenings_source_id ON source_screenings(source_id);
+    """,
 ]
 
 
@@ -896,7 +960,20 @@ def _migrate(conn: sqlite3.Connection, database_path: Path) -> None:
         # nothing to lose yet, so no backup is made for that case.
         _create_backup(conn, database_path, "premigration")
     for index in range(current_version, len(MIGRATIONS)):
-        conn.executescript(MIGRATIONS[index])
+        # Table rebuilds (SQLite's only way to change a constraint) must not
+        # trip foreign-key enforcement mid-script. The check below confirms
+        # nothing dangling was left behind before the version is recorded.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.executescript(MIGRATIONS[index])
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        if violations:
+            raise RuntimeError(
+                f"Migration {index + 1} left {len(violations)} foreign-key violation(s); "
+                "the schema version was not advanced. Restore from the premigration backup."
+            )
         conn.execute(f"PRAGMA user_version = {index + 1}")
         conn.commit()
 
@@ -2551,16 +2628,41 @@ def get_latest_repaired_narrative(conn: sqlite3.Connection, screening_id: int) -
 
 
 def get_source_screening(
-    conn: sqlite3.Connection, *, source_id: int, taste_version: int, screen_rules_sha256: str
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    taste_version: int,
+    screen_rules_sha256: str,
+    screening_prompt_version: int = screening_prompt.CURRENT_SCREENING_PROMPT_VERSION,
 ) -> sqlite3.Row | None:
-    """Existence check mirroring get_shadow_prediction: is there already a
-    screening for this EXACT (source, taste version, rules hash)
-    combination? If so, callers skip re-screening -- never overwritten.
+    """Dedupe/current lookup for one EXACT screening identity: (source, taste
+    version, rules hash, PROMPT VERSION). The same taste and rules under a
+    different prompt version is a different screening and is never returned
+    here. Never overwritten.
     """
     return conn.execute(
         """
         SELECT * FROM source_screenings
         WHERE source_id = ? AND taste_version = ? AND screen_rules_sha256 = ?
+          AND screening_prompt_version = ?
+        """,
+        (source_id, taste_version, screen_rules_sha256, screening_prompt_version),
+    ).fetchone()
+
+
+def get_latest_screening_for_taste_and_rules(
+    conn: sqlite3.Connection, *, source_id: int, taste_version: int, screen_rules_sha256: str
+) -> sqlite3.Row | None:
+    """The newest screening of this source under this taste and rules hash,
+    whatever its prompt version. Used to decide what a targeted repair acts on
+    -- it never creates a screening.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM source_screenings
+        WHERE source_id = ? AND taste_version = ? AND screen_rules_sha256 = ?
+        ORDER BY screening_id DESC
+        LIMIT 1
         """,
         (source_id, taste_version, screen_rules_sha256),
     ).fetchone()
@@ -2587,10 +2689,13 @@ def insert_source_screening(
     key_concerns_json: str,
     critical_questions_json: str,
     confidence: str,
+    screening_prompt_version: int = screening_prompt.CURRENT_SCREENING_PROMPT_VERSION,
 ) -> int:
     """Insert one immutable source screening. Never updated afterward --
     there is deliberately no update_source_screening function, mirroring
-    shadow_predictions's immutability guarantee exactly.
+    shadow_predictions's immutability guarantee exactly. The prompt version
+    defaults to the CURRENT prompt; the legacy value exists only on rows
+    migration 18 labelled.
     """
     cursor = conn.execute(
         """
@@ -2599,18 +2704,21 @@ def insert_source_screening(
             screen_rules_path, screen_rules_sha256, content_hash, model_name,
             overall_prediction, mispricing, variant_perception, upside,
             business_quality, downside,
-            key_reasons_json, key_concerns_json, critical_questions_json, confidence
+            key_reasons_json, key_concerns_json, critical_questions_json, confidence,
+            screening_prompt_version
         ) VALUES (
             :source_id, :created_at, :taste_version, :taste_sha256,
             :screen_rules_path, :screen_rules_sha256, :content_hash, :model_name,
             :overall_prediction, :mispricing, :variant_perception, :upside,
             :business_quality, :downside,
-            :key_reasons_json, :key_concerns_json, :critical_questions_json, :confidence
+            :key_reasons_json, :key_concerns_json, :critical_questions_json, :confidence,
+            :screening_prompt_version
         )
         """,
         {
             "source_id": source_id,
             "created_at": created_at,
+            "screening_prompt_version": screening_prompt_version,
             "taste_version": taste_version,
             "taste_sha256": taste_sha256,
             "screen_rules_path": screen_rules_path,
