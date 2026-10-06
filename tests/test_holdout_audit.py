@@ -557,7 +557,7 @@ def test_empty_holdout_reports_not_complete(tmp_path, monkeypatch):
 
     assert "Post-training feedback rows (feedback_id > checkpoint): 0" in rendered
     assert "HOLDOUT NOT CLEAN" in rendered
-    assert "The official holdout has 0 row(s); expected exactly 20." in rendered
+    assert "Replacement blind-review judgment required: 20" in rendered
 
 
 def test_no_taste_version_prints_message(tmp_path):

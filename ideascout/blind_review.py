@@ -138,6 +138,39 @@ def _find_valid_headers(lines: List[str]) -> tuple[list[tuple[int, str, str]], O
     return headers, None
 
 
+def _terminal_state_error(conn: sqlite3.Connection, assignment_row: sqlite3.Row) -> Optional[str]:
+    """A blind-review assignment is TERMINAL once judged: judged_at is set
+    only by db.insert_feedback_events in the same transaction that writes the
+    accepted judgment. Terminality does not depend on the judgment's
+    excluded_from_learning, holdout, or parse state -- exclusion changes how a
+    judgment is used, never whether the assignment can be answered again.
+
+    Legacy inconsistencies (judged_at and the judgment rows disagree) fail
+    closed rather than creating an additional judgment.
+    """
+    assignment_id = assignment_row["assignment_id"]
+    ref = format_review_ref(assignment_id)
+    judged_at = assignment_row["judged_at"]
+    judgment_rows = db.get_feedback_rows_for_blind_review_assignment(conn, assignment_id)
+
+    if judged_at is None and judgment_rows:
+        return (
+            f"INCONSISTENT_BLIND_REVIEW_STATE: {ref} has a judgment row but is not marked judged; "
+            "refusing to record another judgment"
+        )
+    if judged_at is not None and not judgment_rows:
+        return (
+            f"INCONSISTENT_BLIND_REVIEW_STATE: {ref} is marked judged at {judged_at} but has no judgment row; "
+            "refusing to record another judgment"
+        )
+    if judged_at is not None:
+        return (
+            f"DUPLICATE_BLIND_REVIEW: {ref} was already judged at {judged_at}; "
+            "a judged blind-review assignment is terminal and cannot be answered again"
+        )
+    return None
+
+
 def parse_blind_review(conn: sqlite3.Connection, body: Optional[str]) -> BlindReviewParseResult:
     """Deterministically parses Brad's isolated blind-review text into one
     block per "BR-<id> — VERDICT" header, each resolved against the EXACT
@@ -150,8 +183,9 @@ def parse_blind_review(conn: sqlite3.Connection, body: Optional[str]) -> BlindRe
     reply text, a malformed or ticker/company-only header, an unknown or
     duplicate review reference within the message, a review reference
     that doesn't resolve to any known assignment, or an assignment that
-    already has a learning-eligible BLIND_REVIEW judgment from a prior
-    message. Callers must route a failure to NEEDS_REVIEW and must never
+    has already been judged (judged_at set, whatever the prior judgment's
+    exclusion state), or whose judged_at and judgment rows are inconsistent.
+    Callers must route a failure to NEEDS_REVIEW and must never
     create a feedback row for any block of a failed message, and must
     NEVER reveal source_screenings content anywhere in that failure path.
     """
@@ -184,12 +218,9 @@ def parse_blind_review(conn: sqlite3.Connection, body: Optional[str]) -> BlindRe
             errors.append(f"review reference {ref_text.upper()} does not resolve to any known assignment")
             continue
 
-        existing = db.get_learning_eligible_blind_review_feedback_for_assignment(conn, assignment_id)
-        if existing is not None:
-            errors.append(
-                f"DUPLICATE_BLIND_REVIEW: {format_review_ref(assignment_id)} already has a "
-                "learning-eligible blind-review judgment"
-            )
+        terminal_error = _terminal_state_error(conn, assignment_row)
+        if terminal_error is not None:
+            errors.append(terminal_error)
             continue
 
         start = line_index + 1

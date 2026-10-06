@@ -1458,6 +1458,31 @@ def insert_feedback_events(
                 )
 
 
+def _holdout_repair_key(feedback_id: int) -> str:
+    return f"holdout_repair:feedback:{feedback_id}"
+
+
+def get_holdout_repair_record(conn: sqlite3.Connection, feedback_id: int) -> dict | None:
+    """The record written by repair-holdout-duplicate for this feedback row,
+    or None. Stored in app_meta (no schema change) and read-only here.
+    """
+    value = get_meta(conn, _holdout_repair_key(feedback_id))
+    return json.loads(value) if value else None
+
+
+def apply_holdout_duplicate_exclusion(conn: sqlite3.Connection, *, feedback_id: int, record: dict) -> None:
+    """Excludes one feedback row from learning and records why, in ONE
+    transaction. Only excluded_from_learning changes on the feedback row;
+    nothing is deleted, and the blind-review assignment is untouched.
+    """
+    with conn:
+        conn.execute("UPDATE feedback SET excluded_from_learning = 1 WHERE feedback_id = ?", (feedback_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+            (_holdout_repair_key(feedback_id), json.dumps(record, sort_keys=True)),
+        )
+
+
 def count_feedback_pending_messages(conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM messages_raw WHERE feedback_parse_status = 'UNPARSED'"
@@ -2811,24 +2836,22 @@ def get_blind_review_assignment_by_id(conn: sqlite3.Connection, assignment_id: i
     ).fetchone()
 
 
-def get_learning_eligible_blind_review_feedback_for_assignment(
+def get_feedback_rows_for_blind_review_assignment(
     conn: sqlite3.Connection, assignment_id: int
-) -> sqlite3.Row | None:
-    """Is there already a learning-eligible BLIND_REVIEW judgment for this
-    EXACT assignment? Used to fail a second, independent judgment of the
-    same assignment closed (DUPLICATE_BLIND_REVIEW) -- see
-    ideascout/blind_review.py. Mirrors get_learning_eligible_screen_
-    review_feedback_for_screening's exclude-then-allow-a-fresh-review
-    semantics: a row Brad has since excluded via exclude-feedback does not
-    count as "already judged."
+) -> list[sqlite3.Row]:
+    """EVERY feedback row linked to this exact assignment, whatever its
+    excluded_from_learning / holdout / parse state. Used by blind_review.py to
+    decide whether an assignment has already been judged: exclusion changes how
+    a judgment is used, never whether the assignment can be answered again.
     """
     return conn.execute(
         """
         SELECT * FROM feedback
-        WHERE feedback_origin = 'BLIND_REVIEW' AND blind_review_assignment_id = ? AND excluded_from_learning = 0
+        WHERE feedback_origin = 'BLIND_REVIEW' AND blind_review_assignment_id = ?
+        ORDER BY feedback_id
         """,
         (assignment_id,),
-    ).fetchone()
+    ).fetchall()
 
 
 def count_unjudged_blind_review_assignments(conn: sqlite3.Connection) -> int:

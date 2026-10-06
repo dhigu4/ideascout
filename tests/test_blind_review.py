@@ -288,7 +288,7 @@ def test_second_independent_judgment_of_same_assignment_fails_closed(tmp_path):
     assert "DUPLICATE_BLIND_REVIEW" in result.reason
 
 
-def test_excluded_prior_judgment_allows_a_fresh_review(tmp_path):
+def test_excluded_prior_judgment_still_blocks_a_fresh_review(tmp_path):
     conn = db.connect(tmp_path / "ideas.db")
     _, aid = make_assignment(conn, external_id="1")
     insert_prior_blind_review_feedback(conn, aid)
@@ -301,7 +301,8 @@ def test_excluded_prior_judgment_allows_a_fresh_review(tmp_path):
     result = blind_review.parse_blind_review(conn, f"{ref} — LIKE\na fresh opinion\n")
     conn.close()
 
-    assert result.ok
+    assert not result.ok
+    assert "DUPLICATE_BLIND_REVIEW" in result.reason
 
 
 # --- quote/signature isolation reuse (shared with digest_reply.py) -------------

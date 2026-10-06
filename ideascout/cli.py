@@ -2959,6 +2959,20 @@ def _is_already_judged_by_brad(candidate, judged_tickers: set[str], judged_compa
     return False
 
 
+def _is_blind_review_duplicate(candidate, judged_tickers: set[str], judged_companies: set[str]) -> bool:
+    """Stricter rule for SELECTING a new blind-review item only: blocked if
+    its normalized ticker OR its normalized company already belongs to a
+    judged or assigned identity. This matches the holdout audit's duplicate
+    rule, so a replacement can never recreate a duplicate the audit flags.
+    Digest suppression keeps its own ticker-first rule (_is_already_judged_by_brad).
+    """
+    candidate_ticker = _normalize_ticker(candidate["ticker"])
+    if candidate_ticker and candidate_ticker in judged_tickers:
+        return True
+    candidate_company = _normalize_company_name(candidate["company"])
+    return bool(candidate_company) and candidate_company in judged_companies
+
+
 def _blind_review_identity_sets(conn) -> tuple[set[str], set[str]]:
     """Normalized (ticker, company) identities that must never be given a
     SECOND blind-review assignment: every learning-eligible feedback
@@ -2968,8 +2982,8 @@ def _blind_review_identity_sets(conn) -> tuple[set[str], set[str]]:
     for the same company (e.g. two separate pitches on the same ticker)
     could both be assigned, either in the same batch or across separate
     `blind-review` runs, weakening the 20-unique-idea holdout. Matching
-    itself is the same ticker-first/company-fallback/no-fuzzy-matching
-    rule digest suppression already uses (_is_already_judged_by_brad).
+    itself is the ticker-or-company, no-fuzzy-matching rule enforced by
+    _is_blind_review_duplicate.
     """
     judged_tickers, judged_companies = _judged_identity_sets(conn)
     for row in db.get_blind_review_assigned_source_identities(conn):
@@ -3304,6 +3318,142 @@ def cmd_audit_holdout_integrity(config: Config) -> int:
     return 0
 
 
+def cmd_repair_holdout_duplicate(
+    config: Config,
+    *,
+    exclude_feedback_id: int,
+    expect_ref: str,
+    expect_ticker: str,
+    expect_company: str,
+    expect_label: str,
+    retain_feedback_id: int,
+    retain_ref: str,
+    reason: str,
+    dry_run: bool,
+) -> int:
+    """Manually exclude ONE confirmed duplicate holdout judgment from learning
+    and the holdout, preserving every row, and record why. Nothing is deleted,
+    the blind-review assignment is untouched, and nothing is evaluated,
+    unlocked, or rebuilt. Every expected fact must match the database before
+    anything changes; any mismatch aborts with no changes. A real run takes a
+    SQLite backup first; --dry-run changes nothing and creates no backup.
+    Re-running after a successful repair is a no-op.
+    """
+    reason = reason.strip()
+    if not reason:
+        print("A non-empty --reason is required. Nothing changed.")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None:
+        conn.close()
+        print("No taste model exists. Nothing changed.")
+        return 1
+
+    existing_record = db.get_holdout_repair_record(conn, exclude_feedback_id)
+    target = db.get_feedback_by_id(conn, exclude_feedback_id)
+    if existing_record is not None and target is not None and target["excluded_from_learning"]:
+        conn.close()
+        if existing_record.get("retained_feedback_id") != retain_feedback_id:
+            print(
+                f"feedback {exclude_feedback_id} was already excluded by a different recorded repair "
+                f"(retained feedback {existing_record.get('retained_feedback_id')}). Nothing changed."
+            )
+            return 1
+        print(f"Already applied: feedback {exclude_feedback_id} is excluded by a recorded repair. No change made.")
+        conn.close()
+        return 0
+
+    audit = holdout_audit.audit_holdout(conn, latest_taste)
+    rows = {r.feedback_id: r for r in audit.official + audit.candidates + audit.superseded + audit.other}
+    exclude_row = rows.get(exclude_feedback_id)
+    retain_row = rows.get(retain_feedback_id)
+    conn.close()
+
+    failures: list[str] = []
+    if exclude_row is None:
+        failures.append(f"feedback {exclude_feedback_id} is not a post-checkpoint feedback row")
+    if retain_row is None:
+        failures.append(f"feedback {retain_feedback_id} is not a post-checkpoint feedback row")
+    if exclude_row is not None:
+        if exclude_row.role != holdout_audit.OFFICIAL:
+            failures.append(
+                f"feedback {exclude_feedback_id} is not a current official holdout member "
+                "(it must be holdout-eligible, not excluded, and PARSED)"
+            )
+        if exclude_row.origin != "BLIND_REVIEW":
+            failures.append(f"feedback {exclude_feedback_id} origin is {exclude_row.origin}, expected BLIND_REVIEW")
+        if exclude_row.ref.upper() != expect_ref.upper():
+            failures.append(f"feedback {exclude_feedback_id} is linked to {exclude_row.ref}, expected {expect_ref}")
+        expected_ticker = _normalize_ticker(expect_ticker)
+        if _normalize_ticker(exclude_row.ticker) != expected_ticker:
+            failures.append(f"feedback {exclude_feedback_id} ticker is {exclude_row.ticker!r}, expected {expect_ticker!r}")
+        expected_company = _normalize_company_name(expect_company)
+        if _normalize_company_name(exclude_row.company) != expected_company:
+            failures.append(
+                f"feedback {exclude_feedback_id} company is {exclude_row.company!r}, expected {expect_company!r}"
+            )
+        if (exclude_row.verdict or "").upper() != expect_label.upper():
+            failures.append(f"feedback {exclude_feedback_id} label is {exclude_row.verdict}, expected {expect_label}")
+        if retain_row is not None:
+            if exclude_row.feedback_id == retain_row.feedback_id:
+                failures.append("the excluded and retained feedback rows are the same")
+            if _normalize_ticker(retain_row.ticker) != _normalize_ticker(exclude_row.ticker) or (
+                _normalize_company_name(retain_row.company) != _normalize_company_name(exclude_row.company)
+            ):
+                failures.append("the retained row does not share the excluded row's normalized ticker and company")
+    if retain_row is not None:
+        if retain_row.role != holdout_audit.OFFICIAL:
+            failures.append(f"retained feedback {retain_feedback_id} is not a current official holdout member")
+        if retain_row.ref.upper() != retain_ref.upper():
+            failures.append(f"retained feedback {retain_feedback_id} is linked to {retain_row.ref}, expected {retain_ref}")
+
+    if failures:
+        print("Expected facts do not match the database. Aborted; nothing changed:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+
+    record = {
+        "action": "excluded_duplicate",
+        "feedback_id": exclude_feedback_id,
+        "ref": exclude_row.ref,
+        "ticker": exclude_row.ticker,
+        "company": exclude_row.company,
+        "label": exclude_row.verdict,
+        "retained_feedback_id": retain_feedback_id,
+        "retained_ref": retain_row.ref,
+        "reason": reason,
+        "applied_at": utcnow_iso(),
+    }
+    print(f"Will exclude feedback {exclude_feedback_id} ({exclude_row.ref}, {exclude_row.ticker}, "
+          f"{exclude_row.company}, label {exclude_row.verdict}) from learning and the holdout.")
+    print(f"Will retain feedback {retain_feedback_id} ({retain_row.ref}) unchanged.")
+    print(f"Will set feedback {exclude_feedback_id} excluded_from_learning: 0 -> 1. No row is deleted and "
+          "the blind-review assignment is untouched.")
+    print(f"Will record the reason under app_meta key holdout_repair:feedback:{exclude_feedback_id}.")
+
+    if dry_run:
+        print("DRY RUN: nothing changed and no backup was created. Re-run without --dry-run to apply.")
+        return 0
+
+    conn = db.open_production_database(config.database_path)
+    backup_path = db.create_labeled_backup(conn, config.database_path, "repair_holdout_duplicate")
+    print(f"Backup created: {backup_path}")
+    record["backup_path"] = str(backup_path)
+    db.apply_holdout_duplicate_exclusion(conn, feedback_id=exclude_feedback_id, record=record)
+
+    after = holdout_audit.audit_holdout(conn, latest_taste)
+    conn.close()
+    print(f"Done: feedback {exclude_feedback_id} excluded. Official holdout is now "
+          f"{after.official_count}/{taste.HOLDOUT_SIZE} ({after.unique_count} unique).")
+    if holdout_audit.replacement_needed(after):
+        print(f"Replacement blind-review judgment required: {holdout_audit.replacement_needed(after)}. "
+              "Run: python run.py blind-review --limit 1")
+    return 0
+
+
 def cmd_audit_screening_narratives(config: Config, source_name: str | None = None) -> int:
     """READ-ONLY: list each CURRENT WATCH/INVESTIGATE_NOW screening whose
     EFFECTIVE narrative (original model output plus any successful repair)
@@ -3545,7 +3695,7 @@ def cmd_blind_review(config: Config, *, limit: int) -> int:
         for candidate in db.get_blind_review_candidate_sources(conn):
             if len(newly_assigned) >= remaining_slots:
                 break
-            if _is_already_judged_by_brad(candidate, judged_tickers, judged_companies):
+            if _is_blind_review_duplicate(candidate, judged_tickers, judged_companies):
                 continue
             if _looks_like_test_or_smoke_source(candidate):
                 continue
@@ -3766,6 +3916,19 @@ def build_parser() -> argparse.ArgumentParser:
     repair_source_content_parser.add_argument(
         "--dry-run", action="store_true", help="Print what would be repaired -- no database changes, no LLM calls, no refetching"
     )
+    repair_duplicate_parser = subparsers.add_parser(
+        "repair-holdout-duplicate",
+        help="Manually exclude ONE confirmed duplicate holdout judgment (validated, backed up, reason recorded)",
+    )
+    repair_duplicate_parser.add_argument("--exclude-feedback-id", type=int, required=True)
+    repair_duplicate_parser.add_argument("--expect-ref", required=True, help="e.g. BR-16")
+    repair_duplicate_parser.add_argument("--expect-ticker", required=True, help="e.g. CPRT")
+    repair_duplicate_parser.add_argument("--expect-company", required=True, help='e.g. "Copart, Inc."')
+    repair_duplicate_parser.add_argument("--expect-label", required=True, help="e.g. MAYBE")
+    repair_duplicate_parser.add_argument("--retain-feedback-id", type=int, required=True)
+    repair_duplicate_parser.add_argument("--retain-ref", required=True, help="e.g. BR-15")
+    repair_duplicate_parser.add_argument("--reason", required=True, help='e.g. "duplicate holdout idea; retained BR-15 feedback 58"')
+    repair_duplicate_parser.add_argument("--dry-run", action="store_true", help="Show the plan; change nothing")
     subparsers.add_parser(
         "audit-holdout-integrity",
         help="READ-ONLY: check whether the active Taste holdout has 20 unique, valid judgments",
@@ -3948,6 +4111,21 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
+        elif args.command == "repair-holdout-duplicate":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_repair_holdout_duplicate(
+                config,
+                exclude_feedback_id=args.exclude_feedback_id,
+                expect_ref=args.expect_ref,
+                expect_ticker=args.expect_ticker,
+                expect_company=args.expect_company,
+                expect_label=args.expect_label,
+                retain_feedback_id=args.retain_feedback_id,
+                retain_ref=args.retain_ref,
+                reason=args.reason,
+                dry_run=args.dry_run,
+            )
         elif args.command == "audit-holdout-integrity":
             # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
             config = load_config()

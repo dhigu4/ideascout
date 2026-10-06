@@ -66,6 +66,7 @@ ORDER BY feedback_id
 
 OFFICIAL = "official"
 CANDIDATE = "candidate"
+SUPERSEDED = "superseded"
 OTHER = "other"
 REFERENCE = "reference"
 
@@ -124,6 +125,8 @@ class HoldoutAudit:
     post_training_count: int
     official: list[HoldoutRow]
     candidates: list[HoldoutRow]
+    superseded: list[HoldoutRow]
+    superseded_records: dict[int, dict]
     other: list[HoldoutRow]
     unique_groups: list[list[HoldoutRow]]
     duplicate_groups: list[DuplicateGroup]
@@ -152,7 +155,9 @@ class HoldoutAudit:
 
     @property
     def reconciles_total(self) -> bool:
-        return self.post_training_count == self.official_count + len(self.candidates) + len(self.other)
+        return self.post_training_count == (
+            self.official_count + len(self.candidates) + len(self.superseded) + len(self.other)
+        )
 
     @property
     def clean(self) -> bool:
@@ -267,6 +272,11 @@ def _validity_problems(conn, row: HoldoutRow, record: sqlite3.Row, screening) ->
     return problems
 
 
+def _has_duplicate_exclusion_record(conn: sqlite3.Connection, feedback_id: int) -> bool:
+    record = db.get_holdout_repair_record(conn, feedback_id)
+    return record is not None and record.get("feedback_id") == feedback_id
+
+
 def _load(conn: sqlite3.Connection, where_sql: str, params: tuple, role_for) -> list[HoldoutRow]:
     records = conn.execute(_BASE_SQL + where_sql, params).fetchall()
     return [_build_row(conn, record, role_for(record)) for record in records]
@@ -355,12 +365,15 @@ def audit_holdout(conn: sqlite3.Connection, latest_taste: sqlite3.Row) -> Holdou
         if record["feedback_id"] in official_ids:
             return OFFICIAL
         if record["feedback_origin"] == "BLIND_REVIEW" or record["blind_review_assignment_id"] is not None:
+            if record["excluded_from_learning"] and _has_duplicate_exclusion_record(conn, record["feedback_id"]):
+                return SUPERSEDED
             return CANDIDATE
         return OTHER
 
     window = _load(conn, "WHERE f.feedback_id > ? ORDER BY f.feedback_id", (checkpoint,), role_for)
     official = [r for r in window if r.role == OFFICIAL]
     candidates = [r for r in window if r.role == CANDIDATE]
+    superseded = [r for r in window if r.role == SUPERSEDED]
     other = [r for r in window if r.role == OTHER]
 
     holdout_rows = official + candidates
@@ -379,6 +392,8 @@ def audit_holdout(conn: sqlite3.Connection, latest_taste: sqlite3.Row) -> Holdou
         post_training_count=len(window),
         official=official,
         candidates=candidates,
+        superseded=superseded,
+        superseded_records={r.feedback_id: db.get_holdout_repair_record(conn, r.feedback_id) for r in superseded},
         other=other,
         unique_groups=unique,
         duplicate_groups=duplicates,
@@ -387,12 +402,22 @@ def audit_holdout(conn: sqlite3.Connection, latest_taste: sqlite3.Row) -> Holdou
     )
 
 
+def replacement_needed(audit: HoldoutAudit) -> int:
+    return max(0, taste.HOLDOUT_SIZE - audit.official_count)
+
+
 def remediation_lines(audit: HoldoutAudit) -> list[str]:
     lines: list[str] = []
-    if audit.official_count != taste.HOLDOUT_SIZE:
+    needed = replacement_needed(audit)
+    if needed:
         lines.append(
-            f"The official holdout has {audit.official_count} row(s); expected exactly "
-            f"{taste.HOLDOUT_SIZE}."
+            f"Replacement blind-review judgment required: {needed}. Run "
+            f"'python run.py blind-review --limit {needed}', judge the new item(s) BLIND by reply, then re-run "
+            "audit-holdout-integrity. Formal evaluation stays blocked until the holdout is 20 official rows."
+        )
+    elif audit.official_count != taste.HOLDOUT_SIZE:
+        lines.append(
+            f"The official holdout has {audit.official_count} row(s); expected exactly {taste.HOLDOUT_SIZE}."
         )
     for group in audit.duplicate_groups:
         lines.append(
@@ -438,6 +463,7 @@ def render_lines(audit: HoldoutAudit) -> list[str]:
     out.append(f"  Post-training feedback rows (feedback_id > checkpoint): {audit.post_training_count}")
     out.append(f"  Official blind holdout rows (taste-status predicate): {audit.official_count}")
     out.append(f"  Questionable blind holdout candidates: {len(audit.candidates)}")
+    out.append(f"  Superseded duplicates (manually excluded, recorded repair): {len(audit.superseded)}")
     out.append(f"  Other post-checkpoint feedback (not part of holdout): {len(audit.other)}")
     out.append(
         f"  Totals reconcile: {'YES' if audit.reconciles_total else 'NO'}; "
@@ -459,6 +485,18 @@ def render_lines(audit: HoldoutAudit) -> list[str]:
         out.append("  (none)")
     for row in audit.candidates:
         _append_row(out, row)
+
+    out.append("")
+    out.append("SUPERSEDED DUPLICATES (manually excluded by a recorded repair; not members, not a verdict input)")
+    if not audit.superseded:
+        out.append("  (none)")
+    for row in audit.superseded:
+        record = audit.superseded_records.get(row.feedback_id, {})
+        out.append(
+            f"  {_row_label(row)} | feedback {row.feedback_id} | {row.company or '-'} ({row.ticker or '-'}) | "
+            f"retained: {record.get('retained_ref', '-')} (feedback {record.get('retained_feedback_id', '-')}) | "
+            f"reason: {record.get('reason', '-')}"
+        )
 
     out.append("")
     out.append("OTHER POST-CHECKPOINT FEEDBACK (not part of holdout; reported for reconciliation only)")
@@ -495,6 +533,8 @@ def render_lines(audit: HoldoutAudit) -> list[str]:
     out.append(f"  Duplicate groups: {len(audit.duplicate_groups)}")
     out.append(f"  Valid unique holdout judgments: {audit.valid_unique_count}")
     out.append(f"  Invalid/questionable rows: {_questionable_count(audit)}")
+    if replacement_needed(audit):
+        out.append(f"  REPLACEMENT BLIND-REVIEW JUDGMENT REQUIRED: {replacement_needed(audit)}")
     if audit.clean:
         out.append(
             f"  HOLDOUT CLEAN: {taste.HOLDOUT_SIZE} official rows, {taste.HOLDOUT_SIZE} unique valid ideas, "
