@@ -12,6 +12,7 @@ Superseded duplicates and questionable candidates are never evaluated.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -164,10 +165,14 @@ def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_ve
     except taste.TasteIntegrityError as exc:
         integrity = (False, str(exc))
     checks.append(("Taste artifact integrity OK", integrity[0], integrity[1]))
+    decision = db.get_taste_evaluation_decision(conn, latest_taste["version_number"])
+    frozen_ok = latest_taste["build_unlocked"] == 0 or (
+        latest_taste["build_unlocked"] == 1 and decision is not None
+    )
     checks.append((
-        "Taste version frozen (build_unlocked = 0)",
-        latest_taste["build_unlocked"] == 0,
-        f"build_unlocked={latest_taste['build_unlocked']}",
+        "Taste version frozen (build_unlocked = 0, or authorized by a recorded decision)",
+        frozen_ok,
+        f"build_unlocked={latest_taste['build_unlocked']}, decision={decision['decision'] if decision else 'none'}",
     ))
     checks.append((
         f"Holdout complete: {taste.HOLDOUT_SIZE} official members",
@@ -569,3 +574,77 @@ def render_report(
     out.append("EVALUATION ONLY — Taste remains frozen.")
     out.append("Brad review/approval is required before any unlock or new Taste build.")
     return out
+
+
+DECISIONS = ("RETRAIN", "ACCEPT")
+
+
+def build_decision_record(
+    *,
+    latest_taste,
+    gate: GateResult,
+    metrics: Metrics,
+    rules_sha256: str,
+    decision: str,
+    reason: str,
+    recorded_at: str,
+) -> dict:
+    """The durable evaluation record for one frozen Taste version. Every value is
+    deterministic and taken from stored rows. The fingerprint is a SHA-256 over
+    the evaluation's inputs and results, so later code can prove exactly which
+    evaluation Brad approved. Brad's decision and reason are stored alongside it
+    but are not part of the fingerprint.
+    """
+    if decision not in DECISIONS:
+        raise ValueError(f"unknown decision {decision!r}")
+    rows = gate.rows
+    prompt = holdout_prompt_version(rows)
+    version = latest_taste["version_number"]
+    payload = {
+        "taste_version": version,
+        "checkpoint_feedback_id": latest_taste["checkpoint_feedback_id"],
+        "artifact_sha256": latest_taste["idea_taste_sha256"],
+        "screen_rules_sha256": rules_sha256,
+        "screening_prompt_version": prompt,
+        "holdout": [
+            [r.feedback_id, r.ref, r.actual, r.prediction, r.screening["screening_id"]] for r in rows
+        ],
+        "metrics": {
+            "exact_correct": metrics.exact_correct,
+            "exact_total": metrics.n,
+            "tp": metrics.tp,
+            "fp": metrics.fp,
+            "tn": metrics.tn,
+            "fn": metrics.fn,
+            "recall": metrics.recall,
+            "balanced_accuracy": metrics.balanced_accuracy,
+            "high_conviction_hit": metrics.hc_hit,
+            "high_conviction_total": metrics.hc_actual,
+        },
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "taste_version_number": version,
+        "decision": decision,
+        "reason": reason,
+        "recorded_at": recorded_at,
+        "checkpoint_feedback_id": latest_taste["checkpoint_feedback_id"],
+        "holdout_count": gate.audit.official_count,
+        "unique_holdout_count": gate.audit.unique_count,
+        "screening_prompt_version": prompt,
+        "taste_artifact_sha256": latest_taste["idea_taste_sha256"],
+        "screen_rules_sha256": rules_sha256,
+        "exact_correct": metrics.exact_correct,
+        "exact_total": metrics.n,
+        "binary_tp": metrics.tp,
+        "binary_fp": metrics.fp,
+        "binary_tn": metrics.tn,
+        "binary_fn": metrics.fn,
+        "recall": metrics.recall,
+        "balanced_accuracy": metrics.balanced_accuracy,
+        "high_conviction_hit": metrics.hc_hit,
+        "high_conviction_total": metrics.hc_actual,
+        "evaluation_fingerprint": fingerprint,
+    }

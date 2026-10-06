@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
 import time
 from types import SimpleNamespace
@@ -1137,6 +1138,7 @@ def cmd_build_taste(config: Config) -> int:
         # explicitly sets build_unlocked=1, a version whose holdout
         # completes simply stays frozen, which is the intended fail-safe.
         if not (holdout_complete and latest["build_unlocked"]):
+            recorded = db.get_taste_evaluation_decision(conn, latest["version_number"])
             conn.close()
             if not holdout_complete:
                 print(
@@ -1145,6 +1147,11 @@ def cmd_build_taste(config: Config) -> int:
                     "Refusing to regenerate until all of them have accumulated -- see "
                     "'python run.py taste-status'."
                 )
+            elif recorded is not None and recorded["decision"] == "ACCEPT":
+                print(
+                    f"Taste {latest['version_label']}'s evaluation decision is ACCEPT. No new build is "
+                    "authorized; the current taste stays in use."
+                )
             else:
                 print(
                     f"Taste {latest['version_label']}'s clean holdout is complete "
@@ -1152,6 +1159,28 @@ def cmd_build_taste(config: Config) -> int:
                     "Refusing to regenerate until Brad explicitly unlocks it -- see "
                     "'python run.py taste-status'."
                 )
+            return 1
+        decision = db.get_taste_evaluation_decision(conn, latest["version_number"])
+        if decision is None:
+            conn.close()
+            print(
+                f"Taste {latest['version_label']} has no recorded evaluation decision. Refusing to build. "
+                "Record one with 'python run.py record-taste-evaluation' (see 'python run.py taste-status')."
+            )
+            return 1
+        if decision["decision"] != "RETRAIN":
+            conn.close()
+            print(
+                f"Taste {latest['version_label']}'s evaluation decision is {decision['decision']}. "
+                "Only RETRAIN authorizes a new build, so nothing will be built."
+            )
+            return 1
+        if decision["consumed_by_version"] is not None:
+            conn.close()
+            print(
+                f"The RETRAIN authorization for {latest['version_label']} was already used to build "
+                f"v{decision['consumed_by_version']}. A further build needs a new evaluation of the latest version."
+            )
             return 1
 
     # The permanent rules are the top of the authority order (see
@@ -1276,8 +1305,10 @@ def cmd_build_taste(config: Config) -> int:
         # commit is the ENTIRE definition of "active" -- taste-status and
         # all future screening logic read only this row, never file
         # presence, to determine the current version.
-        db.insert_taste_version(
+        db.commit_new_taste_version(
             conn,
+            authorizing_version=latest["version_number"] if latest is not None else None,
+            consumed_at=utcnow_iso(),
             version_number=version_number,
             version_label=version_label,
             generated_at=generated_at,
@@ -1365,6 +1396,8 @@ def cmd_taste_status(config: Config) -> int:
     digest_reply_count = db.count_feedback_by_origin(conn, "DIGEST_REPLY")
     screen_review_count = db.count_feedback_by_origin(conn, "SCREEN_REVIEW")
     unjudged_blind_review_count = db.count_unjudged_blind_review_assignments(conn)
+    decision = db.get_taste_evaluation_decision(conn, latest["version_number"])
+    eligible_for_next_build = len(db.get_feedback_eligible_for_learning(conn))
     conn.close()
 
     # HOLDOUT COMPLETE (20/20 eligible judgments collected) and TASTE
@@ -1373,19 +1406,34 @@ def cmd_taste_status(config: Config) -> int:
     # db.py's Migration 14 comment and cmd_build_taste's matching check.
     # Reaching 20/20 alone never unfreezes anything.
     holdout_complete = len(holdout) >= taste.HOLDOUT_SIZE
-    frozen = not (holdout_complete and latest["build_unlocked"])
+    # A Taste version's artifact is never modified, so it is always frozen. A
+    # RETRAIN decision authorizes one NEW build; it does not unfreeze this one.
+    frozen = True
 
     print(f"Taste version: {latest['version_label']}")
     print(f"Training judgments: {latest['training_count']}")
     print(f"Holdout judgments collected: {len(holdout)} / {taste.HOLDOUT_SIZE}")
     print(f"Holdout complete: {'YES' if holdout_complete else 'NO'}")
     print(f"Taste frozen: {'YES' if frozen else 'NO'}")
-    if holdout_complete and frozen:
-        # Complete, but nothing has unlocked it for regeneration yet --
-        # there is no unlock command yet (a future holdout-evaluation
-        # workflow owns that transition); this line makes the "waiting on
-        # Brad" state explicit rather than silently indistinguishable from
-        # an ordinary in-progress holdout.
+    if decision is None:
+        print(f"Evaluation decision: none")
+    else:
+        print(f"Evaluation decision: {decision['decision']}")
+        print(f"Evaluation recorded: {decision['recorded_at']}")
+    if decision is not None and decision["decision"] == "RETRAIN" and decision["consumed_by_version"] is None:
+        if latest["build_unlocked"]:
+            print("Build authorization: ONE BUILD AUTHORIZED (nothing is built automatically; run build-taste)")
+        else:
+            print("Build authorization: LOCKED")
+    elif decision is not None and decision["consumed_by_version"] is not None:
+        print(f"Build authorization: USED (consumed by v{decision['consumed_by_version']})")
+    else:
+        print("Build authorization: LOCKED")
+    print(f"Eligible for the next training build: {eligible_for_next_build} (canonical learning-eligible feedback)")
+    if holdout_complete and decision is None:
+        # Complete but not yet evaluated and decided -- makes the "waiting on
+        # Brad" state explicit rather than indistinguishable from an
+        # ordinary in-progress holdout.
         print("Awaiting holdout evaluation: YES")
     if digest_reply_count:
         # Stage 9: learning-eligible but NEVER counted in "Holdout
@@ -3524,6 +3572,7 @@ def cmd_evaluate_taste(config: Config, *, version: int) -> int:
         print("No taste model exists. Evaluation refused.")
         return 1
     gate = taste_evaluation.check_gate(conn, latest_taste, version)
+    decision = db.get_taste_evaluation_decision(conn, latest_taste["version_number"])
     conn.close()
 
     if not gate.passed:
@@ -3545,6 +3594,115 @@ def cmd_evaluate_taste(config: Config, *, version: int) -> int:
         rules_text=rules_text,
     ):
         print(line)
+    if decision is None:
+        print(f"Recorded evaluation decision for v{version}: none (display only; nothing was written)")
+    else:
+        print(
+            f"Recorded evaluation decision for v{version}: {decision['decision']} "
+            f"(recorded {decision['recorded_at']}; display only)"
+        )
+    return 0
+
+
+def cmd_record_taste_evaluation(
+    config: Config, *, version: int, decision: str, reason: str, dry_run: bool
+) -> int:
+    """Record Brad's evaluation decision for the latest, frozen Taste version.
+    RETRAIN writes the record and sets build_unlocked=1 in ONE transaction,
+    authorizing exactly one new build (build-taste consumes it). ACCEPT records
+    the decision and leaves build_unlocked=0. The decision is never inferred,
+    the record is tied to the deterministic evaluation at the moment of approval,
+    and an existing decision is never replaced. The evaluation itself is read-only.
+    """
+    reason = reason.strip()
+    if not reason:
+        print("A non-empty --reason is required. Nothing recorded.")
+        return 2
+
+    conn = db.open_production_database(config.database_path)
+    latest_taste = db.get_latest_taste_version(conn)
+    if latest_taste is None or latest_taste["version_number"] != version:
+        conn.close()
+        current = "none" if latest_taste is None else f"v{latest_taste['version_number']}"
+        print(f"REFUSED: v{version} is not the latest Taste version (latest is {current}). Nothing recorded.")
+        return 1
+
+    existing = db.get_taste_evaluation_decision(conn, version)
+    if existing is not None:
+        conn.close()
+        print(
+            f"REFUSED: a decision is already recorded for v{version} ({existing['decision']}, recorded "
+            f"{existing['recorded_at']}). Decisions are never replaced. Nothing changed."
+        )
+        return 1
+
+    gate = taste_evaluation.check_gate(conn, latest_taste, version)
+    if not gate.passed:
+        conn.close()
+        print(f"REFUSED: the evaluation gate did not pass for v{version}. Nothing recorded.")
+        for name, ok, detail in gate.checks:
+            print(f"  [{'ok' if ok else 'FAIL'}] {name} ({detail})")
+        return 1
+
+    try:
+        rules_text = config.screen_rules_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        conn.close()
+        print(f"REFUSED: cannot read the screening rules file: {exc}. Nothing recorded.")
+        return 1
+
+    metrics = taste_evaluation.compute_metrics(gate.rows)
+    record = taste_evaluation.build_decision_record(
+        latest_taste=latest_taste,
+        gate=gate,
+        metrics=metrics,
+        rules_sha256=taste.compute_content_sha256(rules_text),
+        decision=decision,
+        reason=reason,
+        recorded_at=utcnow_iso(),
+    )
+    conn.close()
+
+    print(f"EVALUATION SUMMARY -- {latest_taste['version_label']} (checkpoint feedback_id {record['checkpoint_feedback_id']})")
+    print(f"  holdout: {record['holdout_count']} official, {record['unique_holdout_count']} unique")
+    print(f"  screening prompt version: v{record['screening_prompt_version']}")
+    print(f"  artifact sha256: {record['taste_artifact_sha256']}")
+    print(f"  screening rules sha256: {record['screen_rules_sha256']}")
+    print(f"  exact accuracy: {record['exact_correct']}/{record['exact_total']}")
+    print(
+        f"  binary TP {record['binary_tp']} | FP {record['binary_fp']} | TN {record['binary_tn']} | "
+        f"FN {record['binary_fn']} | recall {taste_evaluation._fmt(record['recall'])} | "
+        f"balanced accuracy {taste_evaluation._fmt(record['balanced_accuracy'])}"
+    )
+    print(
+        f"  high-conviction recall: {record['high_conviction_hit']}/{record['high_conviction_total']}"
+    )
+    print(f"  evaluation fingerprint: {record['evaluation_fingerprint']}")
+    print(f"  decision: {decision}")
+    print(f"  reason: {reason}")
+
+    if dry_run:
+        print("DRY RUN: nothing recorded, nothing unlocked, and no backup was created.")
+        return 0
+
+    conn = db.open_production_database(config.database_path)
+    backup_path = db.create_labeled_backup(conn, config.database_path, "record_taste_evaluation")
+    print(f"Backup created: {backup_path}")
+    try:
+        db.record_taste_evaluation_decision(conn, record)
+    except (RuntimeError, sqlite3.IntegrityError) as exc:
+        conn.close()
+        print(f"FAILED: {exc}. Nothing was recorded or unlocked.")
+        return 1
+    conn.close()
+
+    if decision == "RETRAIN":
+        print(
+            f"RECORDED: RETRAIN for {latest_taste['version_label']}. build_unlocked=1 -- exactly ONE new Taste "
+            "build is authorized. It has NOT been built. Run 'python run.py build-taste' when ready."
+        )
+    else:
+        print(f"RECORDED: ACCEPT for {latest_taste['version_label']}. build_unlocked stays 0; no new build is authorized.")
     return 0
 
 
@@ -4015,6 +4173,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="READ-ONLY: evaluate a frozen Taste version against its clean blind holdout (refuses if not clean)",
     )
     evaluate_parser.add_argument("--version", type=int, required=True, help="Taste version number, e.g. 2")
+    record_evaluation_parser = subparsers.add_parser(
+        "record-taste-evaluation",
+        help="Record Brad's evaluation decision for the latest frozen Taste version (RETRAIN authorizes one build)",
+    )
+    record_evaluation_parser.add_argument("--version", type=int, required=True, help="Taste version number, e.g. 2")
+    record_evaluation_parser.add_argument(
+        "--decision", required=True, choices=taste_evaluation.DECISIONS, help="RETRAIN or ACCEPT -- Brad's decision"
+    )
+    record_evaluation_parser.add_argument("--reason", required=True, help="Brad's reason, recorded verbatim")
+    record_evaluation_parser.add_argument("--dry-run", action="store_true", help="Show the summary; change nothing")
     repair_duplicate_parser = subparsers.add_parser(
         "repair-holdout-duplicate",
         help="Manually exclude ONE confirmed duplicate holdout judgment (validated, backed up, reason recorded)",
@@ -4210,6 +4378,16 @@ def main(argv: list[str] | None = None) -> int:
             config = load_config()
             setup_logging(config.log_path)
             return cmd_repair_source_content(config, args.source_name, dry_run=args.dry_run)
+        elif args.command == "record-taste-evaluation":
+            config = load_config()
+            setup_logging(config.log_path)
+            return cmd_record_taste_evaluation(
+                config,
+                version=args.version,
+                decision=args.decision,
+                reason=args.reason,
+                dry_run=args.dry_run,
+            )
         elif args.command == "evaluate-taste":
             # Read-only, no LLM, no ANTHROPIC_API_KEY needed.
             config = load_config()

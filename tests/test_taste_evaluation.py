@@ -126,7 +126,7 @@ def test_clean_holdout_evaluates(tmp_path, monkeypatch):
     assert code == 0
     assert "HOLDOUT GATE: PASSED" in output
     assert "TASTE EVALUATION -- v2" in output
-    assert output.rstrip().endswith("Brad review/approval is required before any unlock or new Taste build.")
+    assert "Brad review/approval is required before any unlock or new Taste build." in output
     assert "EVALUATION ONLY — Taste remains frozen." in output
 
 
@@ -227,7 +227,7 @@ def test_unlocked_taste_refuses(tmp_path, monkeypatch):
     code, output = _evaluate(config)
 
     assert code == 1
-    assert "[FAIL] Taste version frozen (build_unlocked = 0)" in output
+    assert "[FAIL] Taste version frozen (build_unlocked = 0, or authorized by a recorded decision)" in output
 
 
 def test_missing_prediction_before_judgment_refuses(tmp_path, monkeypatch):

@@ -503,13 +503,11 @@ def test_build_taste_after_holdout_completion_includes_screen_review_feedback(tm
     conn = db.connect(config.database_path)
     insert_n_eligible(conn, taste.HOLDOUT_SIZE, prefix="msg_holdout")
     # Holdout complete is NOT the same as build-unlocked (see db.py's
-    # Migration 14 comment) -- explicitly unlock so this test can exercise
+    # Migration 14 comment) -- record a RETRAIN decision so this test can exercise
     # what training looks like once Brad has authorized regeneration.
-    conn.execute(
-        "UPDATE taste_versions SET build_unlocked = 1 WHERE version_number = "
-        "(SELECT version_number FROM taste_versions ORDER BY version_number DESC LIMIT 1)"
-    )
-    conn.commit()
+    from tests.test_cli_build_taste import unlock_latest_taste_version
+
+    unlock_latest_taste_version(conn)
     conn.close()
 
     exit_code = cli.cmd_build_taste(config)

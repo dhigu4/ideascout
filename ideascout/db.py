@@ -805,6 +805,40 @@ MIGRATIONS: list[str] = [
     ALTER TABLE source_screenings_new RENAME TO source_screenings;
     CREATE INDEX idx_source_screenings_source_id ON source_screenings(source_id);
     """,
+    # Migration 19 (governance): a durable record of Brad's evaluation decision
+    # for one frozen Taste version. A RETRAIN decision also sets that version's
+    # build_unlocked=1, which authorizes exactly ONE new build; the successful
+    # build consumes it (consumed_by_version / consumed_at). One row per version
+    # (UNIQUE), so a decision can never be silently replaced. Additive only.
+    """
+    CREATE TABLE taste_evaluation_decisions (
+        decision_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        taste_version_number       INTEGER NOT NULL UNIQUE REFERENCES taste_versions(version_number),
+        decision                   TEXT NOT NULL CHECK (decision IN ('RETRAIN', 'ACCEPT')),
+        reason                     TEXT NOT NULL,
+        recorded_at                TEXT NOT NULL,
+        checkpoint_feedback_id     INTEGER NOT NULL,
+        holdout_count              INTEGER NOT NULL,
+        unique_holdout_count       INTEGER NOT NULL,
+        screening_prompt_version   INTEGER NOT NULL,
+        taste_artifact_sha256      TEXT NOT NULL,
+        screen_rules_sha256        TEXT NOT NULL,
+        exact_correct              INTEGER NOT NULL,
+        exact_total                INTEGER NOT NULL,
+        binary_tp                  INTEGER NOT NULL,
+        binary_fp                  INTEGER NOT NULL,
+        binary_tn                  INTEGER NOT NULL,
+        binary_fn                  INTEGER NOT NULL,
+        recall                     REAL,
+        balanced_accuracy          REAL,
+        high_conviction_hit        INTEGER NOT NULL,
+        high_conviction_total      INTEGER NOT NULL,
+        evaluation_fingerprint     TEXT NOT NULL,
+        consumed_by_version        INTEGER REFERENCES taste_versions(version_number),
+        consumed_at                TEXT,
+        CHECK ((consumed_by_version IS NULL) = (consumed_at IS NULL))
+    );
+    """,
 ]
 
 
@@ -1787,7 +1821,7 @@ def update_taste_version_sha256(
     conn.commit()
 
 
-def insert_taste_version(
+def _insert_taste_version_row(
     conn: sqlite3.Connection,
     *,
     version_number: int,
@@ -1833,7 +1867,86 @@ def insert_taste_version(
             "created_at": created_at,
         },
     )
+
+
+def insert_taste_version(conn: sqlite3.Connection, **kwargs) -> None:
+    _insert_taste_version_row(conn, **kwargs)
     conn.commit()
+
+
+def commit_new_taste_version(
+    conn: sqlite3.Connection, *, authorizing_version: int | None, consumed_at: str, **kwargs
+) -> None:
+    """The ONE commit that makes a new Taste version active. In a single
+    transaction: insert the new row, and -- when this build was authorized by a
+    RETRAIN decision -- consume that authorization (the decision records the new
+    version; the old version's build_unlocked goes back to 0). If anything in the
+    transaction fails, nothing changes and the authorization stays available.
+    """
+    with conn:
+        _insert_taste_version_row(conn, **kwargs)
+        if authorizing_version is None:
+            return
+        consumed = conn.execute(
+            """
+            UPDATE taste_evaluation_decisions
+            SET consumed_by_version = ?, consumed_at = ?
+            WHERE taste_version_number = ? AND decision = 'RETRAIN' AND consumed_by_version IS NULL
+            """,
+            (kwargs["version_number"], consumed_at, authorizing_version),
+        ).rowcount
+        if consumed != 1:
+            raise RuntimeError(
+                f"No unconsumed RETRAIN authorization exists for v{authorizing_version}; "
+                "the new version was not committed."
+            )
+        conn.execute("UPDATE taste_versions SET build_unlocked = 0 WHERE version_number = ?", (authorizing_version,))
+
+
+def get_taste_evaluation_decision(conn: sqlite3.Connection, version_number: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM taste_evaluation_decisions WHERE taste_version_number = ?", (version_number,)
+    ).fetchone()
+
+
+def record_taste_evaluation_decision(conn: sqlite3.Connection, record: dict) -> None:
+    """Write one evaluation decision and, for RETRAIN, set that version's
+    build_unlocked=1 -- in one transaction. ACCEPT never touches build_unlocked.
+    Raises (and changes nothing) if the version is not currently frozen with
+    build_unlocked=0, or if a decision already exists for it.
+    """
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO taste_evaluation_decisions (
+                taste_version_number, decision, reason, recorded_at, checkpoint_feedback_id,
+                holdout_count, unique_holdout_count, screening_prompt_version,
+                taste_artifact_sha256, screen_rules_sha256,
+                exact_correct, exact_total, binary_tp, binary_fp, binary_tn, binary_fn,
+                recall, balanced_accuracy, high_conviction_hit, high_conviction_total,
+                evaluation_fingerprint
+            ) VALUES (
+                :taste_version_number, :decision, :reason, :recorded_at, :checkpoint_feedback_id,
+                :holdout_count, :unique_holdout_count, :screening_prompt_version,
+                :taste_artifact_sha256, :screen_rules_sha256,
+                :exact_correct, :exact_total, :binary_tp, :binary_fp, :binary_tn, :binary_fn,
+                :recall, :balanced_accuracy, :high_conviction_hit, :high_conviction_total,
+                :evaluation_fingerprint
+            )
+            """,
+            record,
+        )
+        if record["decision"] == "RETRAIN":
+            updated = conn.execute(
+                "UPDATE taste_versions SET build_unlocked = 1 "
+                "WHERE version_number = ? AND build_unlocked = 0",
+                (record["taste_version_number"],),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError(
+                    f"Taste v{record['taste_version_number']} is not frozen with build_unlocked=0; "
+                    "no authorization was recorded."
+                )
 
 
 # --- Stage 4: blind shadow screening for the Taste v1 holdout ---------------

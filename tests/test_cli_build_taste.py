@@ -128,20 +128,37 @@ def make_rule(i: int, confidence: str = "HIGH") -> taste.CandidateRule:
 
 
 def unlock_latest_taste_version(conn) -> None:
-    """Simulates what a future holdout-evaluation/unlock workflow will do
-    (no such command exists yet -- see db.py's Migration 14 comment and
-    cmd_build_taste's freeze check): directly flips build_unlocked=1 for
-    whichever taste version is currently active. Tests use this only to
-    reach the "past the freeze gate" code paths they're actually testing
-    (a mid-generation failure, a DB-insert failure, an orphan-directory
-    check) -- reaching HOLDOUT_SIZE alone must never be enough on its own.
+    """Records a RETRAIN evaluation decision for the active taste version through
+    the same database path record-taste-evaluation uses (one transaction that
+    writes the decision and sets build_unlocked=1). Tests use this only to reach
+    the code paths they're actually testing (a mid-generation failure, a
+    DB-insert failure, an orphan-directory check) -- reaching HOLDOUT_SIZE alone
+    is never enough, and the evaluation gate itself is covered elsewhere.
     """
     latest = db.get_latest_taste_version(conn)
-    conn.execute(
-        "UPDATE taste_versions SET build_unlocked = 1 WHERE version_number = ?",
-        (latest["version_number"],),
-    )
-    conn.commit()
+    db.record_taste_evaluation_decision(conn, {
+        "taste_version_number": latest["version_number"],
+        "decision": "RETRAIN",
+        "reason": "test authorization",
+        "recorded_at": "2026-06-01T00:00:00+00:00",
+        "checkpoint_feedback_id": latest["checkpoint_feedback_id"],
+        "holdout_count": 20,
+        "unique_holdout_count": 20,
+        "screening_prompt_version": 1,
+        "taste_artifact_sha256": latest["idea_taste_sha256"],
+        "screen_rules_sha256": "test-rules",
+        "exact_correct": 0,
+        "exact_total": 20,
+        "binary_tp": 0,
+        "binary_fp": 0,
+        "binary_tn": 0,
+        "binary_fn": 0,
+        "recall": None,
+        "balanced_accuracy": None,
+        "high_conviction_hit": 0,
+        "high_conviction_total": 0,
+        "evaluation_fingerprint": "test-fingerprint",
+    })
 
 
 # --- canonical eligibility query ---------------------------------------------
@@ -1053,7 +1070,7 @@ def test_training_ids_identical_across_internal_retries(tmp_path, monkeypatch):
 
 
 def test_version_specific_artifacts_exist_and_are_correct_before_db_activation(tmp_path, monkeypatch):
-    """Proves step ordering: by the time db.insert_taste_version is
+    """Proves step ordering: by the time db.commit_new_taste_version is
     called, the immutable version-specific artifact it is about to be
     recorded as pointing to already exists on disk with the exact final
     content -- nothing about it is provisional at that point.
@@ -1066,7 +1083,7 @@ def test_version_specific_artifacts_exist_and_are_correct_before_db_activation(t
     patch_taste(monkeypatch, body="## Strong Positive Signals\nComplete before activation.\n")
 
     seen = {}
-    original_insert = db.insert_taste_version
+    original_insert = db.commit_new_taste_version
 
     def spy_insert(conn, **kwargs):
         version_path = Path(kwargs["idea_taste_path"])
@@ -1075,7 +1092,7 @@ def test_version_specific_artifacts_exist_and_are_correct_before_db_activation(t
         seen["hash_matches"] = taste.compute_file_sha256(version_path) == kwargs["idea_taste_sha256"]
         return original_insert(conn, **kwargs)
 
-    monkeypatch.setattr(db, "insert_taste_version", spy_insert)
+    monkeypatch.setattr(db, "commit_new_taste_version", spy_insert)
 
     exit_code = cli.cmd_build_taste(config)
     assert exit_code == 0
@@ -1114,7 +1131,7 @@ def test_db_insert_failure_preserves_previously_active_version_and_files(tmp_pat
     def boom(*args, **kwargs):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(db, "insert_taste_version", boom)
+    monkeypatch.setattr(db, "commit_new_taste_version", boom)
 
     exit_code = cli.cmd_build_taste(config)
     assert exit_code == 1
