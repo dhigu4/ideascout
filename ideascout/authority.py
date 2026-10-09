@@ -62,41 +62,55 @@ The user message contains Brad's PERMANENT SCREENING RULES, which are Brad-appro
 
 _NEGATION = re.compile(r"\b(?:not|no|never|isn'?t|aren'?t|without|nor|neither|rather\s+than|unless)\b", re.IGNORECASE)
 
+# Each pattern captures the specific number it is keying off, in group 1 (except
+# "an effective hurdle", which has none -- that exact framing is rejected
+# regardless of the number, since the permanent rules never describe the upside
+# standard as a "hurdle" at all). `unit` says which canonical set (see
+# _extract_canonical_thresholds) that captured number is checked against; None
+# means the match is never exempt. The gap between a keyword and its number
+# deliberately excludes digits ([^.\n;0-9]), so a keyword can only reach the
+# number it actually governs -- not skip over an intervening, unrelated number
+# (e.g. a faithfully-restated ">100%") to reach a second, later one (e.g. an
+# incidental "3x" mention elsewhere in the same sentence).
 _HARD_THRESHOLD_PATTERNS = (
     (
         "a multiple stated as a required minimum or floor",
         re.compile(
             r"\b(?:requires?|required|must|minimum|min\.?|floor|at\s+least|no\s+less\s+than|mandatory|"
-            r"non-?negotiable|hard|strict|absolute)\b[^.\n;]{0,40}?\b\d+(?:\.\d+)?\s*x\b",
+            r"non-?negotiable|hard|strict|absolute)\b[^.\n;0-9]{0,40}?\b(\d+(?:\.\d+)?)\s*x\b",
             re.IGNORECASE,
         ),
+        "x",
     ),
     (
         "a multiple stated as a hurdle, floor, or threshold",
         re.compile(
-            r"\b\d+(?:\.\d+)?\s*x\s+(?:hurdle|floor|minimum|threshold|requirement|cut-?off|bar)\b",
+            r"\b(\d+(?:\.\d+)?)\s*x\s+(?:hurdle|floor|minimum|threshold|requirement|cut-?off|bar)\b",
             re.IGNORECASE,
         ),
+        "x",
     ),
     (
         "an effective hurdle",
         re.compile(r"\beffective(?:ly)?\s+(?:\d+(?:\.\d+)?\s*x\s+)?hurdle\b", re.IGNORECASE),
+        None,
     ),
     (
         "a percentage stated as a required minimum, floor, or threshold",
         re.compile(
             r"\b(?:requires?|required|must|minimum|min\.?|floor|hurdle|threshold|at\s+least|no\s+less\s+than|"
-            r"hard|strict|absolute|mandatory)\b[^.\n;]{0,40}?\b\d+(?:\.\d+)?\s*%",
+            r"hard|strict|absolute|mandatory)\b[^.\n;0-9]{0,40}?\b(\d+(?:\.\d+)?)\s*%",
             re.IGNORECASE,
         ),
+        "%",
     ),
     (
         "a percentage stated as a hurdle, floor, or threshold",
         re.compile(
-            r"\b\d+(?:\.\d+)?\s*%\s*(?:(?:IRR|CAGR|return|upside|annual|annualized|yield)\s+){0,2}"
-            r"(?:hurdle|floor|minimum|threshold|requirement|cut-?off)\b",
+            r"\b(\d+(?:\.\d+)?)\s*%[^.\n;0-9]{0,40}?\b(?:hurdle|floor|minimum|threshold|requirement|cut-?off)\b",
             re.IGNORECASE,
         ),
+        "%",
     ),
 )
 
@@ -108,19 +122,50 @@ class AuthorityConflict:
     reason: str
 
 
-def find_hard_threshold_conflicts(text: str) -> list[AuthorityConflict]:
-    """Deterministic, line-level check for generated Taste text that turns a
-    numeric preference (such as a 3x multiple) into a hard threshold. A match
-    preceded by a negation within the same clause (e.g. "does not require 3x")
-    is a benign statement and is not flagged. One finding per line per reason.
-    No LLM is involved, and nothing is ever rewritten.
+def _extract_canonical_thresholds(permanent_rules_text: str) -> dict[str, set[float]]:
+    """Numeric thresholds that already appear in the permanent screening rules
+    (IDEA_SCREEN_RULES.md), as plain text extraction -- no interpretation of
+    meaning, no LLM. A generated Taste statement that restates one of these
+    exact numbers, in the same unit, is a faithful restatement of an EXISTING
+    canonical rule, not an invented or hardened one. Covers percentages
+    (including an IRR percentage, if the rules ever state one -- IRR numbers
+    are just percentages) and x-multiples, should the rules ever state one.
     """
+    percentages = {float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*%", permanent_rules_text)}
+    multiples = {float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*x\b", permanent_rules_text, re.IGNORECASE)}
+    return {"%": percentages, "x": multiples}
+
+
+def find_hard_threshold_conflicts(text: str, permanent_rules_text: str = "") -> list[AuthorityConflict]:
+    """Deterministic, line-level check for generated Taste text that turns a
+    numeric preference (such as a 3x multiple) into a hard threshold.
+
+    Two kinds of match are never flagged:
+    - one preceded by a negation within the same clause (e.g. "does not
+      require 3x") -- a benign statement, not a hard threshold;
+    - one whose captured number is a FAITHFUL RESTATEMENT of a threshold that
+      already appears in `permanent_rules_text`, in the same unit (e.g. "the
+      permanent rule requires >100% upside" when the rules say ">100%+") --
+      allowed because it doesn't introduce, raise, or harden anything. A line
+      restating a canonical threshold still fails if it ALSO introduces a
+      different, non-canonical hard threshold (e.g. "...>100%, but require
+      3x" -- the 3x half is still flagged, since 3x is not in the rules).
+
+    Pass `permanent_rules_text=""` (the default) to disable the canonical
+    exception entirely and flag every numeric hard-threshold pattern, which is
+    useful for testing the patterns in isolation. One finding per line per
+    reason. No LLM is involved, and nothing is ever rewritten.
+    """
+    canonical = _extract_canonical_thresholds(permanent_rules_text)
     findings: list[AuthorityConflict] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
-        for reason, pattern in _HARD_THRESHOLD_PATTERNS:
+        for reason, pattern, unit in _HARD_THRESHOLD_PATTERNS:
             for match in pattern.finditer(line):
                 prefix = line[max(0, match.start() - 50): match.start()]
                 if _NEGATION.search(prefix):
+                    continue
+                captured = match.group(1) if match.lastindex else None
+                if unit is not None and captured is not None and float(captured) in canonical.get(unit, set()):
                     continue
                 findings.append(AuthorityConflict(line_number, line.strip()[:160], reason))
                 break

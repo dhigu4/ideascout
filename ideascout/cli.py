@@ -1225,11 +1225,15 @@ def cmd_build_taste(config: Config) -> int:
     generated_date = date.today().isoformat()
     generated_at = utcnow_iso()
 
-    conflicts = [("idea-taste.md", finding) for finding in authority.find_hard_threshold_conflicts(body)]
+    conflicts = [
+        ("idea-taste.md", finding)
+        for finding in authority.find_hard_threshold_conflicts(body, permanent_rules_text=permanent_rules_text)
+    ]
     for index, candidate in enumerate(rules, start=1):
         candidate_text = "\n".join((candidate.rule, candidate.evidence, candidate.reusability))
         conflicts += [
-            (f"candidate rule {index}", finding) for finding in authority.find_hard_threshold_conflicts(candidate_text)
+            (f"candidate rule {index}", finding)
+            for finding in authority.find_hard_threshold_conflicts(candidate_text, permanent_rules_text=permanent_rules_text)
         ]
     if conflicts:
         rejected_path = _save_rejected_candidate(config, generated_at, body, rules)
