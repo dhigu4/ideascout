@@ -67,6 +67,38 @@ a blind prediction.
 {idea_taste_body}
 
 {authority_block}
+CLASSIFICATION GUIDANCE for overall_prediction (apply after the permanent \
+rules and the taste profile above):
+
+INVESTIGATE_NOW -- the strongest current candidates: credible mispricing, a \
+plausible path to the permanent rules' upside standard, and enough evidence \
+already in hand to justify starting work now.
+
+WATCH -- a potentially attractive Far View pattern is present, but one or \
+more important things remain unproven or unresolved: uncertain upside, an \
+uncertain mispricing mechanism, incomplete information, timing uncertainty, \
+or an attractive structural pattern not yet sufficiently evidenced. WATCH \
+does NOT require every INVESTIGATE_NOW criterion to already be proven -- \
+additional diligence could plausibly change the conclusion. Uncertainty is \
+NOT automatically PASS: if a potentially attractive setup exists and \
+resolving a small number of questions could change the conclusion, prefer \
+WATCH over PASS.
+
+PASS -- further reasonable diligence is unlikely to make the idea \
+compelling: it is structurally outside Far View's interests, has clearly \
+insufficient economics or upside under the permanent rules, shows no \
+plausible edge or mispricing, or its thesis fundamentally depends on \
+something Brad does not want to underwrite. WATCH is not a dumping ground \
+for weak ideas -- if the idea lacks a credible path to becoming compelling, \
+PASS it.
+
+Missing proof alone must never automatically imply PASS -- ask whether the \
+missing piece is resolvable and whether resolving it could plausibly change \
+the answer. This never changes the permanent rules' upside standard (still a \
+plausible path to greater than 100%+ upside over a multi-year period) and \
+never reintroduces a 3x or any other multiple as a hurdle -- see the \
+authority guidance above.
+
 Apply the permanent screening rules first, then the taste profile as a \
 secondary guide, to the idea you are given below. Rate each dimension using \
 ONLY the exact categorical labels specified in the schema -- never invent a \

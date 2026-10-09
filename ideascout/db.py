@@ -1685,6 +1685,20 @@ def get_feedback_by_id(conn: sqlite3.Connection, feedback_id: int) -> sqlite3.Ro
     ).fetchone()
 
 
+def get_feedback_by_ids(conn: sqlite3.Connection, feedback_ids: list[int]) -> list[sqlite3.Row]:
+    """Feedback rows for exactly these primary keys, order unspecified. Used by
+    the label-distribution diagnostic to look up one taste version's recorded
+    training_feedback_ids_json. Empty input returns an empty list rather than
+    matching everything.
+    """
+    if not feedback_ids:
+        return []
+    placeholders = ",".join("?" for _ in feedback_ids)
+    return conn.execute(
+        f"SELECT * FROM feedback WHERE feedback_id IN ({placeholders})", feedback_ids
+    ).fetchall()
+
+
 def get_feedback_by_ticker_or_company(conn: sqlite3.Connection, value: str) -> list[sqlite3.Row]:
     """Feedback events whose ticker or company matches `value`
     case-insensitively. Used by exclude-feedback/include-feedback -- a

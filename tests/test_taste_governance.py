@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from ideascout import cli, db, taste, taste_evaluation
+from ideascout import cli, db, screening_prompt, taste, taste_evaluation
 from tests.test_holdout_audit import _judge
 from tests.test_narrative_repair_diagnostics import _snapshot_all_tables
 from tests.test_taste_evaluation import STANDARD_20, _setup_v2, _standard_holdout, _member
@@ -106,7 +106,7 @@ def test_real_retrain_records_complete_evaluation_metadata(tmp_path, monkeypatch
     assert row["recorded_at"]
     assert row["checkpoint_feedback_id"] == latest["checkpoint_feedback_id"]
     assert (row["holdout_count"], row["unique_holdout_count"]) == (20, 20)
-    assert row["screening_prompt_version"] == 2
+    assert row["screening_prompt_version"] == screening_prompt.CURRENT_SCREENING_PROMPT_VERSION
     assert row["taste_artifact_sha256"] == latest["idea_taste_sha256"]
     assert len(row["screen_rules_sha256"]) == 64
     assert (row["exact_correct"], row["exact_total"]) == (9, 20)

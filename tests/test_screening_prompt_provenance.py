@@ -89,8 +89,17 @@ def _build_pre_migration_18(path):
 
 def test_legacy_and_current_prompt_versions_are_distinct_constants():
     assert screening_prompt.LEGACY_SCREENING_PROMPT_VERSION == 1
-    assert screening_prompt.CURRENT_SCREENING_PROMPT_VERSION == 2
-    assert set(screening_prompt.SCREENING_PROMPT_DESCRIPTIONS) == {1, 2}
+    assert screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION == 2
+    assert screening_prompt.CURRENT_SCREENING_PROMPT_VERSION == 3
+    assert set(screening_prompt.SCREENING_PROMPT_DESCRIPTIONS) == {1, 2, 3}
+
+
+def test_prompt_v1_and_v2_historical_identities_remain_intact():
+    # v1 (legacy) and v2 (authority-ordered, pre-WATCH/PASS-guidance) are both
+    # historical only now -- neither value or description changed by the v3 bump.
+    assert screening_prompt.SCREENING_PROMPT_DESCRIPTIONS[1] == "legacy peer-authority prompt"
+    assert screening_prompt.SCREENING_PROMPT_DESCRIPTIONS[2] == "authority-ordered prompt (permanent rules outrank taste)"
+    assert screening_prompt.SCREENING_PROMPT_DESCRIPTIONS[3] == "authority-ordered prompt + explicit WATCH/PASS semantics"
 
 
 def test_legacy_prompt_text_is_preserved_and_differs_from_current():
@@ -164,13 +173,32 @@ def test_identical_identity_including_prompt_version_is_still_rejected(tmp_path)
 def test_current_lookup_returns_the_current_prompt_screening_by_default(tmp_path):
     conn = db.connect(tmp_path / "ideas.db")
     source_id = _insert_source(conn)
-    _screening(conn, source_id, prompt_version=1, prediction="PASS")
-    current_id = _screening(conn, source_id, prompt_version=2, prediction="WATCH")
+    _screening(conn, source_id, prompt_version=screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION, prediction="PASS")
+    current_id = _screening(conn, source_id, prompt_version=screening_prompt.CURRENT_SCREENING_PROMPT_VERSION, prediction="WATCH")
 
     found = db.get_source_screening(conn, source_id=source_id, taste_version=2, screen_rules_sha256="rules-sha")
 
     assert found["screening_id"] == current_id
-    assert found["screening_prompt_version"] == 2
+    assert found["screening_prompt_version"] == screening_prompt.CURRENT_SCREENING_PROMPT_VERSION
+
+
+def test_current_lookup_defaults_to_requesting_prompt_v3(tmp_path):
+    """Where code asks for THE current prompt version without saying which one,
+    it must now mean v3 -- not v2 (v2 is historical only after the WATCH/PASS
+    guidance was added).
+    """
+    assert screening_prompt.CURRENT_SCREENING_PROMPT_VERSION == 3
+    conn = db.connect(tmp_path / "ideas.db")
+    source_id = _insert_source(conn)
+    screening_id = _screening(conn, source_id)  # no prompt_version override
+
+    row = conn.execute(
+        "SELECT screening_prompt_version FROM source_screenings WHERE screening_id = ?", (screening_id,)
+    ).fetchone()
+    assert row[0] == 3
+    assert db.get_source_screening(
+        conn, source_id=source_id, taste_version=2, screen_rules_sha256="rules-sha"
+    )["screening_id"] == screening_id
 
 
 def test_latest_lookup_is_prompt_agnostic_for_repairs(tmp_path):
@@ -236,7 +264,7 @@ def test_evaluate_refuses_a_holdout_that_mixes_prompt_versions(tmp_path, monkeyp
     code, output = _evaluate(config)
 
     assert code == 1
-    assert "[FAIL] Single screening prompt version across the holdout (mixed: v1 x1, v2 x19)" in output
+    assert "[FAIL] Single screening prompt version across the holdout (mixed: v1 x1, v3 x19)" in output
     assert "TASTE EVALUATION --" not in output
 
 
@@ -269,6 +297,120 @@ def test_evaluate_leaves_every_historical_row_unchanged(tmp_path, monkeypatch):
 
     assert code == 0
     assert _snapshot_all_tables(config) == before
+
+
+def test_no_migration_was_added_for_the_v3_prompt_bump(tmp_path):
+    """The prompt-version bump is a Python constant change: the existing
+    screening_prompt_version INTEGER column already stores any integer, so no
+    schema change (and no new MIGRATIONS entry) is needed to introduce v3.
+    """
+    assert len(db.MIGRATIONS) == 19
+
+
+def test_old_prompt_v2_screenings_remain_unchanged_after_the_v3_bump(tmp_path):
+    conn = db.connect(tmp_path / "ideas.db")
+    historical_source = _insert_source(conn)
+    historical_id = _screening(
+        conn, historical_source, prompt_version=screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION,
+        prediction="PASS",
+    )
+    before = tuple(conn.execute("SELECT * FROM source_screenings WHERE screening_id = ?", (historical_id,)).fetchone())
+
+    # New screening activity on a genuinely different source, recording the new
+    # current prompt (v3) -- must not touch the historical v2 row above.
+    conn.execute(
+        "INSERT INTO collected_sources (source_name, external_id, canonical_url, discovered_at, content_hash, "
+        "raw_html_path, metadata_json, created_at) VALUES ('yellowbrick', '2', 'u', 'd', 'h2', 'p', '{}', 'd')"
+    )
+    new_source = conn.execute("SELECT source_id FROM collected_sources WHERE external_id = '2'").fetchone()[0]
+    _screening(conn, new_source, prompt_version=screening_prompt.CURRENT_SCREENING_PROMPT_VERSION, content_hash="hash-new")
+
+    after = tuple(conn.execute("SELECT * FROM source_screenings WHERE screening_id = ?", (historical_id,)).fetchone())
+    assert after == before
+
+
+def test_same_source_taste_and_rules_distinguishes_v2_from_v3_by_provenance(tmp_path):
+    conn = db.connect(tmp_path / "ideas.db")
+    source_id = _insert_source(conn)
+    v2_id = _screening(
+        conn, source_id, prompt_version=screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION, prediction="PASS"
+    )
+    v3_id = _screening(
+        conn, source_id, prompt_version=screening_prompt.CURRENT_SCREENING_PROMPT_VERSION, prediction="WATCH"
+    )
+
+    assert v2_id != v3_id
+    found_v2 = db.get_source_screening(
+        conn, source_id=source_id, taste_version=2, screen_rules_sha256="rules-sha",
+        screening_prompt_version=screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION,
+    )
+    found_v3 = db.get_source_screening(
+        conn, source_id=source_id, taste_version=2, screen_rules_sha256="rules-sha",
+        screening_prompt_version=screening_prompt.CURRENT_SCREENING_PROMPT_VERSION,
+    )
+    assert found_v2["screening_id"] == v2_id and found_v2["overall_prediction"] == "PASS"
+    assert found_v3["screening_id"] == v3_id and found_v3["overall_prediction"] == "WATCH"
+
+
+def test_evaluate_accepts_the_completed_v3_holdouts_historical_all_v2_predictions(tmp_path, monkeypatch):
+    """The already-completed Taste v3 holdout evaluation was produced entirely
+    under prompt v2 (authority-ordered, pre-WATCH/PASS-guidance). It must
+    remain evaluable, unchanged, exactly as it ran.
+    """
+    config, _ = _setup_v2(tmp_path, monkeypatch)
+    conn = db.connect(config.database_path)
+    _standard_holdout(conn)
+    conn.execute(
+        "UPDATE source_screenings SET screening_prompt_version = ?",
+        (screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION,),
+    )
+    conn.commit()
+    conn.close()
+
+    code, output = _evaluate(config)
+
+    assert code == 0
+    assert (
+        "Screening prompt version used by every holdout prediction: v2 "
+        "(authority-ordered prompt (permanent rules outrank taste))"
+    ) in output
+    assert "[ok] Single screening prompt version across the holdout" in output
+
+
+def test_evaluate_accepts_a_future_all_v3_holdout(tmp_path, monkeypatch):
+    config, _ = _setup_v2(tmp_path, monkeypatch)
+    conn = db.connect(config.database_path)
+    _standard_holdout(conn)  # default screenings already record CURRENT (v3)
+    conn.close()
+
+    code, output = _evaluate(config)
+
+    assert code == 0
+    assert (
+        "Screening prompt version used by every holdout prediction: v3 "
+        "(authority-ordered prompt + explicit WATCH/PASS semantics)"
+    ) in output
+
+
+def test_evaluate_refuses_a_holdout_that_mixes_v2_and_v3(tmp_path, monkeypatch):
+    config, _ = _setup_v2(tmp_path, monkeypatch)
+    conn = db.connect(config.database_path)
+    _standard_holdout(conn)  # all default to v3
+    first_source = conn.execute(
+        "SELECT source_id FROM blind_review_assignments ORDER BY assignment_id LIMIT 1"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE source_screenings SET screening_prompt_version = ? WHERE source_id = ?",
+        (screening_prompt.AUTHORITY_ORDERED_SCREENING_PROMPT_VERSION, first_source),
+    )
+    conn.commit()
+    conn.close()
+
+    code, output = _evaluate(config)
+
+    assert code == 1
+    assert "[FAIL] Single screening prompt version across the holdout (mixed: v2 x1, v3 x19)" in output
+    assert "TASTE EVALUATION --" not in output
 
 
 def test_frozen_v2_artifact_is_untouched_by_provenance_checks(tmp_path, monkeypatch):

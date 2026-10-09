@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal
 
@@ -138,6 +139,32 @@ Hard rules:
 10. Keep the whole document compact -- this will be reused inside future \
     screening prompts, so cost and length matter. Prefer dense, specific \
     bullet points over long paragraphs.
+11. Do not let label frequency set your default answer. If most judgments are \
+    PASS, that means PASS occurred often -- it does NOT mean "PASS is the \
+    default outcome" or that an idea needs to affirmatively earn its way out \
+    of PASS. Every class of outcome, positive and negative, needs its own \
+    explanation grounded in Brad's stated reasoning, never in how many times \
+    it occurred.
+12. Learn contrastively. For each positive judgment (STRONG LIKE, LIKE, or a \
+    MAYBE Brad treated as promising), look for the most similar PASS/STRONG \
+    PASS judgment(s) and articulate what specifically differed. Write the \
+    Taste to describe what moves an idea INTO LIKE/MAYBE territory for Brad \
+    -- not only what the PASS examples have in common.
+13. Give a minority LIKE/MAYBE judgment the same analytical weight as a PASS \
+    judgment, however many PASS judgments exist. One well-explained LIKE is \
+    real evidence of what Brad wants to see more of -- it is not noise to be \
+    averaged away by a larger PASS count, and it must not disappear from the \
+    Taste merely because PASS judgments outnumber it.
+14. Preserve genuine negative preferences the PASS judgments actually \
+    support -- do not soften or discard them to avoid sounding negative. But \
+    do not manufacture a positive preference ("Brad likes X") unless \
+    positive judgments actually support it; a pattern seen only in PASS \
+    judgments stays a negative pattern, never its assumed inverse.
+15. Do not rebalance, reweight, resample, or omit any judgment because of \
+    its label -- every eligible judgment given to you is in-scope evidence. \
+    If the set is imbalanced, say so if it is relevant to a section (e.g. \
+    "most judgments were PASS, but the few LIKE/MAYBE judgments shared ..."), \
+    rather than silently normalizing it away.
 
 Output ONLY the eight sections and their content in markdown. Do not \
 include a title, a version line, or any preamble -- those are added \
@@ -299,6 +326,71 @@ def format_training_corpus(records: list[dict]) -> str:
             )
         lines.append("")
     return "\n".join(lines)
+
+
+# --- label-distribution diagnostic (read-only; never used to weight or filter) ----
+#
+# Purely informational -- see taste-status. It exists so an imbalanced feedback
+# set (e.g. many more PASS than LIKE/MAYBE judgments) is visible to Brad, not so
+# any code path can use it to reweight, reorder, or filter training data. The
+# canonical training set (training_feedback_ids_json on the active taste
+# version) and the canonical eligibility query
+# (db.get_feedback_eligible_for_learning) are the only two row sets this is ever
+# computed over -- no second eligibility definition is introduced here.
+
+LABEL_ORDER = ("STRONG LIKE", "LIKE", "MAYBE", "PASS", "STRONG PASS")
+
+
+def _normalize_verdict_label(verdict: str | None) -> str | None:
+    """"STRONG_LIKE" -> "STRONG LIKE", mirroring taste_evaluation.normalize_label
+    (duplicated as one line rather than imported, since taste_evaluation imports
+    this module). None for anything that isn't one of the five known verdicts
+    (a missing verdict, or a NEW_IDEA/MISSED_IDEA event with none).
+    """
+    if not verdict:
+        return None
+    normalized = verdict.replace("_", " ").strip().upper()
+    return normalized if normalized in LABEL_ORDER else None
+
+
+@dataclass(frozen=True)
+class LabelDistribution:
+    counts: dict[str, int]
+    other: int
+    total: int
+
+    @property
+    def worth_watching(self) -> int:
+        """STRONG LIKE + LIKE + MAYBE."""
+        return self.counts["STRONG LIKE"] + self.counts["LIKE"] + self.counts["MAYBE"]
+
+    @property
+    def pass_family(self) -> int:
+        """PASS + STRONG PASS."""
+        return self.counts["PASS"] + self.counts["STRONG PASS"]
+
+    @property
+    def positive_share(self) -> float | None:
+        """worth_watching / (worth_watching + pass_family); None if neither
+        occurs (nothing to divide), rather than a misleading 0.0 or 1.0.
+        """
+        scored = self.worth_watching + self.pass_family
+        return None if scored == 0 else self.worth_watching / scored
+
+
+def label_distribution(rows) -> LabelDistribution:
+    """Deterministic count of Brad's verdicts across `rows` (feedback rows, or
+    anything with a `row["verdict"]` lookup). Read-only and purely diagnostic.
+    """
+    counts = {label: 0 for label in LABEL_ORDER}
+    other = 0
+    for row in rows:
+        label = _normalize_verdict_label(row["verdict"])
+        if label is None:
+            other += 1
+        else:
+            counts[label] += 1
+    return LabelDistribution(counts=counts, other=other, total=len(rows))
 
 
 def _log(logger, message: str) -> None:

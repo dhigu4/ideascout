@@ -1379,6 +1379,21 @@ def cmd_build_taste(config: Config) -> int:
     return 0
 
 
+def _print_label_distribution(label: str, rows) -> None:
+    """Read-only diagnostic (taste-status): Brad's verdict counts across one row
+    set. Purely informational -- never used to weight, reorder, or filter
+    training data.
+    """
+    dist = taste.label_distribution(rows)
+    print(f"Label distribution -- {label} ({dist.total} judgment(s)):")
+    counts_line = " | ".join(f"{label_name}: {dist.counts[label_name]}" for label_name in taste.LABEL_ORDER)
+    print(f"  {counts_line} | other/no verdict: {dist.other}")
+    print(f"  Worth-at-least-watching (STRONG LIKE+LIKE+MAYBE): {dist.worth_watching}")
+    print(f"  PASS-family (PASS+STRONG PASS): {dist.pass_family}")
+    share = "N/A" if dist.positive_share is None else f"{dist.positive_share:.1%}"
+    print(f"  Positive share: {share}")
+
+
 def cmd_taste_status(config: Config) -> int:
     conn = db.open_production_database(config.database_path)
     latest = db.get_latest_taste_version(conn)
@@ -1397,7 +1412,9 @@ def cmd_taste_status(config: Config) -> int:
     screen_review_count = db.count_feedback_by_origin(conn, "SCREEN_REVIEW")
     unjudged_blind_review_count = db.count_unjudged_blind_review_assignments(conn)
     decision = db.get_taste_evaluation_decision(conn, latest["version_number"])
-    eligible_for_next_build = len(db.get_feedback_eligible_for_learning(conn))
+    eligible_rows = db.get_feedback_eligible_for_learning(conn)
+    eligible_for_next_build = len(eligible_rows)
+    training_rows = db.get_feedback_by_ids(conn, json.loads(latest["training_feedback_ids_json"]))
     conn.close()
 
     # HOLDOUT COMPLETE (20/20 eligible judgments collected) and TASTE
@@ -1448,6 +1465,9 @@ def cmd_taste_status(config: Config) -> int:
         # above like any other clean judgment; this line only tracks
         # items already assigned but not yet answered.
         print(f"Blind-review assigned/unjudged: {unjudged_blind_review_count}")
+
+    _print_label_distribution(f"current Taste training set ({latest['version_label']})", training_rows)
+    _print_label_distribution("all currently learning-eligible feedback (next build)", eligible_rows)
 
     # Fail loudly rather than silently trusting a file that may have been
     # edited, truncated, or lost since this version was activated. This

@@ -82,6 +82,7 @@ class EvalRow:
     screening: sqlite3.Row
     judged_at: str
     prompt_version: int = screening_prompt.LEGACY_SCREENING_PROMPT_VERSION
+    brad_comment: str | None = None
 
     @property
     def is_actual_positive(self) -> bool:
@@ -131,6 +132,18 @@ class GateResult:
     @property
     def passed(self) -> bool:
         return all(ok for _, ok, _ in self.checks)
+
+
+def _brad_comment(conn, feedback_id: int) -> str | None:
+    """Brad's own stored comment for this judgment (feedback.user_comment) --
+    verbatim, whatever it was: free text for a DIRECT/digest-reply/screen-review
+    judgment, or his blind-review reply text for a BLIND_REVIEW one. Read-only,
+    no LLM. Used only to show next to the model's stored rationale in the
+    false-negative diagnostic -- never regenerated or reinterpreted.
+    """
+    row = conn.execute("SELECT user_comment FROM feedback WHERE feedback_id = ?", (feedback_id,)).fetchone()
+    comment = row["user_comment"] if row is not None else None
+    return comment if comment else None
 
 
 def _screenings_before_judgment(conn, source_id: int, taste_version: int, judged_at: str) -> list:
@@ -236,6 +249,7 @@ def check_gate(conn: sqlite3.Connection, latest_taste: sqlite3.Row, requested_ve
             screening=screening,
             judged_at=member.feedback_created_at,
             prompt_version=screening["screening_prompt_version"],
+            brad_comment=_brad_comment(conn, member.feedback_id),
         ))
     checks.append((
         f"Taste v{version} prediction existed before each judgment",
@@ -419,7 +433,10 @@ def _dims(row: EvalRow) -> str:
 
 def _reasoning_lines(row: EvalRow) -> list[str]:
     s = row.screening
-    lines = [f"    dimensions: {_dims(row)}"]
+    lines = [
+        f"    Brad's stated reason: {row.brad_comment or '(none recorded)'}",
+        f"    dimensions: {_dims(row)}",
+    ]
     for label, column in (
         ("key reasons", "key_reasons_json"),
         ("key concerns", "key_concerns_json"),
